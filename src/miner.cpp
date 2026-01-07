@@ -34,15 +34,18 @@ bool Miner::start() {
         LOG_ERROR("CPU does not support required features (AES-NI, AVX, PCLMUL)");
         return false;
     }
-    
+
+    // Initialize terminal display with sticky header
+    utils::Logger::instance().init_display();
+
     LOG_INFO("Starting BloxMiner v%s", VERSION);
     LOG_INFO("Using %d mining threads", m_config.num_threads);
     LOG_INFO("Pool: %s:%d", m_config.pool_host.c_str(), m_config.pool_port);
     LOG_INFO("Wallet: %s", m_config.wallet_address.c_str());
-    
+
     m_running = true;
     m_stats.start_time = std::chrono::steady_clock::now();
-    
+
     // Setup stratum callbacks
     m_stratum.on_job([this](const stratum::Job& job) {
         on_new_job(job);
@@ -145,25 +148,29 @@ void Miner::stratum_thread() {
 void Miner::stats_thread() {
     while (m_running) {
         std::this_thread::sleep_for(std::chrono::seconds(m_config.stats_interval));
-        
+
         if (!m_running) break;
-        
+
         double hashrate = m_stats.get_hashrate();
-        
+
         // Get system stats (temp, power)
         auto sys_stats = utils::SystemMonitor::instance().get_stats();
-        
-        // Log hashrate with system stats
-        utils::Logger::instance().hashrate_with_stats(
-            hashrate,
-            sys_stats.cpu_temp,
-            sys_stats.cpu_power
-        );
-        
-        utils::Logger::instance().share_accepted(
-            m_stats.shares_accepted.load(),
-            m_stats.shares_rejected.load()
-        );
+
+        // Calculate uptime
+        auto now = std::chrono::steady_clock::now();
+        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            now - m_stats.start_time).count();
+
+        // Build stats struct and display box
+        utils::Logger::MiningStats box_stats;
+        box_stats.hashrate = hashrate;
+        box_stats.cpu_temp = sys_stats.cpu_temp;
+        box_stats.cpu_power = sys_stats.cpu_power;
+        box_stats.accepted = m_stats.shares_accepted.load();
+        box_stats.rejected = m_stats.shares_rejected.load();
+        box_stats.uptime_seconds = static_cast<uint64_t>(uptime);
+
+        utils::Logger::instance().stats_box(box_stats);
     }
 }
 

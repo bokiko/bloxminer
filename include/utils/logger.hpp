@@ -46,6 +46,16 @@ public:
         log(LogLevel::ERROR, fmt, args...);
     }
     
+    // Mining stats structure for box display
+    struct MiningStats {
+        double hashrate;
+        double cpu_temp;
+        double cpu_power;
+        uint64_t accepted;
+        uint64_t rejected;
+        uint64_t uptime_seconds;
+    };
+
     // Convenience methods for common mining output
     void hashrate(double hashrate, const std::string& unit = "H/s");
     void hashrate_with_stats(double hashrate, double cpu_temp, double cpu_power);
@@ -56,8 +66,17 @@ public:
     void new_job(const std::string& job_id, double difficulty);
     void system_stats(double cpu_temp, double cpu_power);
 
+    // Box-formatted stats display
+    void stats_box(const MiningStats& stats);
+
+    // Initialize terminal for sticky header mode
+    void init_display();
+
+    // Check if display is initialized
+    bool display_initialized() const { return m_display_initialized; }
+
 private:
-    Logger() : m_level(LogLevel::INFO) {}
+    Logger() : m_level(LogLevel::INFO), m_display_initialized(false) {}
     
     template<typename... Args>
     void log(LogLevel level, const char* fmt, Args... args) {
@@ -128,6 +147,10 @@ private:
     
     LogLevel m_level;
     std::mutex m_mutex;
+    bool m_display_initialized;
+
+    // Box dimensions
+    static constexpr int BOX_HEIGHT = 7;  // Number of lines the box occupies
 };
 
 // Global logger access
