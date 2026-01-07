@@ -41,3 +41,7 @@ Thumbs.db
 config.json
 *.conf
 tests/test_clhash_compare
+
+# Internal development ledger files
+CONTINUITY.md
+CONTINUATION.md
