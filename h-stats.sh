@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+# HiveOS stats script - sets $khs and $stats variables (sourced by agent)
 
 LOG_FILE="/var/log/miner/custom/custom.log"
 
 khs=0
-ac=0
-rj=0
+local_ac=0
+local_rj=0
 cpu_temp=0
 
 if [[ -f "$LOG_FILE" ]]; then
@@ -32,10 +33,10 @@ if [[ -f "$LOG_FILE" ]]; then
     # Parse box format: |  Accepted: 17          Rejected: 0       |
     SHARE_LINE=$(echo "$CLEAN_LOG" | grep '|.*Accepted:' | tail -1)
     if [[ "$SHARE_LINE" =~ Accepted:[[:space:]]*([0-9]+) ]]; then
-        ac="${BASH_REMATCH[1]}"
+        local_ac="${BASH_REMATCH[1]}"
     fi
     if [[ "$SHARE_LINE" =~ Rejected:[[:space:]]*([0-9]+) ]]; then
-        rj="${BASH_REMATCH[1]}"
+        local_rj="${BASH_REMATCH[1]}"
     fi
 fi
 
@@ -48,6 +49,11 @@ fi
 khs=$(echo "$khs" | grep -oE '^[0-9.]+' || echo "0")
 [[ -z "$khs" ]] && khs=0
 
-cat << STATS
-{"hs":[$khs],"temp":[$cpu_temp],"fan":[],"khs":$khs,"ac":$ac,"rj":$rj,"ver":"1.0","algo":"verushash"}
-STATS
+# Set stats variable for HiveOS agent (sourced, not printed)
+stats=$(cat <<EOF
+{"hs":[$khs],"temp":[$cpu_temp],"fan":[],"khs":$khs,"ac":$local_ac,"rj":$local_rj,"ver":"1.0","algo":"verushash"}
+EOF
+)
+
+# Also print for direct execution testing
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && echo "$stats"
