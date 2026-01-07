@@ -315,13 +315,12 @@ void Miner::mining_thread(uint32_t thread_id) {
             m_stats.hashes++;
             m_stats.thread_hashes[thread_id]++;
             
-            // Debug: log every 500K hashes
-            static thread_local uint64_t sample_count = 0;
-            if (++sample_count % 500000 == 0) {
-                std::string hash_hex = utils::bytes_to_hex(hash, 32);
-                LOG_INFO("[SAMPLE] hash_last4=%s (target=40000000)", 
-                         hash_hex.substr(56, 8).c_str());
-            }
+            // Debug sampling disabled for production
+            // static thread_local uint64_t sample_count = 0;
+            // if (++sample_count % 500000 == 0) {
+            //     std::string hash_hex = utils::bytes_to_hex(hash, 32);
+            //     LOG_INFO("[SAMPLE] hash_last4=%s (target=40000000)", hash_hex.substr(56, 8).c_str());
+            // }
             
             // Check if hash meets target
             if (check_hash(hash, target)) {
