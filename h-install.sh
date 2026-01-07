@@ -115,55 +115,53 @@ if screen -S miner -X hardcopy /tmp/miner_screen.txt 2>/dev/null; then
 fi
 
 if [[ -n "$STATS_LINE" ]]; then
-
-if [[ -n "$STATS_LINE" ]]; then
     # Parse hashrate value and unit
     HR_VALUE=$(echo "$STATS_LINE" | grep -oP 'hr=\K[0-9.]+')
-        HR_UNIT=$(echo "$STATS_LINE" | grep -oP 'unit=\K[A-Z]+')
+    HR_UNIT=$(echo "$STATS_LINE" | grep -oP 'unit=\K[A-Z]+')
 
-        # Convert to KH/s
-        if [[ -n "$HR_VALUE" ]]; then
-            case "$HR_UNIT" in
-                TH) khs=$(echo "$HR_VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
-                GH) khs=$(echo "$HR_VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
-                MH) khs=$(echo "$HR_VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
-                KH) khs="$HR_VALUE" ;;
-                H)  khs=$(echo "scale=2; $HR_VALUE / 1000" | bc 2>/dev/null || echo "0") ;;
-            esac
-        fi
+    # Convert to KH/s
+    if [[ -n "$HR_VALUE" ]]; then
+        case "$HR_UNIT" in
+            TH) khs=$(echo "$HR_VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
+            GH) khs=$(echo "$HR_VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
+            MH) khs=$(echo "$HR_VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
+            KH) khs="$HR_VALUE" ;;
+            H)  khs=$(echo "scale=2; $HR_VALUE / 1000" | bc 2>/dev/null || echo "0") ;;
+        esac
+    fi
 
-        # Parse temp
-        cpu_temp=$(echo "$STATS_LINE" | grep -oP 'temp=\K[0-9]+')
-        [[ -z "$cpu_temp" ]] && cpu_temp=0
+    # Parse temp
+    cpu_temp=$(echo "$STATS_LINE" | grep -oP 'temp=\K[0-9]+')
+    [[ -z "$cpu_temp" ]] && cpu_temp=0
 
-        # Parse accepted/rejected
-        local_ac=$(echo "$STATS_LINE" | grep -oP 'ac=\K[0-9]+')
-        [[ -z "$local_ac" ]] && local_ac=0
+    # Parse accepted/rejected
+    local_ac=$(echo "$STATS_LINE" | grep -oP 'ac=\K[0-9]+')
+    [[ -z "$local_ac" ]] && local_ac=0
 
-        local_rj=$(echo "$STATS_LINE" | grep -oP 'rj=\K[0-9]+')
-        [[ -z "$local_rj" ]] && local_rj=0
+    local_rj=$(echo "$STATS_LINE" | grep -oP 'rj=\K[0-9]+')
+    [[ -z "$local_rj" ]] && local_rj=0
 
-        # Parse per-thread hashrates
-        # Format: thr=756.0K,759.8K,757.9K,...
-        THR_STRING=$(echo "$STATS_LINE" | grep -oP 'thr=\K[^\s]+')
-        if [[ -n "$THR_STRING" ]]; then
-            hs_values=()
-            IFS=',' read -ra THR_ARRAY <<< "$THR_STRING"
-            for thr in "${THR_ARRAY[@]}"; do
-                # Parse value and suffix (K, M, G or none)
-                hr=$(echo "$thr" | grep -oP '^[0-9.]+')
-                suffix=$(echo "$thr" | grep -oP '[KMG]$')
-                if [[ -n "$hr" ]]; then
-                    case "$suffix" in
-                        M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
-                        G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
-                        K|*) val="$hr" ;;
-                    esac
-                    hs_values+=("$val")
-                fi
-            done
-            hs_array=$(IFS=,; echo "${hs_values[*]}")
-        fi
+    # Parse per-thread hashrates
+    # Format: thr=756.0K,759.8K,757.9K,...
+    THR_STRING=$(echo "$STATS_LINE" | grep -oP 'thr=\K[^\s]+')
+    if [[ -n "$THR_STRING" ]]; then
+        hs_values=()
+        IFS=',' read -ra THR_ARRAY <<< "$THR_STRING"
+        for thr in "${THR_ARRAY[@]}"; do
+            # Parse value and suffix (K, M, G or none)
+            hr=$(echo "$thr" | grep -oP '^[0-9.]+')
+            suffix=$(echo "$thr" | grep -oP '[KMG]$')
+            if [[ -n "$hr" ]]; then
+                case "$suffix" in
+                    M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
+                    G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
+                    K|*) val="$hr" ;;
+                esac
+                hs_values+=("$val")
+            fi
+        done
+        hs_array=$(IFS=,; echo "${hs_values[*]}")
+    fi
 fi
 
 # Fallback: distribute total across threads if per-thread not found
