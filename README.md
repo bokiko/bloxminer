@@ -242,5 +242,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 </p>
 
 <p align="center">
-  Made by <a href="https://github.com/bokiko">@bokiko</a>
+  Made by <a href="https://x.com/bokiko">@bokiko</a>
 </p>
