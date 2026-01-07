@@ -40,6 +40,11 @@
 - Fixed binary path issues
 - Added background mining and troubleshooting sections
 
+### 5. Added HiveOS Installation Script
+- Created `h-install.sh` for HiveOS Flight Sheet integration
+- Installation URL for HiveOS custom miner setup
+- Installs to `/hive/miners/bloxminer/`
+
 ---
 
 ## Key Files
@@ -54,6 +59,7 @@
 | `tests/test_clhash_compare.cpp` | CLHash verification test |
 | `CMakeLists.txt` | Build configuration |
 | `README.md` | User documentation |
+| `h-install.sh` | HiveOS installation script |
 
 ---
 
@@ -76,21 +82,29 @@ cd /home/bokiko/projects/bloxminer
 
 ---
 
-## HiveOS One-Command Install
+## HiveOS Installation
 
-```bash
-cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t $(nproc)
+### Installation URL (for Flight Sheet custom miner)
 ```
+https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+```
+
+### Manual Terminal Install
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
+```
+
+After installation, the miner is at `/hive/miners/bloxminer/bloxminer`
 
 ---
 
 ## Git History
 
 ```
+6641424 feat: Add HiveOS installation script and URL
+4c2f184 docs: Enhance README with badges and better formatting
+b2e5d49 docs: Add continuity ledger for project state tracking
 f3b74f9 docs: Completely rewrite README for miners
-fb42fed test: verify git push works
-7f6512f docs: Simplify README and fix HiveOS one-command installation
-9a6b53c fix: Fix CMake binary output location and simplify HiveOS installation
 f53d5c3 fix: CLHash variable shadowing bug - shares now accepted
 89479f9 Initial commit: BloxMiner v0.1.0-beta
 ```
