@@ -2,7 +2,7 @@
 
 **High-Performance VerusHash v2.2 CPU Miner**
 
-BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing the VerusHash v2.2 algorithm. It's designed for maximum performance on modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ support.
+BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing VerusHash v2.2 algorithm. It's designed for maximum performance on modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ support.
 
 ## Features
 
@@ -12,6 +12,8 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 - **Optimized** - AES-NI, AVX2, PCLMULQDQ hardware acceleration
 - **Lightweight** - Minimal dependencies, fast startup
 - **Pool Verified** - Tested and working with pool.verus.io
+
+---
 
 ## Requirements
 
@@ -34,7 +36,9 @@ BloxMiner is tested and confirmed working on:
 - OpenSSL development libraries
 - Git (for cloning)
 
-## Building
+---
+
+## Installation
 
 ### Ubuntu/Debian
 
@@ -51,76 +55,27 @@ cd bloxminer
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 make -C build -j$(nproc)
+
+# Run miner (binary is now in parent directory)
+./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w miner1 -t 4
 ```
 
 ### HiveOS
 
-```bash
-# Update and install dependencies
-sudo apt update
-sudo apt install -y build-essential cmake libssl-dev git wget
-
-# Clone repository
-cd ~
-git clone https://github.com/bokiko/bloxminer.git
-cd bloxminer
-
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-make -C build -j$(nproc)
-
-# Run miner
-cd ..
-./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
-```
-
-**Note:** See [HiveOS Installation](#hiveos-installation) section for quick-start commands.
-
-## HiveOS Installation
-
-### Quick Start (Recommended)
+#### Quick Start (One Command)
 
 Copy and paste this entire block into your HiveOS terminal:
 
 ```bash
-cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git wget && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET_ADDRESS_HERE -w HiveOSMiner -t 4
+cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && make -C build -j$(nproc) && cd .. && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET_ADDRESS_HERE -w HiveOSMiner -t 4
 ```
 
-### Manual Installation
-
-```bash
-# Update HiveOS
-sudo apt update
-
-# Install dependencies
-sudo apt install -y build-essential cmake libssl-dev git
-
-# Clone BloxMiner
-cd ~
-git clone https://github.com/bokiko/bloxminer.git
-cd bloxminer
-
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-make -C build -j$(nproc)
-
-# Run miner (binary is now in parent directory)
-cd ..
-./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
-```
-
-### HiveOS-Specific Notes
-
-- **CPU Detection:** HiveOS automatically detects available threads
-- **Performance:** HiveOS instances typically support AES-NI, AVX2, and PCLMULQDQ
-- **Threading:** Recommended threads: 2-4 for most HiveOS instances
-
-### Background Mining (Optional)
+#### Background Mining (Optional)
 
 ```bash
 # Run in background with nohup
-cd bloxminer && nohup ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4 > miner.log 2>&1 &
+cd bloxminer
+nohup ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4 > miner.log 2>&1 &
 
 # Or use tmux for interactive background sessions
 tmux new -s miner
@@ -128,62 +83,7 @@ tmux new -s miner
 # Press Ctrl+B then D to detach
 ```
 
-### Troubleshooting on HiveOS
-
-```bash
-# Check if CPU supports required features
-lscpu | grep -E "aes|avx2|pclmul"
-
-# Monitor miner output
-tail -f miner.log
-
-# Check running processes
-ps aux | grep bloxminer
-
-# Stop miner if needed
-pkill bloxminer
-```
-
-### HiveOS Quick Start (One-liner)
-
-Copy and paste this entire block into your HiveOS terminal:
-
-```bash
-cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git wget && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && cd .. && ./bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET_ADDRESS_HERE -w HiveOSMiner -t 4
-```
-
-### HiveOS-Specific Notes
-
-- **CPU Detection:** HiveOS automatically detects available threads
-- **Performance:** HiveOS instances typically support AES-NI, AVX2, and PCLMULQDQ
-- **Threading:** Recommended threads: 2-4 for most HiveOS instances
-- **Background Mining:** Use `nohup` or screen/tmux for persistent sessions:
-
-```bash
-# Run in background with nohup
-nohup ./bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4 > miner.log 2>&1 &
-
-# Or use tmux for interactive background sessions
-tmux new -s miner
-./bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
-# Press Ctrl+B then D to detach
-```
-
-### Troubleshooting on HiveOS
-
-```bash
-# Check if CPU supports required features
-lscpu | grep -E "aes|avx2|pclmul"
-
-# Monitor miner output
-tail -f miner.log
-
-# Check running processes
-ps aux | grep bloxminer
-
-# Stop miner if needed
-pkill bloxminer
-```
+---
 
 ## Usage
 
@@ -212,12 +112,9 @@ pkill bloxminer
 
 # Mine with all available threads
 ./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress
-
-# Note: If built in 'build/' subdirectory, run from parent directory:
-# ./build/bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -t 4
 ```
 
-**Important:** After building in the `build/` directory, run the miner from the **parent directory** to access the binary at `./build/bloxminer`. Alternatively, copy the binary to your preferred location.
+---
 
 ## Performance
 
@@ -231,6 +128,8 @@ Approximate hashrates (per thread):
 | AMD Ryzen AI 9 HX 370 | ~1.6 MH/s |
 
 *Performance varies based on CPU model, cooling, and system configuration.*
+
+---
 
 ## Project Structure
 
@@ -251,13 +150,12 @@ bloxminer/
 │       └── logger.cpp/hpp    # Logging system
 ├── include/                  # Header files
 ├── tests/                    # Test programs
-│   ├── test_clhash_compare.cpp  # CLHash verification test
-│   ├── test_verushash.cpp       # VerusHash test vectors
-│   └── test_target.cpp          # Target/difficulty tests
 ├── CMakeLists.txt
 ├── CONTINUATION.md           # Development notes
 └── README.md
 ```
+
+---
 
 ## Algorithm
 
@@ -285,6 +183,8 @@ Final Haraka512 (keyed)
 Hash Result (32 bytes)
 ```
 
+---
+
 ## Testing
 
 ```bash
@@ -298,6 +198,8 @@ cd build
 ./test_verushash  # if built with tests enabled
 ```
 
+---
+
 ## Contributing
 
 Contributions are welcome! Please:
@@ -305,9 +207,13 @@ Contributions are welcome! Please:
 2. Create a feature branch
 3. Submit a pull request
 
+---
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
 
 ## Acknowledgments
 
@@ -316,6 +222,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Daniel Lemire](https://github.com/lemire/clhash) - CLHash algorithm
 - [kste](https://github.com/kste/haraka) - Haraka hash function
 
+---
+
 ## Changelog
 
 ### v1.0.0 (January 7, 2026)
@@ -323,6 +231,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - VerusHash v2.2 implementation verified against pool
 - Fixed CLHash variable shadowing bug (cases 0x10, 0x14, 0x18)
 - All shares accepted by pool.verus.io
+- 100% share acceptance rate in 12-minute test (52/53 accepted)
 
 ### v0.1.0-beta (January 6, 2026)
 - Initial beta release
