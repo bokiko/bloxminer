@@ -2,6 +2,7 @@
 #include "../include/utils/hex_utils.hpp"
 #include "../include/utils/logger.hpp"
 #include "../include/utils/system_monitor.hpp"
+#include "../include/utils/display.hpp"
 
 #include <cstring>
 #include <sstream>
@@ -34,18 +35,19 @@ bool Miner::start() {
         LOG_ERROR("CPU does not support required features (AES-NI, AVX, PCLMUL)");
         return false;
     }
-
-    // Initialize terminal display with sticky header
-    utils::Logger::instance().init_display();
-
+    
     LOG_INFO("Starting BloxMiner v%s", VERSION);
     LOG_INFO("Using %d mining threads", m_config.num_threads);
     LOG_INFO("Pool: %s:%d", m_config.pool_host.c_str(), m_config.pool_port);
     LOG_INFO("Wallet: %s", m_config.wallet_address.c_str());
-
+    
     m_running = true;
     m_stats.start_time = std::chrono::steady_clock::now();
-
+    m_stats.num_threads = m_config.num_threads;
+    
+    // Initialize display with sticky header
+    utils::Display::instance().init(m_config.num_threads);
+    
     // Setup stratum callbacks
     m_stratum.on_job([this](const stratum::Job& job) {
         on_new_job(job);
@@ -74,6 +76,9 @@ void Miner::stop() {
     if (!m_running) {
         return;
     }
+    
+    // Reset terminal display
+    utils::Display::instance().cleanup();
     
     LOG_INFO("Stopping miner...");
     
@@ -148,29 +153,35 @@ void Miner::stratum_thread() {
 void Miner::stats_thread() {
     while (m_running) {
         std::this_thread::sleep_for(std::chrono::seconds(m_config.stats_interval));
-
+        
         if (!m_running) break;
-
+        
         double hashrate = m_stats.get_hashrate();
-
+        
         // Get system stats (temp, power)
         auto sys_stats = utils::SystemMonitor::instance().get_stats();
-
-        // Calculate uptime
+        
+        // Build display stats
+        utils::Display::Stats disp_stats;
+        disp_stats.total_hashrate = hashrate;
+        disp_stats.cpu_temp = sys_stats.cpu_temp;
+        disp_stats.cpu_power = sys_stats.cpu_power;
+        disp_stats.accepted = m_stats.shares_accepted.load();
+        disp_stats.rejected = m_stats.shares_rejected.load();
+        disp_stats.pool = m_config.pool_host + ":" + std::to_string(m_config.pool_port);
+        disp_stats.worker = m_config.worker_name;
+        disp_stats.difficulty = m_current_job.difficulty;
+        
         auto now = std::chrono::steady_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-            now - m_stats.start_time).count();
-
-        // Build stats struct and display box
-        utils::Logger::MiningStats box_stats;
-        box_stats.hashrate = hashrate;
-        box_stats.cpu_temp = sys_stats.cpu_temp;
-        box_stats.cpu_power = sys_stats.cpu_power;
-        box_stats.accepted = m_stats.shares_accepted.load();
-        box_stats.rejected = m_stats.shares_rejected.load();
-        box_stats.uptime_seconds = static_cast<uint64_t>(uptime);
-
-        utils::Logger::instance().stats_box(box_stats);
+        disp_stats.uptime_seconds = std::chrono::duration<double>(now - m_stats.start_time).count();
+        
+        // Collect per-thread hashrates
+        for (uint32_t i = 0; i < m_config.num_threads; i++) {
+            disp_stats.thread_hashrates.push_back(m_stats.get_thread_hashrate(i));
+        }
+        
+        // Update sticky header
+        utils::Display::instance().update_header(disp_stats);
     }
 }
 
@@ -195,6 +206,9 @@ void Miner::mining_thread(uint32_t thread_id) {
     uint32_t nonce_step = m_config.num_threads;
     
     LOG_INFO("Mining thread %d started", thread_id);
+    
+    // Initialize per-thread stats
+    m_stats.init_thread(thread_id);
     
     while (m_running) {
         // Wait for job
@@ -263,6 +277,18 @@ void Miner::mining_thread(uint32_t thread_id) {
                 // This matches ccminer: GenNewCLKey(blockhash_half, data_key)
                 hasher.prepare_key(intermediate);
                 
+                // Debug: log job setup
+                std::string hdr_nonce_before = utils::bytes_to_hex(m_current_job.header + 108, 32);
+                std::string hdr_nonce_after = utils::bytes_to_hex(full_block + 108, 32);
+                std::string ns_debug = utils::bytes_to_hex(nonceSpace, 15);
+                std::string int_debug = utils::bytes_to_hex(intermediate, 64);
+                int ver_int = solution_version;
+                int mm_int = full_block[143+5];
+                LOG_INFO("[JOB] ver=%d mm=%d hdr_nonce=%s", ver_int, mm_int, hdr_nonce_before.c_str());
+                LOG_INFO("[JOB] cleared_nonce=%s", hdr_nonce_after.c_str());
+                LOG_INFO("[JOB] nonceSpace=%s", ns_debug.c_str());
+                LOG_INFO("[JOB] intermediate=%s", int_debug.c_str());
+                
                 // Reset nonce for new job
                 nonce = thread_id;
             }
@@ -287,13 +313,38 @@ void Miner::mining_thread(uint32_t thread_id) {
             // This matches ccminer's Verus2hash exactly
             hasher.hash_with_nonce(intermediate, nonceSpace, hash);
             m_stats.hashes++;
-
+            m_stats.thread_hashes[thread_id]++;
+            
+            // Debug: log every 500K hashes
+            static thread_local uint64_t sample_count = 0;
+            if (++sample_count % 500000 == 0) {
+                std::string hash_hex = utils::bytes_to_hex(hash, 32);
+                LOG_INFO("[SAMPLE] hash_last4=%s (target=40000000)", 
+                         hash_hex.substr(56, 8).c_str());
+            }
+            
             // Check if hash meets target
             if (check_hash(hash, target)) {
+                // Found a share!
+                // Log the nonceSpace we used for hashing
+                std::string miner_ns_hex = utils::bytes_to_hex(nonceSpace, 15);
+                LOG_INFO("[HASH] miner_nonceSpace=%s nonce=%u", miner_ns_hex.c_str(), nonce);
+                
                 std::lock_guard<std::mutex> lock(m_job_mutex);
-
+                
                 // Verify job hasn't changed before submitting
                 if (m_current_job.job_id == current_job_id) {
+                    // Debug: log hash and target
+                    std::string hash_hex = utils::bytes_to_hex(hash, 32);
+                    std::string target_hex = utils::bytes_to_hex(target, 32);
+                    std::string ns_hex = utils::bytes_to_hex(nonceSpace, 15);
+                    std::string int_hex = utils::bytes_to_hex(intermediate, 32);
+                    LOG_INFO("[DEBUG] Hash:   %s", hash_hex.c_str());
+                    LOG_INFO("[DEBUG] Target: %s", target_hex.c_str());
+                    LOG_INFO("[DEBUG] NonceSpace: %s", ns_hex.c_str());
+                    LOG_INFO("[DEBUG] Intermediate: %s", int_hex.c_str());
+                    LOG_INFO("[DEBUG] Nonce: %u (0x%08x)", nonce, nonce);
+                    
                     utils::Logger::instance().share_found(m_current_job.difficulty);
                     submit_share(m_current_job, nonce, current_solution);
                 } else {

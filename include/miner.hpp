@@ -17,16 +17,37 @@ namespace bloxminer {
  * Mining statistics
  */
 struct MinerStats {
+    static constexpr size_t MAX_THREADS = 256;
+    
     std::atomic<uint64_t> hashes{0};
     std::atomic<uint64_t> shares_accepted{0};
     std::atomic<uint64_t> shares_rejected{0};
     std::atomic<uint64_t> shares_submitted{0};
     std::chrono::steady_clock::time_point start_time;
     
+    // Per-thread hash counts for individual hashrate calculation
+    std::atomic<uint64_t> thread_hashes[MAX_THREADS] = {};
+    std::chrono::steady_clock::time_point thread_start_time[MAX_THREADS];
+    uint32_t num_threads = 0;
+    
     double get_hashrate() const {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration<double>(now - start_time).count();
         return elapsed > 0 ? static_cast<double>(hashes.load()) / elapsed : 0.0;
+    }
+    
+    double get_thread_hashrate(uint32_t thread_id) const {
+        if (thread_id >= MAX_THREADS) return 0.0;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - thread_start_time[thread_id]).count();
+        return elapsed > 0 ? static_cast<double>(thread_hashes[thread_id].load()) / elapsed : 0.0;
+    }
+    
+    void init_thread(uint32_t thread_id) {
+        if (thread_id < MAX_THREADS) {
+            thread_hashes[thread_id] = 0;
+            thread_start_time[thread_id] = std::chrono::steady_clock::now();
+        }
     }
 };
 

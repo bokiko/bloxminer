@@ -96,19 +96,23 @@ cat > "$INSTALL_DIR/h-stats.sh" << 'EOF'
 # HiveOS stats script - sets $khs and $stats variables (sourced by agent)
 
 LOG_FILE="/var/log/miner/custom/custom.log"
+CONFIG_FILE="/hive/miners/custom/BloxMiner/config.txt"
+
+# Get thread count from config
+THREADS=$(grep -oP '\-t\s*\K\d+' "$CONFIG_FILE" 2>/dev/null || nproc)
 
 khs=0
 local_ac=0
 local_rj=0
 cpu_temp=0
+hs_array=""
 
 if [[ -f "$LOG_FILE" ]]; then
-    # Strip ANSI color codes and cursor control sequences, get last 100 lines
-    CLEAN_LOG=$(tail -100 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+    # Strip ANSI color codes and cursor control sequences, get last 200 lines
+    CLEAN_LOG=$(tail -200 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
 
-    # Parse box format: |  Hashrate: 27.18 MH/s  Temp: 54°C     |
-    HASH_LINE=$(echo "$CLEAN_LOG" | grep '|.*Hashrate:' | tail -1)
-    if [[ "$HASH_LINE" =~ Hashrate:[[:space:]]*([0-9.]+)[[:space:]]*(MH|KH|GH|TH)/s ]]; then
+    # Parse sticky header format: "Hashrate: 27.18 MH/s"
+    if [[ "$CLEAN_LOG" =~ Hashrate:[[:space:]]*([0-9.]+)[[:space:]]*(MH|KH|GH|TH)/s ]]; then
         VALUE="${BASH_REMATCH[1]}"
         UNIT="${BASH_REMATCH[2]}"
         case "$UNIT" in
@@ -119,24 +123,80 @@ if [[ -f "$LOG_FILE" ]]; then
         esac
     fi
 
-    # Get temp from same line
-    if [[ "$HASH_LINE" =~ Temp:[[:space:]]*([0-9]+) ]]; then
+    # Get temp from header: "Temp: 54C"
+    if [[ "$CLEAN_LOG" =~ Temp:[[:space:]]*([0-9]+) ]]; then
         cpu_temp="${BASH_REMATCH[1]}"
     fi
 
-    # Parse box format: |  Accepted: 17          Rejected: 0       |
-    SHARE_LINE=$(echo "$CLEAN_LOG" | grep '|.*Accepted:' | tail -1)
-    if [[ "$SHARE_LINE" =~ Accepted:[[:space:]]*([0-9]+) ]]; then
+    # Get shares: "Shares: X" or count checkmarks
+    if [[ "$CLEAN_LOG" =~ Shares:[[:space:]]*([0-9]+) ]]; then
         local_ac="${BASH_REMATCH[1]}"
+    else
+        # Count checkmarks from log
+        local_ac=$(echo "$CLEAN_LOG" | grep -c "Share accepted" 2>/dev/null || echo "0")
     fi
-    if [[ "$SHARE_LINE" =~ Rejected:[[:space:]]*([0-9]+) ]]; then
-        local_rj="${BASH_REMATCH[1]}"
+    
+    local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected" 2>/dev/null || echo "0")
+    
+    # Parse per-thread hashrates from "Threads:" line
+    # Format: Threads: [0]1.0M [1]1.0M [2]1.0M ...
+    THREAD_LINE=$(echo "$CLEAN_LOG" | grep "Threads:" | tail -1)
+    if [[ -n "$THREAD_LINE" ]]; then
+        hs_values=()
+        for i in $(seq 0 $((THREADS-1))); do
+            hr=$(echo "$THREAD_LINE" | grep -oP "\[$i\]\K[\d.]+[MKG]?" || echo "0")
+            if [[ "$hr" =~ ([0-9.]+)M ]]; then
+                val=$(echo "${BASH_REMATCH[1]} * 1000" | bc 2>/dev/null || echo "0")
+            elif [[ "$hr" =~ ([0-9.]+)K ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$hr" =~ ([0-9.]+)G ]]; then
+                val=$(echo "${BASH_REMATCH[1]} * 1000000" | bc 2>/dev/null || echo "0")
+            else
+                val="0"
+            fi
+            hs_values+=("$val")
+        done
+        hs_array=$(IFS=,; echo "${hs_values[*]}")
     fi
 fi
 
+# Fallback: distribute total across threads
+if [[ -z "$hs_array" && "$khs" != "0" ]]; then
+    per_thread=$(echo "$khs / $THREADS" | bc 2>/dev/null || echo "0")
+    hs_values=()
+    for i in $(seq 1 $THREADS); do
+        hs_values+=("$per_thread")
+    done
+    hs_array=$(IFS=,; echo "${hs_values[*]}")
+fi
+
 # Fallback CPU temp from system
-if [[ "$cpu_temp" == "0" ]] && [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
-    cpu_temp=$(($(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000))
+if [[ "$cpu_temp" == "0" ]]; then
+    # Try hwmon (k10temp, coretemp)
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        name=$(cat "$hwmon/name" 2>/dev/null)
+        if [[ "$name" == "k10temp" || "$name" == "coretemp" ]]; then
+            temp=$(cat "$hwmon/temp1_input" 2>/dev/null || echo 0)
+            cpu_temp=$((temp / 1000))
+            break
+        fi
+    done
+    # Fallback to thermal zone
+    if [[ "$cpu_temp" == "0" && -f /sys/class/thermal/thermal_zone0/temp ]]; then
+        cpu_temp=$(($(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000))
+    fi
+fi
+
+# Build temp array (one per thread for HiveOS display)
+temp_array=""
+if [[ "$cpu_temp" != "0" && "$THREADS" -gt 0 ]]; then
+    temps=()
+    for i in $(seq 1 $THREADS); do
+        temps+=("$cpu_temp")
+    done
+    temp_array=$(IFS=,; echo "${temps[*]}")
+else
+    temp_array="$cpu_temp"
 fi
 
 # Ensure khs is a valid number
@@ -145,7 +205,7 @@ khs=$(echo "$khs" | grep -oE '^[0-9.]+' || echo "0")
 
 # Set stats variable for HiveOS agent (sourced, not printed)
 stats=$(cat <<STATSEOF
-{"hs":[$khs],"temp":[$cpu_temp],"fan":[],"khs":$khs,"ac":$local_ac,"rj":$local_rj,"ver":"1.0","algo":"verushash"}
+{"hs":[$hs_array],"temp":[$temp_array],"fan":[],"khs":$khs,"ac":$local_ac,"rj":$local_rj,"ver":"1.0","algo":"verushash"}
 STATSEOF
 )
 
