@@ -91,42 +91,51 @@ chmod +x "$INSTALL_DIR/h-run.sh"
 cat > "$INSTALL_DIR/h-stats.sh" << 'EOF'
 #!/usr/bin/env bash
 
-# Read from miner log
 LOG_FILE="/var/log/miner/custom/custom.log"
 
-# Initialize stats
 khs=0
 ac=0
 rj=0
+cpu_temp=0
 
-# Parse log for hashrate
 if [[ -f "$LOG_FILE" ]]; then
-    # Get total hashrate - look for "[HASH] X.XX MH/s"
-    HASHRATE=$(tail -200 "$LOG_FILE" | grep -oP '\[HASH\]\s*[\d.]+\s*[MKG]?H/s' | tail -1)
-    if [[ -n "$HASHRATE" ]]; then
-        if [[ "$HASHRATE" =~ ([0-9.]+).*MH ]]; then
-            khs=$(echo "${BASH_REMATCH[1]} * 1000" | bc 2>/dev/null || echo "0")
-        elif [[ "$HASHRATE" =~ ([0-9.]+).*KH ]]; then
-            khs="${BASH_REMATCH[1]}"
-        elif [[ "$HASHRATE" =~ ([0-9.]+).*GH ]]; then
-            khs=$(echo "${BASH_REMATCH[1]} * 1000000" | bc 2>/dev/null || echo "0")
-        fi
+    # Strip ANSI color codes and get last 100 lines
+    CLEAN_LOG=$(tail -100 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g')
+
+    # Get hashrate from [HASH] line
+    HASH_LINE=$(echo "$CLEAN_LOG" | grep '\[HASH\]' | tail -1)
+    if [[ "$HASH_LINE" =~ ([0-9.]+)[[:space:]]*(MH|KH|GH)/s ]]; then
+        VALUE="${BASH_REMATCH[1]}"
+        UNIT="${BASH_REMATCH[2]}"
+        case "$UNIT" in
+            MH) khs=$(echo "$VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
+            KH) khs="$VALUE" ;;
+            GH) khs=$(echo "$VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
+        esac
     fi
 
-    # Count accepted/rejected shares
-    ac=$(tail -500 "$LOG_FILE" | grep -c "Share accepted" 2>/dev/null || echo "0")
-    rj=$(tail -500 "$LOG_FILE" | grep -c "Share rejected\|rejected" 2>/dev/null || echo "0")
+    # Get accepted/rejected from [SHARE] line
+    SHARE_LINE=$(echo "$CLEAN_LOG" | grep '\[SHARE\]' | tail -1)
+    if [[ "$SHARE_LINE" =~ Accepted:[[:space:]]*([0-9]+) ]]; then
+        ac="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$SHARE_LINE" =~ Rejected:[[:space:]]*([0-9]+) ]]; then
+        rj="${BASH_REMATCH[1]}"
+    fi
+
+    # Get temp from [HASH] line
+    if [[ "$HASH_LINE" =~ Temp:[[:space:]]*([0-9]+) ]]; then
+        cpu_temp="${BASH_REMATCH[1]}"
+    fi
 fi
 
-# Get CPU temp
-cpu_temp=0
-if [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
+# Fallback CPU temp from system
+if [[ "$cpu_temp" == "0" ]] && [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
     cpu_temp=$(($(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000))
 fi
 
-# Output JSON stats
 cat << STATS
-{"hs":[],"temp":[$cpu_temp],"fan":[],"khs":$khs,"ac":$ac,"rj":$rj,"ver":"1.0","algo":"verushash"}
+{"hs":[$khs],"temp":[$cpu_temp],"fan":[],"khs":$khs,"ac":$ac,"rj":$rj,"ver":"1.0","algo":"verushash"}
 STATS
 EOF
 chmod +x "$INSTALL_DIR/h-stats.sh"
