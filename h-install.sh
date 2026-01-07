@@ -112,28 +112,26 @@ if [[ -f "$LOG_FILE" ]]; then
     # Strip ANSI codes and non-printable chars (box drawing, etc.)
     CLEAN_LOG=$(tail -200 "$LOG_FILE" | LC_ALL=C sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -cd '[:print:]\n')
 
-    # Parse hashrate: "Hashrate: 27.18 MH/s"
-    if [[ "$CLEAN_LOG" =~ Hashrate:[[:space:]]*([0-9.]+)[[:space:]]*(MH|KH|GH|TH)/s ]]; then
-        VALUE="${BASH_REMATCH[1]}"
-        UNIT="${BASH_REMATCH[2]}"
+    # Parse hashrate using grep -oP (more reliable than bash regex)
+    HR_LINE=$(echo "$CLEAN_LOG" | grep -oP 'Hashrate:\s*[0-9.]+\s*[KMGT]H/s' | tail -1)
+    if [[ -n "$HR_LINE" ]]; then
+        VALUE=$(echo "$HR_LINE" | grep -oP '[0-9.]+')
+        UNIT=$(echo "$HR_LINE" | grep -oP '[KMGT](?=H/s)')
         case "$UNIT" in
-            TH) khs=$(echo "$VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
-            GH) khs=$(echo "$VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
-            MH) khs=$(echo "$VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
-            KH) khs="$VALUE" ;;
+            T) khs=$(echo "$VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
+            G) khs=$(echo "$VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
+            M) khs=$(echo "$VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
+            K) khs="$VALUE" ;;
         esac
     fi
 
-    # Get temp: "Temp: 54C" or "Temp: 54°C"
-    if [[ "$CLEAN_LOG" =~ Temp:[[:space:]]*([0-9]+) ]]; then
-        cpu_temp="${BASH_REMATCH[1]}"
-    fi
+    # Get temp using grep
+    cpu_temp=$(echo "$CLEAN_LOG" | grep -oP 'Temp:\s*\K[0-9]+' | tail -1)
+    [[ -z "$cpu_temp" ]] && cpu_temp=0
 
-    # Get shares from header display (checkmark format)
-    # Format: "Shares: ✓ 76" or after ANSI strip just numbers
-    if [[ "$CLEAN_LOG" =~ Shares:[^0-9]*([0-9]+) ]]; then
-        local_ac="${BASH_REMATCH[1]}"
-    fi
+    # Get shares using grep
+    local_ac=$(echo "$CLEAN_LOG" | grep -oP 'Shares:[^0-9]*\K[0-9]+' | tail -1)
+    [[ -z "$local_ac" ]] && local_ac=0
 
     # Count rejected from log messages
     local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected:" 2>/dev/null || echo "0")
