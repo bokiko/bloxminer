@@ -179,9 +179,31 @@ void Miner::stats_thread() {
         for (uint32_t i = 0; i < m_config.num_threads; i++) {
             disp_stats.thread_hashrates.push_back(m_stats.get_thread_hashrate(i));
         }
-        
+
         // Update sticky header
         utils::Display::instance().update_header(disp_stats);
+
+        // Log plain-text stats line for h-stats.sh parsing
+        // Format: [STATS] hr=24.15 unit=MH temp=56 ac=100 rj=0 threads=32
+        std::string hr_unit = "H";
+        double hr_value = hashrate;
+        if (hashrate >= 1e9) { hr_value = hashrate / 1e9; hr_unit = "GH"; }
+        else if (hashrate >= 1e6) { hr_value = hashrate / 1e6; hr_unit = "MH"; }
+        else if (hashrate >= 1e3) { hr_value = hashrate / 1e3; hr_unit = "KH"; }
+
+        // Build per-thread string
+        std::stringstream threads_ss;
+        for (uint32_t i = 0; i < m_config.num_threads; i++) {
+            if (i > 0) threads_ss << ",";
+            double thr = disp_stats.thread_hashrates[i];
+            if (thr >= 1e6) threads_ss << std::fixed << std::setprecision(1) << (thr/1e6) << "M";
+            else if (thr >= 1e3) threads_ss << std::fixed << std::setprecision(1) << (thr/1e3) << "K";
+            else threads_ss << std::fixed << std::setprecision(0) << thr;
+        }
+
+        LOG_INFO("[STATS] hr=%.2f unit=%s temp=%.0f ac=%lu rj=%lu thr=%s",
+                 hr_value, hr_unit.c_str(), sys_stats.cpu_temp,
+                 disp_stats.accepted, disp_stats.rejected, threads_ss.str().c_str());
     }
 }
 

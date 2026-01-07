@@ -14,58 +14,63 @@ cpu_temp=0
 hs_array=""
 
 if [[ -f "$LOG_FILE" ]]; then
-    # Strip ANSI codes and non-printable chars (box drawing, etc.)
-    CLEAN_LOG=$(tail -200 "$LOG_FILE" | LC_ALL=C sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -cd '[:print:]\n')
+    # Get last STATS line from log
+    # Format: [STATS] hr=24.15 unit=MH temp=56 ac=100 rj=0 thr=756.0K,759.8K,...
+    STATS_LINE=$(tail -200 "$LOG_FILE" | grep '\[STATS\]' | tail -1)
 
-    # Parse hashrate using grep -oP (more reliable than bash regex)
-    HR_LINE=$(echo "$CLEAN_LOG" | grep -oP 'Hashrate:\s*[0-9.]+\s*[KMGT]H/s' | tail -1)
-    if [[ -n "$HR_LINE" ]]; then
-        VALUE=$(echo "$HR_LINE" | grep -oP '[0-9.]+')
-        UNIT=$(echo "$HR_LINE" | grep -oP '[KMGT](?=H/s)')
-        case "$UNIT" in
-            T) khs=$(echo "$VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
-            G) khs=$(echo "$VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
-            M) khs=$(echo "$VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
-            K) khs="$VALUE" ;;
-        esac
-    fi
+    if [[ -n "$STATS_LINE" ]]; then
+        # Parse hashrate value and unit
+        HR_VALUE=$(echo "$STATS_LINE" | grep -oP 'hr=\K[0-9.]+')
+        HR_UNIT=$(echo "$STATS_LINE" | grep -oP 'unit=\K[A-Z]+')
 
-    # Get temp using grep
-    cpu_temp=$(echo "$CLEAN_LOG" | grep -oP 'Temp:\s*\K[0-9]+' | tail -1)
-    [[ -z "$cpu_temp" ]] && cpu_temp=0
-
-    # Get shares using grep
-    local_ac=$(echo "$CLEAN_LOG" | grep -oP 'Shares:[^0-9]*\K[0-9]+' | tail -1)
-    [[ -z "$local_ac" ]] && local_ac=0
-
-    # Count rejected from log messages
-    local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected:" 2>/dev/null || echo "0")
-
-    # Parse per-thread hashrates - threads split across multiple lines
-    # Search entire log for each thread pattern
-    hs_values=()
-    for i in $(seq 0 $((THREADS-1))); do
-        idx=$(printf "%02d" $i)
-        # Search entire clean log for this thread's value
-        hr=$(echo "$CLEAN_LOG" | grep -oP "\[$idx\][^0-9]*\K[0-9.]+" | tail -1)
-        suffix=$(echo "$CLEAN_LOG" | grep -oP "\[$idx\][^0-9]*[0-9.]+\K[KMG]" | tail -1)
-
-        if [[ -n "$hr" ]]; then
-            case "$suffix" in
-                M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
-                G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
-                K|*) val="$hr" ;;
+        # Convert to KH/s
+        if [[ -n "$HR_VALUE" ]]; then
+            case "$HR_UNIT" in
+                TH) khs=$(echo "$HR_VALUE * 1000000000" | bc 2>/dev/null || echo "0") ;;
+                GH) khs=$(echo "$HR_VALUE * 1000000" | bc 2>/dev/null || echo "0") ;;
+                MH) khs=$(echo "$HR_VALUE * 1000" | bc 2>/dev/null || echo "0") ;;
+                KH) khs="$HR_VALUE" ;;
+                H)  khs=$(echo "scale=2; $HR_VALUE / 1000" | bc 2>/dev/null || echo "0") ;;
             esac
-        else
-            val="0"
         fi
-        hs_values+=("$val")
-    done
-    hs_array=$(IFS=,; echo "${hs_values[*]}")
+
+        # Parse temp
+        cpu_temp=$(echo "$STATS_LINE" | grep -oP 'temp=\K[0-9]+')
+        [[ -z "$cpu_temp" ]] && cpu_temp=0
+
+        # Parse accepted/rejected
+        local_ac=$(echo "$STATS_LINE" | grep -oP 'ac=\K[0-9]+')
+        [[ -z "$local_ac" ]] && local_ac=0
+
+        local_rj=$(echo "$STATS_LINE" | grep -oP 'rj=\K[0-9]+')
+        [[ -z "$local_rj" ]] && local_rj=0
+
+        # Parse per-thread hashrates
+        # Format: thr=756.0K,759.8K,757.9K,...
+        THR_STRING=$(echo "$STATS_LINE" | grep -oP 'thr=\K[^\s]+')
+        if [[ -n "$THR_STRING" ]]; then
+            hs_values=()
+            IFS=',' read -ra THR_ARRAY <<< "$THR_STRING"
+            for thr in "${THR_ARRAY[@]}"; do
+                # Parse value and suffix (K, M, G or none)
+                hr=$(echo "$thr" | grep -oP '^[0-9.]+')
+                suffix=$(echo "$thr" | grep -oP '[KMG]$')
+                if [[ -n "$hr" ]]; then
+                    case "$suffix" in
+                        M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
+                        G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
+                        K|*) val="$hr" ;;
+                    esac
+                    hs_values+=("$val")
+                fi
+            done
+            hs_array=$(IFS=,; echo "${hs_values[*]}")
+        fi
+    fi
 fi
 
 # Fallback: distribute total across threads if per-thread not found
-if [[ -z "$hs_array" || "$hs_array" == "0" ]] && [[ "$khs" != "0" ]]; then
+if [[ -z "$hs_array" ]] && [[ "$khs" != "0" && "$khs" != "" ]]; then
     per_thread=$(echo "scale=2; $khs / $THREADS" | bc 2>/dev/null || echo "0")
     hs_values=()
     for i in $(seq 1 $THREADS); do
@@ -75,8 +80,7 @@ if [[ -z "$hs_array" || "$hs_array" == "0" ]] && [[ "$khs" != "0" ]]; then
 fi
 
 # Fallback CPU temp from system
-if [[ "$cpu_temp" == "0" ]]; then
-    # Try hwmon (k10temp, coretemp)
+if [[ "$cpu_temp" == "0" || -z "$cpu_temp" ]]; then
     for hwmon in /sys/class/hwmon/hwmon*; do
         name=$(cat "$hwmon/name" 2>/dev/null)
         if [[ "$name" == "k10temp" || "$name" == "coretemp" ]]; then
@@ -85,7 +89,6 @@ if [[ "$cpu_temp" == "0" ]]; then
             break
         fi
     done
-    # Fallback to thermal zone
     if [[ "$cpu_temp" == "0" && -f /sys/class/thermal/thermal_zone0/temp ]]; then
         cpu_temp=$(($(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000))
     fi
