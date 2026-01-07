@@ -110,6 +110,7 @@ private:
         // Format message
         print_formatted(fmt, args...);
         std::cout << std::endl;
+        std::cout.flush();  // Force flush for pipe compatibility
     }
     
     void print_formatted(const char* fmt) {

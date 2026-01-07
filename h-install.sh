@@ -86,8 +86,8 @@ CONFIG=$(cat config.txt 2>/dev/null)
 mkdir -p /var/log/miner/custom
 
 # Run miner with logging (required for h-stats.sh to parse output)
-# Note: Cannot use exec with pipe, so just run with tee
-./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
+# Use stdbuf to force line buffering so tee writes output immediately
+stdbuf -oL ./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
 EOF
 chmod +x "$INSTALL_DIR/h-run.sh"
 
@@ -96,7 +96,6 @@ cat > "$INSTALL_DIR/h-stats.sh" << 'EOF'
 #!/usr/bin/env bash
 # HiveOS stats script - sets $khs and $stats variables (sourced by agent)
 
-LOG_FILE="/var/log/miner/custom/custom.log"
 CONFIG_FILE="/hive/miners/custom/bloxminer/config.txt"
 
 # Get thread count from config
@@ -108,14 +107,18 @@ local_rj=0
 cpu_temp=0
 hs_array=""
 
-if [[ -f "$LOG_FILE" ]]; then
-    # Get last STATS line from log
-    # Format: [STATS] hr=24.15 unit=MH temp=56 ac=100 rj=0 thr=756.0K,759.8K,...
-    STATS_LINE=$(tail -200 "$LOG_FILE" | grep '\[STATS\]' | tail -1)
+# Capture screen output (more reliable than log file with tee buffering)
+STATS_LINE=""
+if screen -S miner -X hardcopy /tmp/miner_screen.txt 2>/dev/null; then
+    sleep 0.1
+    STATS_LINE=$(grep '\[STATS\]' /tmp/miner_screen.txt 2>/dev/null | tail -1)
+fi
 
-    if [[ -n "$STATS_LINE" ]]; then
-        # Parse hashrate value and unit
-        HR_VALUE=$(echo "$STATS_LINE" | grep -oP 'hr=\K[0-9.]+')
+if [[ -n "$STATS_LINE" ]]; then
+
+if [[ -n "$STATS_LINE" ]]; then
+    # Parse hashrate value and unit
+    HR_VALUE=$(echo "$STATS_LINE" | grep -oP 'hr=\K[0-9.]+')
         HR_UNIT=$(echo "$STATS_LINE" | grep -oP 'unit=\K[A-Z]+')
 
         # Convert to KH/s
@@ -161,7 +164,6 @@ if [[ -f "$LOG_FILE" ]]; then
             done
             hs_array=$(IFS=,; echo "${hs_values[*]}")
         fi
-    fi
 fi
 
 # Fallback: distribute total across threads if per-thread not found
