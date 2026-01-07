@@ -3,7 +3,7 @@
 
 set -e
 
-MINER_NAME="bloxminer"
+MINER_NAME="BloxMiner"
 INSTALL_DIR="/hive/miners/custom/$MINER_NAME"
 
 echo "=========================================="
@@ -16,6 +16,7 @@ apt-get install -y -qq build-essential cmake libssl-dev git
 
 # Clean previous installation
 rm -rf "$INSTALL_DIR"
+rm -rf "/hive/miners/custom/bloxminer"  # Remove old lowercase version
 mkdir -p "$INSTALL_DIR"
 
 # Clone and build
@@ -33,9 +34,9 @@ chmod +x "$INSTALL_DIR/bloxminer"
 
 # Create h-manifest.conf
 cat > "$INSTALL_DIR/h-manifest.conf" << 'EOF'
-CUSTOM_NAME=bloxminer
+CUSTOM_NAME=BloxMiner
 CUSTOM_LOG_BASENAME=/var/log/miner/custom/custom
-CUSTOM_CONFIG_FILENAME=/hive/miners/custom/bloxminer/config.txt
+CUSTOM_CONFIG_FILENAME=/hive/miners/custom/BloxMiner/config.txt
 EOF
 
 # Create h-config.sh - parses Flight Sheet config
@@ -66,14 +67,14 @@ fi
 THREADS="${CUSTOM_PASS:-$(nproc)}"
 
 # Write config
-echo "-o $POOL -u $WALLET -w $WORKER -t $THREADS" > /hive/miners/custom/bloxminer/config.txt
+echo "-o $POOL -u $WALLET -w $WORKER -t $THREADS" > /hive/miners/custom/BloxMiner/config.txt
 EOFCONFIG
 chmod +x "$INSTALL_DIR/h-config.sh"
 
 # Create h-run.sh - runs the miner
 cat > "$INSTALL_DIR/h-run.sh" << 'EOF'
 #!/usr/bin/env bash
-cd /hive/miners/custom/bloxminer
+cd /hive/miners/custom/BloxMiner
 
 # Generate config from flight sheet
 ./h-config.sh
@@ -130,6 +131,11 @@ STATS
 EOF
 chmod +x "$INSTALL_DIR/h-stats.sh"
 
+# Set directory permissions so HiveOS can write config
+chmod 777 "$INSTALL_DIR"
+touch "$INSTALL_DIR/config.txt"
+chmod 666 "$INSTALL_DIR/config.txt"
+
 # Cleanup
 rm -rf /tmp/bloxminer
 
@@ -143,7 +149,7 @@ echo ""
 echo "Flight Sheet Setup:"
 echo "  - Miner: custom"
 echo "  - Installation URL: (leave empty after install)"
-echo "  - Miner name: bloxminer"
+echo "  - Miner name: BloxMiner"
 echo "  - Pool URL: pool.verus.io:9999"
 echo "  - Wallet: YOUR_VRSC_ADDRESS.WORKER_NAME"
 echo "  - Pass: number of threads (e.g., 16)"
