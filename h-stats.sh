@@ -14,8 +14,8 @@ cpu_temp=0
 hs_array=""
 
 if [[ -f "$LOG_FILE" ]]; then
-    # Strip ANSI codes more aggressively (including UTF-8 box chars and cursor sequences)
-    CLEAN_LOG=$(tail -200 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r')
+    # Strip ANSI codes and non-printable chars (box drawing, etc.)
+    CLEAN_LOG=$(tail -200 "$LOG_FILE" | LC_ALL=C sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -cd '[:print:]\n')
 
     # Parse hashrate: "Hashrate: 27.18 MH/s"
     if [[ "$CLEAN_LOG" =~ Hashrate:[[:space:]]*([0-9.]+)[[:space:]]*(MH|KH|GH|TH)/s ]]; then
