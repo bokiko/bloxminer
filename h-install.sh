@@ -109,7 +109,9 @@ hs_array=""
 
 # Capture screen output (more reliable than log file with tee buffering)
 STATS_LINE=""
-if screen -S miner -X hardcopy /tmp/miner_screen.txt 2>/dev/null; then
+# Get the miner screen session (HiveOS uses PID.miner format)
+SCREEN_NAME=$(screen -ls | grep -oP '\d+\.miner' | head -1)
+if [[ -n "$SCREEN_NAME" ]] && screen -S "$SCREEN_NAME" -X hardcopy /tmp/miner_screen.txt 2>/dev/null; then
     sleep 0.1
     STATS_LINE=$(grep '\[STATS\]' /tmp/miner_screen.txt 2>/dev/null | tail -1)
 fi
