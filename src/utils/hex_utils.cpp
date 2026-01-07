@@ -77,9 +77,13 @@ int compare_hash(const uint8_t* hash1, const uint8_t* hash2) {
 }
 
 bool meets_target(const uint8_t* hash, const uint8_t* target) {
-    // Hash must be <= target (comparing as 256-bit big-endian numbers)
-    // hash[0] is the most significant byte
-    for (int i = 0; i < 32; i++) {
+    // Hash must be <= target (comparing as 256-bit little-endian numbers)
+    // VerusHash outputs hash in little-endian: hash[31] is the most significant byte
+    // Pool target is also stored in standard format (big-endian in string, but we
+    // receive it and store it in the same byte order as the hash for comparison)
+    //
+    // Compare from most significant byte (index 31) down to least significant (index 0)
+    for (int i = 31; i >= 0; i--) {
         if (hash[i] < target[i]) return true;
         if (hash[i] > target[i]) return false;
     }

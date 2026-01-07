@@ -191,6 +191,8 @@ void haraka512_zero(unsigned char *out, const unsigned char *in) {
 }
 
 void haraka512_keyed(unsigned char *out, const unsigned char *in, const u128 *rc) {
+  // This is the CORRECT keyed haraka512 that uses the passed rc (key) parameter.
+  // The key comes from the CLHash-generated key array at a computed offset.
   u128 s[4], tmp;
 
   s[0] = LOAD(in);

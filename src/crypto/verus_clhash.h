@@ -83,10 +83,40 @@ uint64_t verusclhash(void *random, const unsigned char buf[64], uint64_t keyMask
 uint64_t verusclhash_sv2_1(void *random, const unsigned char buf[64], uint64_t keyMask, __m128i **pMoveScratch);
 uint64_t verusclhash_sv2_2(void *random, const unsigned char buf[64], uint64_t keyMask, __m128i **pMoveScratch);
 
-// Internal CLHash functions
+// Internal CLHash functions (legacy without FixKey)
 __m128i __verusclmulwithoutreduction64alignedrepeat(__m128i *randomsource, const __m128i buf[4], uint64_t keyMask, __m128i **pMoveScratch);
 __m128i __verusclmulwithoutreduction64alignedrepeat_sv2_1(__m128i *randomsource, const __m128i buf[4], uint64_t keyMask, __m128i **pMoveScratch);
 __m128i __verusclmulwithoutreduction64alignedrepeat_sv2_2(__m128i *randomsource, const __m128i buf[4], uint64_t keyMask, __m128i **pMoveScratch);
+
+// =========================================================================
+// NEW: Full CLHash implementation with FixKey support (matches ccminer)
+// =========================================================================
+
+// FixKey - restore modified key entries after CLHash
+// Must be called after each hash to restore the key for the next hash
+void verus_fixkey(uint32_t *fixrand, uint32_t *fixrandex, u128 *keyback,
+                  u128 *g_prand, u128 *g_prandex);
+
+// Full CLHash v2.2 with FixKey support
+// keyMask should be 511 (VERUS_KEY_SIZE128 - 1, already divided by 16)
+uint64_t verusclhashv2_2_full(
+    void *random,
+    const unsigned char buf[64],
+    uint64_t keyMask,
+    uint32_t *fixrand,
+    uint32_t *fixrandex,
+    u128 *g_prand,
+    u128 *g_prandex);
+
+// Internal CLHash v2.2 with FixKey support
+__m128i __verusclmulwithoutreduction64alignedrepeat_v2_2_full(
+    __m128i *randomsource,
+    const __m128i buf[4],
+    uint64_t keyMask,
+    uint32_t *fixrand,
+    uint32_t *fixrandex,
+    u128 *g_prand,
+    u128 *g_prandex);
 
 #ifdef __cplusplus
 }

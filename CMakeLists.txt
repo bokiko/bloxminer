@@ -37,6 +37,7 @@ set(SOURCES
     # VerusHash crypto (state of the art implementation)
     src/crypto/haraka.c
     src/crypto/verus_clhash.c
+    src/crypto/verus_clhash_v2.c
     src/crypto/verus_hash.cpp
 )
 

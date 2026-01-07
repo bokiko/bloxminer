@@ -96,7 +96,7 @@ private:
     
     void on_new_job(const stratum::Job& job);
     void on_share_result(bool accepted, const std::string& reason);
-    void submit_share(const stratum::Job& job, uint32_t nonce, const std::string& extranonce2);
+    void submit_share(const stratum::Job& job, uint32_t nonce, const std::string& solution);
     
     bool check_hash(const uint8_t* hash, const uint8_t* target);
 };

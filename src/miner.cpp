@@ -159,10 +159,20 @@ void Miner::stats_thread() {
 void Miner::mining_thread(uint32_t thread_id) {
     verus::Hasher hasher;
     alignas(32) uint8_t hash[32];
-    alignas(32) uint8_t header[80];
     alignas(32) uint8_t target[32];
     
+    // Full block buffer: 140-byte header + 3-byte prefix + 1344-byte solution = 1487 bytes
+    alignas(32) uint8_t full_block[1536];  // Aligned and padded
+    
+    // Intermediate state from hash_half (64 bytes)
+    alignas(32) uint8_t intermediate[64];
+    
+    // 15-byte nonceSpace for hash_with_nonce
+    uint8_t nonceSpace[15] = {0};
+    
     std::string current_job_id;
+    std::string current_solution;
+    uint8_t solution_version = 0;
     uint32_t nonce = thread_id;  // Each thread starts at different offset
     uint32_t nonce_step = m_config.num_threads;
     
@@ -182,11 +192,70 @@ void Miner::mining_thread(uint32_t thread_id) {
             // Check if job changed
             if (m_current_job.job_id != current_job_id) {
                 current_job_id = m_current_job.job_id;
-                memcpy(header, m_current_job.header, 80);
+                current_solution = m_current_job.solution;
                 memcpy(target, m_current_job.target, 32);
                 
-                // Initialize hasher with new header (80 bytes for stratum)
-                hasher.init(header, 80);
+                // Build full block for hashing
+                memset(full_block, 0, sizeof(full_block));
+                
+                // Copy 140-byte header
+                memcpy(full_block, m_current_job.header, 140);
+                
+                // Add solution prefix (fd4005 = compact size for 1344)
+                full_block[140] = 0xfd;
+                full_block[141] = 0x40;
+                full_block[142] = 0x05;
+                
+                // Copy solution body (pad to 1344 bytes)
+                size_t sol_bytes = current_solution.length() / 2;
+                utils::hex_to_bytes(current_solution, full_block + 143, sol_bytes);
+                
+                // Get solution version (first byte of solution body)
+                solution_version = full_block[143];
+                
+                // Save header nonce values to nonceSpace BEFORE clearing
+                // nonceSpace layout from ccminer (15 bytes total):
+                // - bytes 0-6: header[108:114] = first 7 bytes of nNonce (extranonce1 + padding)
+                // - bytes 7-10: header[128:131] = bytes 20-23 of nNonce (more padding)
+                // - bytes 11-14: mining nonce (set per-iteration)
+                //
+                // From ccminer: memcpy(nonceSpace, &pdata[27], 7);  // bytes 108-114
+                //               memcpy(nonceSpace + 7, &pdata[32], 4);  // bytes 128-131
+                memcpy(nonceSpace, full_block + 108, 7);
+                memcpy(nonceSpace + 7, full_block + 128, 4);
+                // nonceSpace[11..14] will be set per-nonce
+                
+                // For version >= 7 with merged mining (solution[5] > 0), clear non-canonical data
+                if (solution_version >= 7 && full_block[143 + 5] > 0) {
+                    // Clear header fields: hashPrevBlock, hashMerkleRoot, hashFinalSaplingRoot (96 bytes at offset 4)
+                    memset(full_block + 4, 0, 96);
+                    // Clear nBits (4 bytes at offset 104)
+                    memset(full_block + 104, 0, 4);
+                    // Clear nNonce (32 bytes at offset 108)
+                    memset(full_block + 108, 0, 32);
+                    // Clear hashPrevMMRRoot and hashBlockMMRRoot in solution (64 bytes starting at solution byte 8)
+                    memset(full_block + 143 + 8, 0, 64);
+                }
+                
+                // Compute intermediate state from full block (once per job)
+                // This matches ccminer: VerusHashHalf(blockhash_half, full_data, 1487)
+                hasher.hash_half(full_block, 1487, intermediate);
+                
+                // Prepare CLHash key from intermediate (once per job)
+                // This matches ccminer: GenNewCLKey(blockhash_half, data_key)
+                hasher.prepare_key(intermediate);
+                
+                // Debug: log job setup
+                std::string hdr_nonce_before = utils::bytes_to_hex(m_current_job.header + 108, 32);
+                std::string hdr_nonce_after = utils::bytes_to_hex(full_block + 108, 32);
+                std::string ns_debug = utils::bytes_to_hex(nonceSpace, 15);
+                std::string int_debug = utils::bytes_to_hex(intermediate, 64);
+                int ver_int = solution_version;
+                int mm_int = full_block[143+5];
+                LOG_INFO("[JOB] ver=%d mm=%d hdr_nonce=%s", ver_int, mm_int, hdr_nonce_before.c_str());
+                LOG_INFO("[JOB] cleared_nonce=%s", hdr_nonce_after.c_str());
+                LOG_INFO("[JOB] nonceSpace=%s", ns_debug.c_str());
+                LOG_INFO("[JOB] intermediate=%s", int_debug.c_str());
                 
                 // Reset nonce for new job
                 nonce = thread_id;
@@ -202,22 +271,54 @@ void Miner::mining_thread(uint32_t thread_id) {
                 break;
             }
             
-            // Compute hash
-            hasher.hash(nonce, hash);
+            // Set mining nonce in nonceSpace (bytes 11-14, little-endian)
+            nonceSpace[11] = (nonce >> 0) & 0xFF;
+            nonceSpace[12] = (nonce >> 8) & 0xFF;
+            nonceSpace[13] = (nonce >> 16) & 0xFF;
+            nonceSpace[14] = (nonce >> 24) & 0xFF;
+            
+            // Use two-stage hash with proper FillExtra rotation
+            // This matches ccminer's Verus2hash exactly
+            hasher.hash_with_nonce(intermediate, nonceSpace, hash);
             m_stats.hashes++;
+            
+            // Debug: log every 500K hashes
+            static thread_local uint64_t sample_count = 0;
+            if (++sample_count % 500000 == 0) {
+                std::string hash_hex = utils::bytes_to_hex(hash, 32);
+                LOG_INFO("[SAMPLE] hash_last4=%s (target=40000000)", 
+                         hash_hex.substr(56, 8).c_str());
+            }
             
             // Check if hash meets target
             if (check_hash(hash, target)) {
                 // Found a share!
+                // Log the nonceSpace we used for hashing
+                std::string miner_ns_hex = utils::bytes_to_hex(nonceSpace, 15);
+                LOG_INFO("[HASH] miner_nonceSpace=%s nonce=%u", miner_ns_hex.c_str(), nonce);
+                
                 std::lock_guard<std::mutex> lock(m_job_mutex);
                 
-                // Generate extranonce2
-                uint32_t en2 = m_extranonce2++;
-                std::stringstream ss;
-                ss << std::hex << std::setfill('0') << std::setw(m_stratum.get_extranonce2_size() * 2) << en2;
-                
-                utils::Logger::instance().share_found(m_current_job.difficulty);
-                submit_share(m_current_job, nonce, ss.str());
+                // Verify job hasn't changed before submitting
+                if (m_current_job.job_id == current_job_id) {
+                    // Debug: log hash and target
+                    std::string hash_hex = utils::bytes_to_hex(hash, 32);
+                    std::string target_hex = utils::bytes_to_hex(target, 32);
+                    std::string ns_hex = utils::bytes_to_hex(nonceSpace, 15);
+                    std::string int_hex = utils::bytes_to_hex(intermediate, 32);
+                    LOG_INFO("[DEBUG] Hash:   %s", hash_hex.c_str());
+                    LOG_INFO("[DEBUG] Target: %s", target_hex.c_str());
+                    LOG_INFO("[DEBUG] NonceSpace: %s", ns_hex.c_str());
+                    LOG_INFO("[DEBUG] Intermediate: %s", int_hex.c_str());
+                    LOG_INFO("[DEBUG] Nonce: %u (0x%08x)", nonce, nonce);
+                    
+                    utils::Logger::instance().share_found(m_current_job.difficulty);
+                    submit_share(m_current_job, nonce, current_solution);
+                } else {
+                    // Job changed, share is stale - don't submit
+                    LOG_WARN("Discarding stale share for job %s (current: %s)", 
+                             current_job_id.c_str(), m_current_job.job_id.c_str());
+                }
             }
             
             nonce += nonce_step;
@@ -252,12 +353,12 @@ void Miner::on_share_result(bool accepted, const std::string& reason) {
     }
 }
 
-void Miner::submit_share(const stratum::Job& job, uint32_t nonce, const std::string& extranonce2) {
+void Miner::submit_share(const stratum::Job& job, uint32_t nonce, const std::string& solution) {
     stratum::Share share;
     share.job_id = job.job_id;
-    share.extranonce2 = extranonce2;
     share.ntime = job.ntime;
     share.nonce = nonce;
+    share.solution = solution;
     
     m_stats.shares_submitted++;
     m_stratum.submit_share(share);

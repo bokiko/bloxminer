@@ -26,8 +26,13 @@ struct Job {
     std::string ntime;          // Block timestamp
     bool clean_jobs;            // If true, discard previous work
     
+    // Verus-specific fields
+    std::string final_sapling_root;  // hashFinalSaplingRoot
+    std::string solution;            // Solution template from pool
+    
     // Parsed/computed fields
-    uint8_t header[80];         // Constructed block header
+    uint8_t header[256];        // Constructed block header (up to 140 bytes for Verus)
+    size_t header_len;          // Actual header length
     uint8_t target[32];         // Target hash for share validation
     double difficulty;          // Current difficulty
     
@@ -42,6 +47,7 @@ struct Share {
     std::string extranonce2;
     std::string ntime;
     uint32_t nonce;
+    std::string solution;       // Verus: full solution with nonce embedded
 };
 
 /**
@@ -125,6 +131,16 @@ public:
     double get_difficulty() const { return m_difficulty; }
     
     /**
+     * Check if pool provided a target directly
+     */
+    bool has_pool_target() const { return m_has_pool_target; }
+    
+    /**
+     * Get pool-provided target
+     */
+    const uint8_t* get_pool_target() const { return m_pool_target; }
+    
+    /**
      * Run the receive loop (blocks)
      */
     void run();
@@ -150,6 +166,10 @@ private:
     size_t m_extranonce2_size;
     std::atomic<double> m_difficulty;
     std::atomic<uint64_t> m_message_id;
+    
+    // Pool-provided target (from mining.set_target)
+    uint8_t m_pool_target[32];
+    std::atomic<bool> m_has_pool_target;
     
     // Thread safety
     std::mutex m_send_mutex;
