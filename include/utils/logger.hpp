@@ -48,11 +48,13 @@ public:
     
     // Convenience methods for common mining output
     void hashrate(double hashrate, const std::string& unit = "H/s");
+    void hashrate_with_stats(double hashrate, double cpu_temp, double cpu_power);
     void share_accepted(uint64_t accepted, uint64_t rejected);
     void share_found(double difficulty);
     void connected(const std::string& host, uint16_t port);
     void disconnected(const std::string& reason);
     void new_job(const std::string& job_id, double difficulty);
+    void system_stats(double cpu_temp, double cpu_power);
 
 private:
     Logger() : m_level(LogLevel::INFO) {}

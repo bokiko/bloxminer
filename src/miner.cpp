@@ -1,6 +1,7 @@
 #include "../include/miner.hpp"
 #include "../include/utils/hex_utils.hpp"
 #include "../include/utils/logger.hpp"
+#include "../include/utils/system_monitor.hpp"
 
 #include <cstring>
 #include <sstream>
@@ -148,7 +149,17 @@ void Miner::stats_thread() {
         if (!m_running) break;
         
         double hashrate = m_stats.get_hashrate();
-        utils::Logger::instance().hashrate(hashrate);
+        
+        // Get system stats (temp, power)
+        auto sys_stats = utils::SystemMonitor::instance().get_stats();
+        
+        // Log hashrate with system stats
+        utils::Logger::instance().hashrate_with_stats(
+            hashrate,
+            sys_stats.cpu_temp,
+            sys_stats.cpu_power
+        );
+        
         utils::Logger::instance().share_accepted(
             m_stats.shares_accepted.load(),
             m_stats.shares_rejected.load()

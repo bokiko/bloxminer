@@ -20,23 +20,22 @@
 
 ---
 
-## HiveOS Installation
+## Quick Install
 
-### Installation URL (for Flight Sheet)
+### Ubuntu/Debian (Interactive)
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/install.sh | bash
+```
+The installer will ask for your wallet, pool, and thread count, then start mining.
+
+### HiveOS (Flight Sheet)
 ```
 https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
 ```
 
-### Manual Terminal Install
+### HiveOS (Terminal)
 ```bash
 curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
-```
-
-After installation, the miner is located at `/hive/miners/bloxminer/bloxminer`
-
-### Run Manually
-```bash
-/hive/miners/bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t $(nproc)
 ```
 
 ---
@@ -78,6 +77,16 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 - Stratum v1 protocol
 - All major Verus pools
 - HiveOS ready
+
+</td>
+</tr>
+<tr>
+<td colspan="2">
+
+### Monitoring
+- Real-time CPU temperature display
+- Power consumption monitoring (RAPL)
+- Hashrate and share statistics
 
 </td>
 </tr>
@@ -216,6 +225,9 @@ Hash Result (32 bytes)
 - [x] VerusHash v2.2 implementation
 - [x] Stratum v1 support
 - [x] Pool verification (100% acceptance)
+- [x] CPU temperature monitoring
+- [x] Power consumption monitoring
+- [x] Interactive Ubuntu installer
 - [ ] ARM64 support
 - [ ] Solo mining mode
 - [ ] Benchmark mode
