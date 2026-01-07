@@ -138,31 +138,27 @@ if [[ -f "$LOG_FILE" ]]; then
     # Count rejected from log messages
     local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected:" 2>/dev/null || echo "0")
 
-    # Parse per-thread hashrates from "Threads:" line
-    # Format after ANSI strip: "Threads: [00]740.5K [01]740.1K ..."
-    THREAD_LINE=$(echo "$CLEAN_LOG" | grep "Threads:" | tail -1)
-    if [[ -n "$THREAD_LINE" ]]; then
-        hs_values=()
-        for i in $(seq 0 $((THREADS-1))); do
-            # Zero-pad the index to match [00], [01], etc.
-            idx=$(printf "%02d" $i)
-            # Extract value after [NN] - handles K, M, G suffixes
-            hr=$(echo "$THREAD_LINE" | grep -oP "\[$idx\][^0-9]*\K[0-9.]+" | head -1)
-            suffix=$(echo "$THREAD_LINE" | grep -oP "\[$idx\][^0-9]*[0-9.]+\K[KMG]" | head -1)
+    # Parse per-thread hashrates - threads split across multiple lines
+    # Search entire log for each thread pattern
+    hs_values=()
+    for i in $(seq 0 $((THREADS-1))); do
+        idx=$(printf "%02d" $i)
+        # Search entire clean log for this thread's value
+        hr=$(echo "$CLEAN_LOG" | grep -oP "\[$idx\][^0-9]*\K[0-9.]+" | tail -1)
+        suffix=$(echo "$CLEAN_LOG" | grep -oP "\[$idx\][^0-9]*[0-9.]+\K[KMG]" | tail -1)
 
-            if [[ -n "$hr" ]]; then
-                case "$suffix" in
-                    M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
-                    G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
-                    K|*) val="$hr" ;;
-                esac
-            else
-                val="0"
-            fi
-            hs_values+=("$val")
-        done
-        hs_array=$(IFS=,; echo "${hs_values[*]}")
-    fi
+        if [[ -n "$hr" ]]; then
+            case "$suffix" in
+                M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
+                G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
+                K|*) val="$hr" ;;
+            esac
+        else
+            val="0"
+        fi
+        hs_values+=("$val")
+    done
+    hs_array=$(IFS=,; echo "${hs_values[*]}")
 fi
 
 # Fallback: distribute total across threads if per-thread not found
