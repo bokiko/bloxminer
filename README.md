@@ -1,72 +1,93 @@
+<div align="center">
+
 # BloxMiner
 
-**High-Performance VerusHash v2.2 CPU Miner**
+**High-Performance VerusHash v2.2 CPU Miner for Verus Coin**
 
-BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing VerusHash v2.2 algorithm. Optimized for modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ support.
+<p>
+  <a href="https://github.com/bokiko/bloxminer"><img src="https://img.shields.io/badge/GitHub-bloxminer-181717?style=for-the-badge&logo=github" alt="GitHub"></a>
+  <a href="https://verus.io"><img src="https://img.shields.io/badge/Verus-VRSC-3165D4?style=for-the-badge" alt="Verus"></a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Language-C++-00599C?style=flat-square&logo=cplusplus" alt="C++">
+  <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
+  <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
+</p>
+
+</div>
 
 ---
 
-## HiveOS - One Command Install
+## Overview
 
-Copy and paste this into your HiveOS terminal (replace `YOUR_WALLET` with your VRSC address):
+BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing the VerusHash v2.2 algorithm. Designed for maximum performance on modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ hardware acceleration.
 
-```bash
-cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t $(nproc)
-```
+---
 
-**Run in background:**
-```bash
-cd ~/bloxminer/build && nohup ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t $(nproc) > ~/miner.log 2>&1 &
-```
+## Stats
 
-**Check miner status:**
-```bash
-tail -f ~/miner.log
-```
-
-**Stop miner:**
-```bash
-pkill bloxminer
-```
+| Metric | Value |
+|--------|-------|
+| **Share Acceptance** | 100% verified |
+| **Pool Tested** | pool.verus.io |
+| **Algorithm** | VerusHash v2.2 |
+| **Platforms** | Ubuntu, Debian, HiveOS |
 
 ---
 
 ## Features
 
-- **VerusHash v2.2** - Current Verus mainnet algorithm
-- **Multi-threaded** - Uses all CPU cores by default
-- **Stratum v1** - Works with all major Verus pools
-- **Optimized** - AES-NI, AVX2, PCLMULQDQ hardware acceleration
-- **Pool Verified** - Tested with pool.verus.io (100% share acceptance)
+<table>
+<tr>
+<td width="50%">
+
+### Performance
+- VerusHash v2.2 mainnet algorithm
+- AES-NI hardware acceleration
+- AVX2 vector optimizations
+- PCLMULQDQ carry-less multiplication
+
+</td>
+<td width="50%">
+
+### Compatibility
+- Multi-threaded (auto-detect cores)
+- Stratum v1 protocol
+- All major Verus pools
+- HiveOS ready
+
+</td>
+</tr>
+</table>
 
 ---
 
-## Requirements
+## Quick Start
 
-### Supported Systems
-- **HiveOS** (recommended)
-- **Ubuntu** 20.04, 22.04
-- **Debian** 11+
-
-### Hardware
-- x86-64 CPU with AES-NI, AVX2, PCLMULQDQ
-- Intel Haswell+ or AMD Zen+ processors
-
----
-
-## Ubuntu/Debian Installation
+### Ubuntu/Debian
 
 ```bash
 # Install dependencies
-sudo apt update && sudo apt install -y build-essential cmake libssl-dev git
+sudo apt update
+sudo apt install build-essential cmake libssl-dev git
 
 # Clone and build
 git clone https://github.com/bokiko/bloxminer.git
-cd bloxminer && mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+cd bloxminer
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+make -C build -j$(nproc)
 
-# Run miner
-./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t 4
+# Run
+./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w miner1 -t 4
+```
+
+### HiveOS (One Command)
+
+```bash
+cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && make -C build -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
 ```
 
 ---
@@ -74,66 +95,137 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 ## Usage
 
 ```bash
-./bloxminer -o <pool:port> -u <wallet> -w <worker> -t <threads>
+./bloxminer -o <pool:port> -u <wallet_address> [options]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-o` | Pool address (host:port) | Required |
-| `-u` | Wallet address | Required |
-| `-w` | Worker name | hostname |
-| `-t` | Number of threads | All cores |
+| `-o, --pool` | Pool address (host:port) | Required |
+| `-u, --user` | Wallet address | Required |
+| `-w, --worker` | Worker name | hostname |
+| `-p, --pass` | Pool password | x |
+| `-t, --threads` | Mining threads | Auto-detect |
 
-### Pool Examples
+### Examples
 
 ```bash
-# Verus.io pool
-./bloxminer -o pool.verus.io:9999 -u RYourWallet -w rig1 -t 4
+# Verus.io pool with 4 threads
+./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w miner1 -t 4
 
-# LuckPool
-./bloxminer -o na.luckpool.net:3956 -u RYourWallet -w rig1 -t 8
+# LuckPool with 8 threads
+./bloxminer -o na.luckpool.net:3956 -u RYourWalletAddress -w rig1 -t 8
+
+# All available threads
+./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress
 ```
 
 ---
 
 ## Performance
 
-| CPU | Per Thread | 4 Threads |
-|-----|------------|-----------|
-| AMD Ryzen 9 5950X | ~1.8 MH/s | ~7.2 MH/s |
-| AMD Ryzen 7 5800X | ~1.7 MH/s | ~6.8 MH/s |
-| Intel i9-12900K | ~1.5 MH/s | ~6.0 MH/s |
+| CPU | H/s per Thread |
+|-----|----------------|
+| AMD Ryzen 9 5950X | ~1.8 MH/s |
+| AMD Ryzen 7 5800X | ~1.7 MH/s |
+| AMD Ryzen AI 9 HX 370 | ~1.6 MH/s |
+| Intel Core i9-12900K | ~1.5 MH/s |
+
+*Performance varies based on CPU model, cooling, and system configuration.*
 
 ---
 
-## Troubleshooting
+## Requirements
 
-**Check CPU support:**
-```bash
-lscpu | grep -E "aes|avx2|pclmul"
+| Category | Requirement |
+|----------|-------------|
+| **OS** | Ubuntu 20.04+, Debian 11+, HiveOS |
+| **CPU** | x86-64 with AES-NI, AVX2, PCLMULQDQ |
+| **Compiler** | GCC 9+ or Clang 10+ |
+| **Build** | CMake 3.16+, OpenSSL dev libs |
+
+Most Intel (Haswell+) and AMD (Zen+) processors are supported.
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| **Language** | C++ |
+| **Build** | CMake |
+| **Crypto** | OpenSSL, AES-NI intrinsics |
+| **Protocol** | Stratum v1 |
+
+---
+
+## Project Structure
+
+```
+bloxminer/
+├── src/
+│   ├── main.cpp              # Entry point
+│   ├── miner.cpp             # Mining engine
+│   ├── crypto/               # Haraka, CLHash, VerusHash
+│   ├── stratum/              # Pool communication
+│   └── utils/                # Hex, logging utilities
+├── include/                  # Header files
+├── tests/                    # Test programs
+├── CMakeLists.txt
+└── README.md
 ```
 
-**View logs:**
-```bash
-tail -f ~/miner.log
+---
+
+## Algorithm
+
+VerusHash v2.2 combines multiple cryptographic primitives for ASIC resistance:
+
+```
+Block Data (1487 bytes)
+    ↓
+Haraka512 Chain (AES-NI)
+    ↓
+Key Generation (8832 bytes via Haraka256)
+    ↓
+CLHash v2.2 (32 iterations + AES mixing)
+    ↓
+Final Haraka512 (keyed)
+    ↓
+Hash Result (32 bytes)
 ```
 
-**Check if running:**
-```bash
-ps aux | grep bloxminer
-```
+---
+
+## Roadmap
+
+- [x] VerusHash v2.2 implementation
+- [x] Stratum v1 support
+- [x] Pool verification (100% acceptance)
+- [ ] ARM64 support
+- [ ] Solo mining mode
+- [ ] Benchmark mode
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file.
-
-## Acknowledgments
-
-- [VerusCoin Team](https://verus.io)
-- [ccminer-verus](https://github.com/monkins1010/ccminer)
+MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-Made by [@bokiko](https://github.com/bokiko)
+## Acknowledgments
+
+- [VerusCoin Team](https://verus.io) - Original VerusHash implementation
+- [ccminer-verus](https://github.com/monkins1010/ccminer) - Reference CPU implementation
+- [Daniel Lemire](https://github.com/lemire/clhash) - CLHash algorithm
+
+---
+
+<p align="center">
+  <a href="https://github.com/bokiko/bloxminer">GitHub</a> •
+  <a href="https://verus.io">Verus.io</a>
+</p>
+
+<p align="center">
+  Made by <a href="https://github.com/bokiko">@bokiko</a>
+</p>
