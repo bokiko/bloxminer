@@ -48,9 +48,9 @@ git clone https://github.com/bokiko/bloxminer.git
 cd bloxminer
 
 # Build
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+make -C build -j$(nproc)
 ```
 
 ### HiveOS
@@ -58,7 +58,7 @@ make -j$(nproc)
 ```bash
 # Update and install dependencies
 sudo apt update
-sudo apt install -y build-essential cmake libssl-dev git
+sudo apt install -y build-essential cmake libssl-dev git wget
 
 # Clone repository
 cd ~
@@ -66,42 +66,82 @@ git clone https://github.com/bokiko/bloxminer.git
 cd bloxminer
 
 # Build
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+make -C build -j$(nproc)
 
-# Run (after building - see HiveOS Installation section below)
+# Run miner
 cd ..
-./bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
+./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
 ```
 
 **Note:** See [HiveOS Installation](#hiveos-installation) section for quick-start commands.
 
 ## HiveOS Installation
 
-For HiveOS users, install and run BloxMiner with these commands:
+### Quick Start (Recommended)
+
+Copy and paste this entire block into your HiveOS terminal:
+
+```bash
+cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git wget && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET_ADDRESS_HERE -w HiveOSMiner -t 4
+```
+
+### Manual Installation
 
 ```bash
 # Update HiveOS
 sudo apt update
 
-# Install build dependencies
-sudo apt install -y build-essential cmake libssl-dev git wget
+# Install dependencies
+sudo apt install -y build-essential cmake libssl-dev git
 
 # Clone BloxMiner
 cd ~
 git clone https://github.com/bokiko/bloxminer.git
 cd bloxminer
 
-# Build the miner
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+# Build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+make -C build -j$(nproc)
 
-# Run BloxMiner
+# Run miner (binary is now in parent directory)
 cd ..
-# Replace with your wallet and pool
-./bloxminer/bloxminer -o pool.verus.io:9999 -u RYourVRSCWalletAddress -w HiveOSMiner -t 4
+./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
+```
+
+### HiveOS-Specific Notes
+
+- **CPU Detection:** HiveOS automatically detects available threads
+- **Performance:** HiveOS instances typically support AES-NI, AVX2, and PCLMULQDQ
+- **Threading:** Recommended threads: 2-4 for most HiveOS instances
+
+### Background Mining (Optional)
+
+```bash
+# Run in background with nohup
+cd bloxminer && nohup ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4 > miner.log 2>&1 &
+
+# Or use tmux for interactive background sessions
+tmux new -s miner
+./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
+# Press Ctrl+B then D to detach
+```
+
+### Troubleshooting on HiveOS
+
+```bash
+# Check if CPU supports required features
+lscpu | grep -E "aes|avx2|pclmul"
+
+# Monitor miner output
+tail -f miner.log
+
+# Check running processes
+ps aux | grep bloxminer
+
+# Stop miner if needed
+pkill bloxminer
 ```
 
 ### HiveOS Quick Start (One-liner)

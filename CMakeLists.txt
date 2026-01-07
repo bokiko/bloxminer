@@ -41,8 +41,13 @@ set(SOURCES
     src/crypto/verus_hash.cpp
 )
 
-# Create executable
+# Create executable with project name prefix to place it in project root
 add_executable(bloxminer ${SOURCES})
+
+# Set output directory to project root (not build/)
+set_target_properties(bloxminer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
 
 # Include directories
 target_include_directories(bloxminer PRIVATE
