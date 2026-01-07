@@ -256,18 +256,6 @@ void Miner::mining_thread(uint32_t thread_id) {
                 // This matches ccminer: GenNewCLKey(blockhash_half, data_key)
                 hasher.prepare_key(intermediate);
                 
-                // Debug: log job setup
-                std::string hdr_nonce_before = utils::bytes_to_hex(m_current_job.header + 108, 32);
-                std::string hdr_nonce_after = utils::bytes_to_hex(full_block + 108, 32);
-                std::string ns_debug = utils::bytes_to_hex(nonceSpace, 15);
-                std::string int_debug = utils::bytes_to_hex(intermediate, 64);
-                int ver_int = solution_version;
-                int mm_int = full_block[143+5];
-                LOG_INFO("[JOB] ver=%d mm=%d hdr_nonce=%s", ver_int, mm_int, hdr_nonce_before.c_str());
-                LOG_INFO("[JOB] cleared_nonce=%s", hdr_nonce_after.c_str());
-                LOG_INFO("[JOB] nonceSpace=%s", ns_debug.c_str());
-                LOG_INFO("[JOB] intermediate=%s", int_debug.c_str());
-                
                 // Reset nonce for new job
                 nonce = thread_id;
             }
@@ -292,37 +280,13 @@ void Miner::mining_thread(uint32_t thread_id) {
             // This matches ccminer's Verus2hash exactly
             hasher.hash_with_nonce(intermediate, nonceSpace, hash);
             m_stats.hashes++;
-            
-            // Debug: log every 500K hashes
-            static thread_local uint64_t sample_count = 0;
-            if (++sample_count % 500000 == 0) {
-                std::string hash_hex = utils::bytes_to_hex(hash, 32);
-                LOG_INFO("[SAMPLE] hash_last4=%s (target=40000000)", 
-                         hash_hex.substr(56, 8).c_str());
-            }
-            
+
             // Check if hash meets target
             if (check_hash(hash, target)) {
-                // Found a share!
-                // Log the nonceSpace we used for hashing
-                std::string miner_ns_hex = utils::bytes_to_hex(nonceSpace, 15);
-                LOG_INFO("[HASH] miner_nonceSpace=%s nonce=%u", miner_ns_hex.c_str(), nonce);
-                
                 std::lock_guard<std::mutex> lock(m_job_mutex);
-                
+
                 // Verify job hasn't changed before submitting
                 if (m_current_job.job_id == current_job_id) {
-                    // Debug: log hash and target
-                    std::string hash_hex = utils::bytes_to_hex(hash, 32);
-                    std::string target_hex = utils::bytes_to_hex(target, 32);
-                    std::string ns_hex = utils::bytes_to_hex(nonceSpace, 15);
-                    std::string int_hex = utils::bytes_to_hex(intermediate, 32);
-                    LOG_INFO("[DEBUG] Hash:   %s", hash_hex.c_str());
-                    LOG_INFO("[DEBUG] Target: %s", target_hex.c_str());
-                    LOG_INFO("[DEBUG] NonceSpace: %s", ns_hex.c_str());
-                    LOG_INFO("[DEBUG] Intermediate: %s", int_hex.c_str());
-                    LOG_INFO("[DEBUG] Nonce: %u (0x%08x)", nonce, nonce);
-                    
                     utils::Logger::instance().share_found(m_current_job.difficulty);
                     submit_share(m_current_job, nonce, current_solution);
                 } else {

@@ -447,20 +447,6 @@ void StratumClient::submit_share(const Share& share) {
     
     std::string msg = ss.str();
     
-    // Debug: verify solution and nonceSpace
-    std::string ns_debug = utils::bytes_to_hex(nonceSpace, 15);
-    LOG_INFO("[SUBMIT] id=%d job=%s ntime=%s", (int)submit_id, share.job_id.c_str(), share.ntime.c_str());
-    LOG_INFO("[SUBMIT] noncestr=%s", noncestr.c_str());
-    LOG_INFO("[SUBMIT] nonceSpace_hex=%s", ns_debug.c_str());
-    LOG_INFO("[SUBMIT] embedded_at_2664=%s", full_solution.substr(2664, 30).c_str());
-    LOG_INFO("[SUBMIT] mining_nonce=%u (0x%08x)", share.nonce, share.nonce);
-    // Log MMR roots area (solution bytes 8-71 = hex positions 22-149 after fd4005 prefix)
-    LOG_INFO("[SUBMIT] sol_bytes8-71=%s", full_solution.substr(22, 128).c_str());
-    LOG_INFO("[SUBMIT] original_sol_first64=%s", share.solution.substr(0, 64).c_str());
-    
-    // Log the full submit message for debugging
-    LOG_INFO("[SUBMIT] FULL_MSG: %s", msg.substr(0, 500).c_str());
-    
     std::lock_guard<std::mutex> lock(m_send_mutex);
     send_message(msg);
 }
@@ -515,8 +501,6 @@ void StratumClient::stop() {
 }
 
 void StratumClient::process_message(const std::string& message) {
-    LOG_INFO("[RECV] %s", message.substr(0, 200).c_str());
-    
     // Check if it's a notification (has "method" but no "id" or id is null)
     std::string method = extract_string(message, "method");
     
@@ -536,7 +520,7 @@ void StratumClient::process_message(const std::string& message) {
                                message.find("\"error\": [") != std::string::npos;
         
         bool success = has_result_true || (has_null_error && !has_error_array);
-        
+
         // Extract error message if present
         std::string error;
         if (has_error_array) {
@@ -550,8 +534,7 @@ void StratumClient::process_message(const std::string& message) {
                 }
             }
         }
-        
-        LOG_INFO("[RESPONSE] id=%d success=%d error=%s", (int)id, success, error.c_str());
+
         handle_response(id, success, "", error);
     }
 }
@@ -661,8 +644,6 @@ void StratumClient::parse_job(const std::string& params) {
     //   "solution"          [8] - solution template (variable length hex)
     // ]}
     
-    LOG_INFO("[JOB_RAW] %s", params.c_str());
-    
     Job job;
     
     // Extract params array
@@ -741,10 +722,6 @@ void StratumClient::parse_job(const std::string& params) {
     if (elements.size() > 8) {
         std::string raw_sol = elements[8];
         job.solution = unquote(raw_sol);
-        
-        // Debug: check solution length - Verus solution is typically 201 bytes = 402 hex chars
-        // But luckpool appears to send 229 bytes = 458 hex chars
-        LOG_INFO("[JOB_SOL] len=%d", (int)job.solution.length());
     }
     
     // Set difficulty from current pool difficulty
