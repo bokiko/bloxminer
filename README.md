@@ -20,6 +20,27 @@
 
 ---
 
+## HiveOS Installation
+
+### Installation URL (for Flight Sheet)
+```
+https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+```
+
+### Manual Terminal Install
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
+```
+
+After installation, the miner is located at `/hive/miners/bloxminer/bloxminer`
+
+### Run Manually
+```bash
+/hive/miners/bloxminer/bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w worker1 -t $(nproc)
+```
+
+---
+
 ## Overview
 
 BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing the VerusHash v2.2 algorithm. Designed for maximum performance on modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ hardware acceleration.
@@ -82,12 +103,6 @@ make -C build -j$(nproc)
 
 # Run
 ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w miner1 -t 4
-```
-
-### HiveOS (One Command)
-
-```bash
-cd ~ && sudo apt update && sudo apt install -y build-essential cmake libssl-dev git && git clone https://github.com/bokiko/bloxminer.git && cd bloxminer && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && make -C build -j$(nproc) && ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w HiveOSMiner -t 4
 ```
 
 ---
@@ -182,15 +197,15 @@ VerusHash v2.2 combines multiple cryptographic primitives for ASIC resistance:
 
 ```
 Block Data (1487 bytes)
-    ↓
+    |
 Haraka512 Chain (AES-NI)
-    ↓
+    |
 Key Generation (8832 bytes via Haraka256)
-    ↓
+    |
 CLHash v2.2 (32 iterations + AES mixing)
-    ↓
+    |
 Final Haraka512 (keyed)
-    ↓
+    |
 Hash Result (32 bytes)
 ```
 
