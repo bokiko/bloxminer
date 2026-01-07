@@ -3,7 +3,7 @@
 
 set -e
 
-MINER_NAME="BloxMiner"
+MINER_NAME="bloxminer"
 INSTALL_DIR="/hive/miners/custom/$MINER_NAME"
 
 echo "=========================================="
@@ -16,7 +16,7 @@ apt-get install -y -qq build-essential cmake libssl-dev git
 
 # Clean previous installation
 rm -rf "$INSTALL_DIR"
-rm -rf "/hive/miners/custom/bloxminer"  # Remove old lowercase version
+rm -rf "/hive/miners/custom/BloxMiner"  # Remove old capitalized version
 mkdir -p "$INSTALL_DIR"
 
 # Clone and build
@@ -34,9 +34,9 @@ chmod +x "$INSTALL_DIR/bloxminer"
 
 # Create h-manifest.conf
 cat > "$INSTALL_DIR/h-manifest.conf" << 'EOF'
-CUSTOM_NAME=BloxMiner
+CUSTOM_NAME=bloxminer
 CUSTOM_LOG_BASENAME=/var/log/miner/custom/custom
-CUSTOM_CONFIG_FILENAME=/hive/miners/custom/BloxMiner/config.txt
+CUSTOM_CONFIG_FILENAME=/hive/miners/custom/bloxminer/config.txt
 EOF
 
 # Create h-config.sh - parses Flight Sheet config
@@ -67,14 +67,14 @@ fi
 THREADS="${CUSTOM_PASS:-$(nproc)}"
 
 # Write config
-echo "-o $POOL -u $WALLET -w $WORKER -t $THREADS" > /hive/miners/custom/BloxMiner/config.txt
+echo "-o $POOL -u $WALLET -w $WORKER -t $THREADS" > /hive/miners/custom/bloxminer/config.txt
 EOFCONFIG
 chmod +x "$INSTALL_DIR/h-config.sh"
 
 # Create h-run.sh - runs the miner
 cat > "$INSTALL_DIR/h-run.sh" << 'EOF'
 #!/usr/bin/env bash
-cd /hive/miners/custom/BloxMiner
+cd /hive/miners/custom/bloxminer
 
 # Generate config from flight sheet
 ./h-config.sh
@@ -86,7 +86,7 @@ CONFIG=$(cat config.txt 2>/dev/null)
 mkdir -p /var/log/miner/custom
 
 # Run miner with logging (required for h-stats.sh to parse output)
-./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
+exec ./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
 EOF
 chmod +x "$INSTALL_DIR/h-run.sh"
 
@@ -96,7 +96,7 @@ cat > "$INSTALL_DIR/h-stats.sh" << 'EOF'
 # HiveOS stats script - sets $khs and $stats variables (sourced by agent)
 
 LOG_FILE="/var/log/miner/custom/custom.log"
-CONFIG_FILE="/hive/miners/custom/BloxMiner/config.txt"
+CONFIG_FILE="/hive/miners/custom/bloxminer/config.txt"
 
 # Get thread count from config
 THREADS=$(grep -oP '\-t\s*\K\d+' "$CONFIG_FILE" 2>/dev/null || nproc)
@@ -128,14 +128,8 @@ if [[ -f "$LOG_FILE" ]]; then
         cpu_temp="${BASH_REMATCH[1]}"
     fi
 
-    # Get shares: "Shares: X" or count checkmarks
-    if [[ "$CLEAN_LOG" =~ Shares:[[:space:]]*([0-9]+) ]]; then
-        local_ac="${BASH_REMATCH[1]}"
-    else
-        # Count checkmarks from log
-        local_ac=$(echo "$CLEAN_LOG" | grep -c "Share accepted" 2>/dev/null || echo "0")
-    fi
-    
+    # Get shares: count accepted/rejected from log
+    local_ac=$(echo "$CLEAN_LOG" | grep -c "Share accepted" 2>/dev/null || echo "0")
     local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected" 2>/dev/null || echo "0")
     
     # Parse per-thread hashrates from "Threads:" line
@@ -232,7 +226,7 @@ echo ""
 echo "Flight Sheet Setup:"
 echo "  - Miner: custom"
 echo "  - Installation URL: (leave empty after install)"
-echo "  - Miner name: BloxMiner"
+echo "  - Miner name: bloxminer"
 echo "  - Pool URL: pool.verus.io:9999"
 echo "  - Wallet: YOUR_VRSC_ADDRESS.WORKER_NAME"
 echo "  - Pass: number of threads (e.g., 16)"
