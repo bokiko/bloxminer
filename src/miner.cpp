@@ -184,7 +184,7 @@ void Miner::stats_thread() {
         utils::Display::instance().update_header(disp_stats);
 
         // Log plain-text stats line for h-stats.sh parsing
-        // Format: [STATS] hr=24.15 unit=MH temp=56 ac=100 rj=0 threads=32
+        // Format: [STATS] hr=24.15 unit=MH temp=56 ac=100 rj=0 thr=756.0K,759.8K,...
         std::string hr_unit = "H";
         double hr_value = hashrate;
         if (hashrate >= 1e9) { hr_value = hashrate / 1e9; hr_unit = "GH"; }
@@ -201,9 +201,15 @@ void Miner::stats_thread() {
             else threads_ss << std::fixed << std::setprecision(0) << thr;
         }
 
-        LOG_INFO("[STATS] hr=%.2f unit=%s temp=%.0f ac=%lu rj=%lu thr=%s",
-                 hr_value, hr_unit.c_str(), sys_stats.cpu_temp,
-                 disp_stats.accepted, disp_stats.rejected, threads_ss.str().c_str());
+        // Build stats string manually since LOG_INFO uses simple format parsing
+        std::stringstream stats_ss;
+        stats_ss << "[STATS] hr=" << std::fixed << std::setprecision(2) << hr_value
+                 << " unit=" << hr_unit
+                 << " temp=" << static_cast<int>(sys_stats.cpu_temp)
+                 << " ac=" << disp_stats.accepted
+                 << " rj=" << disp_stats.rejected
+                 << " thr=" << threads_ss.str();
+        LOG_INFO("%s", stats_ss.str().c_str());
     }
 }
 
