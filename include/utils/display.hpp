@@ -13,7 +13,10 @@ namespace bloxminer {
 namespace utils {
 
 /**
- * Terminal display manager with sticky header (htop-style)
+ * Terminal display manager with TRUE sticky header using scroll regions
+ *
+ * The key insight: set scroll region BELOW header, then ALL output
+ * (including printf/cout) will scroll within that region, never touching header.
  */
 class Display {
 public:
@@ -21,7 +24,7 @@ public:
         static Display display;
         return display;
     }
-    
+
     struct Stats {
         double total_hashrate = 0;
         std::vector<double> thread_hashrates;
@@ -34,64 +37,93 @@ public:
         double difficulty = 0;
         double uptime_seconds = 0;
     };
-    
-    void set_header_lines(int lines) { m_header_lines = lines; }
-    
-    // Update and redraw the sticky header
-    void update_header(const Stats& stats) {
+
+    // Initialize terminal for sticky header mode
+    void init(int num_threads) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        
-        // Save cursor position, move to top, clear header area
-        std::cout << "\033[s";  // Save cursor
-        std::cout << "\033[H";  // Move to top
-        
-        // Draw header box
+        m_num_threads = num_threads;
+
+        // Calculate header height: 7 base lines + extra rows for >8 threads
+        m_header_lines = 7 + ((num_threads + 7) / 8);  // Ceiling div for thread rows
+        if (m_header_lines > 12) m_header_lines = 12;  // Cap at reasonable height
+
+        // Clear entire screen
+        std::cout << "\033[2J";
+
+        // Move to top
+        std::cout << "\033[H";
+
+        // Reserve space for header by printing empty lines
+        for (int i = 0; i < m_header_lines; i++) {
+            std::cout << "\033[K\n";  // Clear line and newline
+        }
+
+        // SET SCROLL REGION: from (header_lines+1) to bottom of screen (999 = large number)
+        // This is the critical part - all subsequent output stays in this region
+        std::cout << "\033[" << (m_header_lines + 1) << ";999r";
+
+        // Move cursor to first line of scroll region
+        std::cout << "\033[" << (m_header_lines + 1) << ";1H";
+
+        std::cout << std::flush;
+        m_initialized = true;
+    }
+
+    // Update header without disturbing scroll region content
+    void update_header(const Stats& stats) {
+        if (!m_initialized) return;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Save cursor position
+        std::cout << "\033[s";
+
+        // Temporarily disable scroll region to access header area
+        std::cout << "\033[r";
+
+        // Move to home (top-left)
+        std::cout << "\033[H";
+
+        // Draw the header
         draw_header(stats);
-        
-        // Restore cursor position
-        std::cout << "\033[u";  // Restore cursor
+
+        // Re-enable scroll region (from header_lines+1 to bottom)
+        std::cout << "\033[" << (m_header_lines + 1) << ";999r";
+
+        // Restore cursor position (back to where we were in scroll region)
+        std::cout << "\033[u";
+
         std::cout << std::flush;
     }
-    
-    // Print a log line (below the header)
+
+    // Print a log line (ensures it goes to scroll region)
     void log(const std::string& message) {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::cout << message << std::endl;
     }
-    
-    // Initialize terminal for header display
-    void init(int num_threads) {
-        m_num_threads = num_threads;
-        m_header_lines = 7 + (num_threads > 8 ? 2 : 1);  // Adjust based on thread count
-        
-        // Clear screen and set scroll region below header
-        std::cout << "\033[2J";  // Clear screen
-        std::cout << "\033[H";   // Move to top
-        
-        // Print empty lines for header
-        for (int i = 0; i < m_header_lines; i++) {
-            std::cout << std::endl;
-        }
-        
-        // Set scroll region (below header)
-        std::cout << "\033[" << (m_header_lines + 1) << ";999r";
-        
-        // Move cursor to start of scroll region
-        std::cout << "\033[" << (m_header_lines + 1) << ";1H";
-        std::cout << std::flush;
-    }
-    
-    // Reset terminal on exit
+
+    // Cleanup: reset scroll region and cursor
     void cleanup() {
-        // Reset scroll region
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Reset scroll region to entire screen
         std::cout << "\033[r";
+
+        // Move cursor below header area
+        std::cout << "\033[" << (m_header_lines + 1) << ";1H";
+
         std::cout << std::flush;
+        m_initialized = false;
     }
+
+    bool is_initialized() const { return m_initialized; }
+    int header_lines() const { return m_header_lines; }
 
 private:
     Display() = default;
-    
+
     void draw_header(const Stats& stats) {
+        // ANSI color codes
         const char* CYAN = "\033[36m";
         const char* GREEN = "\033[32m";
         const char* YELLOW = "\033[33m";
@@ -100,88 +132,85 @@ private:
         const char* DIM = "\033[90m";
         const char* BOLD = "\033[1m";
         const char* RESET = "\033[0m";
-        
-        int width = 80;  // Terminal width (could be dynamic)
-        
+        const char* RED = "\033[31m";
+
+        int width = 80;
+
         // Format uptime
         int hours = static_cast<int>(stats.uptime_seconds) / 3600;
         int mins = (static_cast<int>(stats.uptime_seconds) % 3600) / 60;
         int secs = static_cast<int>(stats.uptime_seconds) % 60;
-        
+
         // Format total hashrate
         std::string hr_str = format_hashrate(stats.total_hashrate);
-        
-        // Clear header area
-        for (int i = 0; i < m_header_lines; i++) {
-            std::cout << "\033[K" << std::endl;  // Clear line
-        }
-        std::cout << "\033[H";  // Back to top
-        
+
         // Line 1: Title bar
         std::cout << BOLD << CYAN << " BloxMiner v1.0.0 " << RESET
                   << DIM << "| " << RESET
                   << "Pool: " << WHITE << stats.pool << RESET
                   << DIM << " | " << RESET
                   << "Worker: " << WHITE << stats.worker << RESET
-                  << "\033[K" << std::endl;
-        
-        // Line 2: Separator
+                  << "\033[K\n";
+
+        // Line 2: Separator (thin)
         std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "─";
-        std::cout << RESET << std::endl;
-        
+        for (int i = 0; i < width; i++) std::cout << "\342\224\200";  // ─ UTF-8
+        std::cout << RESET << "\n";
+
         // Line 3: Main stats
         std::cout << " " << BOLD << GREEN << "Hashrate: " << hr_str << RESET;
-        
+
         if (stats.cpu_temp > 0) {
-            std::cout << DIM << " │ " << RESET;
-            std::cout << YELLOW << "Temp: " << std::fixed << std::setprecision(0) 
-                      << stats.cpu_temp << "°C" << RESET;
+            std::cout << DIM << " \342\224\202 " << RESET;  // │
+            std::cout << YELLOW << "Temp: " << std::fixed << std::setprecision(0)
+                      << stats.cpu_temp << "\302\260C" << RESET;  // °C
         }
-        
+
         if (stats.cpu_power > 0) {
-            std::cout << DIM << " │ " << RESET;
-            std::cout << MAGENTA << "Power: " << std::fixed << std::setprecision(1) 
+            std::cout << DIM << " \342\224\202 " << RESET;
+            std::cout << MAGENTA << "Power: " << std::fixed << std::setprecision(1)
                       << stats.cpu_power << "W" << RESET;
         }
-        
-        std::cout << DIM << " │ " << RESET;
-        std::cout << "Uptime: " << std::setfill('0') << std::setw(2) << hours 
+
+        std::cout << DIM << " \342\224\202 " << RESET;
+        std::cout << "Uptime: " << std::setfill('0') << std::setw(2) << hours
                   << ":" << std::setw(2) << mins << ":" << std::setw(2) << secs;
-        std::cout << "\033[K" << std::endl;
-        
+        std::cout << "\033[K\n";
+
         // Line 4: Shares
-        std::cout << " Shares: " << GREEN << "✓ " << stats.accepted << RESET;
+        std::cout << " Shares: " << GREEN << "\342\234\223 " << stats.accepted << RESET;  // ✓
         if (stats.rejected > 0) {
-            std::cout << "  " << "\033[31m" << "✗ " << stats.rejected << RESET;
+            std::cout << "  " << RED << "\342\234\227 " << stats.rejected << RESET;  // ✗
         }
-        std::cout << DIM << " │ " << RESET;
+        std::cout << DIM << " \342\224\202 " << RESET;
         std::cout << "Difficulty: " << std::fixed << std::setprecision(4) << stats.difficulty;
-        std::cout << "\033[K" << std::endl;
-        
+        std::cout << "\033[K\n";
+
         // Line 5: Separator
         std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "─";
-        std::cout << RESET << std::endl;
-        
-        // Line 6+: Thread hashrates (compact display)
+        for (int i = 0; i < width; i++) std::cout << "\342\224\200";
+        std::cout << RESET << "\n";
+
+        // Lines 6+: Thread hashrates (compact display, 8 per line)
         std::cout << " Threads: ";
         int threads_per_line = 8;
         for (size_t i = 0; i < stats.thread_hashrates.size(); i++) {
             if (i > 0 && i % threads_per_line == 0) {
-                std::cout << "\033[K" << std::endl << "          ";
+                std::cout << "\033[K\n          ";  // New line with indent
             }
-            std::cout << DIM << "[" << RESET << std::setw(2) << i << DIM << "]" << RESET;
-            std::cout << format_hashrate_short(stats.thread_hashrates[i]) << " ";
+            std::cout << DIM << "[" << RESET
+                      << std::setfill('0') << std::setw(2) << i
+                      << DIM << "]" << RESET
+                      << format_hashrate_short(stats.thread_hashrates[i]) << " ";
         }
-        std::cout << "\033[K" << std::endl;
-        
-        // Final separator
+        std::cout << "\033[K\n";
+
+        // Final separator (double line)
         std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "═";
-        std::cout << RESET << "\033[K" << std::endl;
+        for (int i = 0; i < width; i++) std::cout << "\342\225\220";  // ═
+        std::cout << RESET << "\033[K\n";
     }
-    
+
     std::string format_hashrate(double hr) {
         std::stringstream ss;
         ss << std::fixed << std::setprecision(2);
@@ -196,7 +225,7 @@ private:
         }
         return ss.str();
     }
-    
+
     std::string format_hashrate_short(double hr) {
         std::stringstream ss;
         ss << std::fixed << std::setprecision(1);
@@ -209,10 +238,11 @@ private:
         }
         return ss.str();
     }
-    
+
     std::mutex m_mutex;
     int m_header_lines = 8;
     int m_num_threads = 0;
+    bool m_initialized = false;
 };
 
 }  // namespace utils

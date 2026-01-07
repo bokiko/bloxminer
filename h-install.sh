@@ -86,7 +86,8 @@ CONFIG=$(cat config.txt 2>/dev/null)
 mkdir -p /var/log/miner/custom
 
 # Run miner with logging (required for h-stats.sh to parse output)
-exec ./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
+# Note: Cannot use exec with pipe, so just run with tee
+./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
 EOF
 chmod +x "$INSTALL_DIR/h-run.sh"
 
@@ -108,10 +109,10 @@ cpu_temp=0
 hs_array=""
 
 if [[ -f "$LOG_FILE" ]]; then
-    # Strip ANSI color codes and cursor control sequences, get last 200 lines
-    CLEAN_LOG=$(tail -200 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+    # Strip ANSI codes more aggressively (including UTF-8 box chars and cursor sequences)
+    CLEAN_LOG=$(tail -200 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r')
 
-    # Parse sticky header format: "Hashrate: 27.18 MH/s"
+    # Parse hashrate: "Hashrate: 27.18 MH/s"
     if [[ "$CLEAN_LOG" =~ Hashrate:[[:space:]]*([0-9.]+)[[:space:]]*(MH|KH|GH|TH)/s ]]; then
         VALUE="${BASH_REMATCH[1]}"
         UNIT="${BASH_REMATCH[2]}"
@@ -123,28 +124,38 @@ if [[ -f "$LOG_FILE" ]]; then
         esac
     fi
 
-    # Get temp from header: "Temp: 54C"
+    # Get temp: "Temp: 54C" or "Temp: 54°C"
     if [[ "$CLEAN_LOG" =~ Temp:[[:space:]]*([0-9]+) ]]; then
         cpu_temp="${BASH_REMATCH[1]}"
     fi
 
-    # Get shares: count accepted/rejected from log
-    local_ac=$(echo "$CLEAN_LOG" | grep -c "Share accepted" 2>/dev/null || echo "0")
-    local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected" 2>/dev/null || echo "0")
-    
+    # Get shares from header display (checkmark format)
+    # Format: "Shares: ✓ 76" or after ANSI strip just numbers
+    if [[ "$CLEAN_LOG" =~ Shares:[^0-9]*([0-9]+) ]]; then
+        local_ac="${BASH_REMATCH[1]}"
+    fi
+
+    # Count rejected from log messages
+    local_rj=$(echo "$CLEAN_LOG" | grep -c "Share rejected\|rejected:" 2>/dev/null || echo "0")
+
     # Parse per-thread hashrates from "Threads:" line
-    # Format: Threads: [0]1.0M [1]1.0M [2]1.0M ...
+    # Format after ANSI strip: "Threads: [00]740.5K [01]740.1K ..."
     THREAD_LINE=$(echo "$CLEAN_LOG" | grep "Threads:" | tail -1)
     if [[ -n "$THREAD_LINE" ]]; then
         hs_values=()
         for i in $(seq 0 $((THREADS-1))); do
-            hr=$(echo "$THREAD_LINE" | grep -oP "\[$i\]\K[\d.]+[MKG]?" || echo "0")
-            if [[ "$hr" =~ ([0-9.]+)M ]]; then
-                val=$(echo "${BASH_REMATCH[1]} * 1000" | bc 2>/dev/null || echo "0")
-            elif [[ "$hr" =~ ([0-9.]+)K ]]; then
-                val="${BASH_REMATCH[1]}"
-            elif [[ "$hr" =~ ([0-9.]+)G ]]; then
-                val=$(echo "${BASH_REMATCH[1]} * 1000000" | bc 2>/dev/null || echo "0")
+            # Zero-pad the index to match [00], [01], etc.
+            idx=$(printf "%02d" $i)
+            # Extract value after [NN] - handles K, M, G suffixes
+            hr=$(echo "$THREAD_LINE" | grep -oP "\[$idx\][^0-9]*\K[0-9.]+" | head -1)
+            suffix=$(echo "$THREAD_LINE" | grep -oP "\[$idx\][^0-9]*[0-9.]+\K[KMG]" | head -1)
+
+            if [[ -n "$hr" ]]; then
+                case "$suffix" in
+                    M) val=$(echo "$hr * 1000" | bc 2>/dev/null || echo "0") ;;
+                    G) val=$(echo "$hr * 1000000" | bc 2>/dev/null || echo "0") ;;
+                    K|*) val="$hr" ;;
+                esac
             else
                 val="0"
             fi
@@ -154,9 +165,9 @@ if [[ -f "$LOG_FILE" ]]; then
     fi
 fi
 
-# Fallback: distribute total across threads
-if [[ -z "$hs_array" && "$khs" != "0" ]]; then
-    per_thread=$(echo "$khs / $THREADS" | bc 2>/dev/null || echo "0")
+# Fallback: distribute total across threads if per-thread not found
+if [[ -z "$hs_array" || "$hs_array" == "0" ]] && [[ "$khs" != "0" ]]; then
+    per_thread=$(echo "scale=2; $khs / $THREADS" | bc 2>/dev/null || echo "0")
     hs_values=()
     for i in $(seq 1 $THREADS); do
         hs_values+=("$per_thread")
