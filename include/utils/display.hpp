@@ -132,15 +132,15 @@ private:
         const char* RESET = "\033[0m";
         const char* RED = "\033[31m";
 
-        // Box-drawing characters (UTF-8)
-        const char* TL = "\xE2\x94\x8C";  // ┌
-        const char* TR = "\xE2\x94\x90";  // ┐
-        const char* BL = "\xE2\x94\x94";  // └
-        const char* BR = "\xE2\x94\x98";  // ┘
-        const char* H  = "\xE2\x94\x80";  // ─
-        const char* V  = "\xE2\x94\x82";  // │
-        const char* LT = "\xE2\x94\x9C";  // ├
-        const char* RT = "\xE2\x94\xA4";  // ┤
+        // ASCII box-drawing characters (universal compatibility)
+        const char* TL = "+";  // top-left
+        const char* TR = "+";  // top-right
+        const char* BL = "+";  // bottom-left
+        const char* BR = "+";  // bottom-right
+        const char* H  = "-";  // horizontal
+        const char* V  = "|";  // vertical
+        const char* LT = "+";  // left-tee
+        const char* RT = "+";  // right-tee
 
         const int BOX_WIDTH = 60;  // Inner width
 
@@ -172,8 +172,8 @@ private:
 
         // Line 4: Hashrate and Temp
         std::string temp_str = (stats.cpu_temp > 0)
-            ? std::to_string((int)stats.cpu_temp) + "\xC2\xB0" "C"
-            : "--\xC2\xB0" "C";
+            ? std::to_string((int)stats.cpu_temp) + "C"
+            : "--C";
 
         std::cout << CYAN << V << RESET
                   << "  Hashrate: " << GREEN << std::setw(12) << std::left << hr_str << RESET
