@@ -85,9 +85,10 @@ CONFIG=$(cat config.txt 2>/dev/null)
 # Ensure log directory exists
 mkdir -p /var/log/miner/custom
 
-# Run miner with logging (required for h-stats.sh to parse output)
-# Use stdbuf to force line buffering so tee writes output immediately
-stdbuf -oL ./bloxminer $CONFIG 2>&1 | tee /var/log/miner/custom/custom.log
+# Use exec to replace shell with miner process (required for HiveOS integration)
+# HiveOS tracks the PID and expects h-run.sh to "become" the miner
+# Stats are written to /tmp/bloxminer_stats.txt for h-stats.sh
+exec ./bloxminer $CONFIG
 EOF
 chmod +x "$INSTALL_DIR/h-run.sh"
 
