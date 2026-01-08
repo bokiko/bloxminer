@@ -10,9 +10,11 @@
 </p>
 
 <p>
+  <img src="https://img.shields.io/badge/Version-1.0.1-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Language-C++-00599C?style=flat-square&logo=cplusplus" alt="C++">
   <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
   <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/HiveOS-Ready-green?style=flat-square" alt="HiveOS">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
 </p>
 
@@ -30,7 +32,7 @@ The installer will ask for your wallet, pool, and thread count, then start minin
 
 ### HiveOS (Flight Sheet)
 ```
-https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+Installation URL: https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
 ```
 
 ### HiveOS (Terminal)
@@ -46,14 +48,30 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 
 ---
 
-## Stats
+## Live Stats Display
 
-| Metric | Value |
-|--------|-------|
-| **Share Acceptance** | 100% verified |
-| **Pool Tested** | pool.verus.io |
-| **Algorithm** | VerusHash v2.2 |
-| **Platforms** | Ubuntu, Debian, HiveOS |
+```
++------------------------------------------------------------+
+|  BloxMiner v1.0.1 - VerusHash CPU Miner                    |
++------------------------------------------------------------+
+|  Hashrate: 24.15 MH/s     Temp: 55C                        |
+|  Accepted: 367            Rejected: 0                      |
+|  Uptime: 3h 24m           Power: 110.6W                    |
++------------------------------------------------------------+
+```
+
+---
+
+## Benchmarks
+
+| CPU | Threads | Hashrate | Per Thread |
+|-----|---------|----------|------------|
+| AMD EPYC 7282 | 32 | 24.15 MH/s | 755 KH/s |
+| AMD Ryzen 5600G | 12 | 14.65 MH/s | 1.22 MH/s |
+| AMD Ryzen 9 5950X | 32 | ~28 MH/s | ~875 KH/s |
+| Intel Xeon E5-2680v4 | 28 | ~14 MH/s | ~500 KH/s |
+
+*Performance varies based on CPU model, cooling, and system configuration.*
 
 ---
 
@@ -76,7 +94,7 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 - Multi-threaded (auto-detect cores)
 - Stratum v1 protocol
 - All major Verus pools
-- HiveOS ready
+- HiveOS native support
 
 </td>
 </tr>
@@ -84,9 +102,11 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 <td colspan="2">
 
 ### Monitoring
-- Real-time CPU temperature display
-- Power consumption monitoring (RAPL)
-- Hashrate and share statistics
+- Real-time sticky stats display
+- CPU temperature monitoring
+- Power consumption (RAPL)
+- Per-thread hashrate breakdown
+- JSON API on port 4068
 
 </td>
 </tr>
@@ -106,9 +126,9 @@ sudo apt install build-essential cmake libssl-dev git
 # Clone and build
 git clone https://github.com/bokiko/bloxminer.git
 cd bloxminer
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-make -C build -j$(nproc)
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 
 # Run
 ./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w miner1 -t 4
@@ -129,6 +149,7 @@ make -C build -j$(nproc)
 | `-w, --worker` | Worker name | hostname |
 | `-p, --pass` | Pool password | x |
 | `-t, --threads` | Mining threads | Auto-detect |
+| `--api-port` | API port | 4068 |
 
 ### Examples
 
@@ -145,16 +166,38 @@ make -C build -j$(nproc)
 
 ---
 
-## Performance
+## API
 
-| CPU | H/s per Thread |
-|-----|----------------|
-| AMD Ryzen 9 5950X | ~1.8 MH/s |
-| AMD Ryzen 7 5800X | ~1.7 MH/s |
-| AMD Ryzen AI 9 HX 370 | ~1.6 MH/s |
-| Intel Core i9-12900K | ~1.5 MH/s |
+BloxMiner exposes a JSON API on port 4068:
 
-*Performance varies based on CPU model, cooling, and system configuration.*
+```bash
+curl http://localhost:4068
+```
+
+```json
+{
+  "miner": "BloxMiner",
+  "version": "1.0.1",
+  "algorithm": "verushash",
+  "uptime": 12345,
+  "hashrate": {
+    "total": 24150.5,
+    "threads": [755.2, 758.1, ...],
+    "unit": "KH/s"
+  },
+  "shares": {
+    "accepted": 367,
+    "rejected": 0
+  },
+  "hardware": {
+    "threads": 32,
+    "temp": 55,
+    "power": 110.6,
+    "efficiency": 218.4,
+    "efficiency_unit": "KH/W"
+  }
+}
+```
 
 ---
 
@@ -175,10 +218,11 @@ Most Intel (Haswell+) and AMD (Zen+) processors are supported.
 
 | Component | Technology |
 |-----------|------------|
-| **Language** | C++ |
+| **Language** | C++17 |
 | **Build** | CMake |
 | **Crypto** | OpenSSL, AES-NI intrinsics |
 | **Protocol** | Stratum v1 |
+| **Monitoring** | RAPL, lm-sensors |
 
 ---
 
@@ -191,9 +235,12 @@ bloxminer/
 │   ├── miner.cpp             # Mining engine
 │   ├── crypto/               # Haraka, CLHash, VerusHash
 │   ├── stratum/              # Pool communication
-│   └── utils/                # Hex, logging utilities
+│   └── utils/                # Hex, logging, display
 ├── include/                  # Header files
 ├── tests/                    # Test programs
+├── install.sh                # Ubuntu installer
+├── h-install.sh              # HiveOS installer
+├── h-stats.sh                # HiveOS stats parser
 ├── CMakeLists.txt
 └── README.md
 ```
@@ -206,15 +253,20 @@ VerusHash v2.2 combines multiple cryptographic primitives for ASIC resistance:
 
 ```
 Block Data (1487 bytes)
-    |
-Haraka512 Chain (AES-NI)
-    |
+    │
+    ▼
+Haraka512 Chain (AES-NI accelerated)
+    │
+    ▼
 Key Generation (8832 bytes via Haraka256)
-    |
+    │
+    ▼
 CLHash v2.2 (32 iterations + AES mixing)
-    |
+    │
+    ▼
 Final Haraka512 (keyed)
-    |
+    │
+    ▼
 Hash Result (32 bytes)
 ```
 
@@ -228,9 +280,13 @@ Hash Result (32 bytes)
 - [x] CPU temperature monitoring
 - [x] Power consumption monitoring
 - [x] Interactive Ubuntu installer
+- [x] HiveOS integration
+- [x] Sticky stats display
+- [x] JSON API
 - [ ] ARM64 support
 - [ ] Solo mining mode
 - [ ] Benchmark mode
+- [ ] GPU mining (OpenCL)
 
 ---
 
@@ -254,5 +310,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 </p>
 
 <p align="center">
-  Made by <a href="https://x.com/bokiko">@bokiko</a>
+  Made by <a href="https://github.com/bokiko">@bokiko</a>
 </p>

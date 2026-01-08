@@ -163,7 +163,7 @@ private:
 
         // Line 2: Title
         std::cout << CYAN << V << RESET << "  " << BOLD << WHITE
-                  << "BloxMiner v1.0.0" << RESET << " - VerusHash CPU Miner";
+                  << "BloxMiner v1.0.1" << RESET << " - VerusHash CPU Miner";
         std::cout << std::string(BOX_WIDTH - 41, ' ');
         std::cout << CYAN << V << RESET << "\033[K\n";
 
