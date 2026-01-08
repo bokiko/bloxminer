@@ -115,9 +115,9 @@ if [[ -f "$STATS_FILE" ]]; then
 fi
 
 if [[ -n "$STATS_LINE" ]]; then
-    # Parse hashrate value and unit
-    HR_VALUE=$(echo "$STATS_LINE" | grep -oP 'hr=\K[0-9.]+')
-    HR_UNIT=$(echo "$STATS_LINE" | grep -oP 'unit=\K[A-Z]+')
+    # Parse hashrate value and unit (use word boundary to avoid matching 'thr=')
+    HR_VALUE=$(echo "$STATS_LINE" | grep -oP '\bhr=\K[0-9.]+')
+    HR_UNIT=$(echo "$STATS_LINE" | grep -oP '\bunit=\K[A-Z]+')
 
     # Convert to KH/s
     if [[ -n "$HR_VALUE" ]]; then
