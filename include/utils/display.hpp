@@ -43,9 +43,8 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_num_threads = num_threads;
 
-        // Calculate header height: 7 base lines + extra rows for >8 threads
-        m_header_lines = 7 + ((num_threads + 7) / 8);  // Ceiling div for thread rows
-        if (m_header_lines > 12) m_header_lines = 12;  // Cap at reasonable height
+        // Fixed 7-line box header
+        m_header_lines = 7;
 
         // Clear entire screen
         std::cout << "\033[2J";
@@ -129,92 +128,85 @@ private:
         const char* YELLOW = "\033[33m";
         const char* MAGENTA = "\033[35m";
         const char* WHITE = "\033[97m";
-        const char* DIM = "\033[90m";
         const char* BOLD = "\033[1m";
         const char* RESET = "\033[0m";
         const char* RED = "\033[31m";
 
-        int width = 80;
+        // Box-drawing characters (UTF-8)
+        const char* TL = "\xE2\x94\x8C";  // ┌
+        const char* TR = "\xE2\x94\x90";  // ┐
+        const char* BL = "\xE2\x94\x94";  // └
+        const char* BR = "\xE2\x94\x98";  // ┘
+        const char* H  = "\xE2\x94\x80";  // ─
+        const char* V  = "\xE2\x94\x82";  // │
+        const char* LT = "\xE2\x94\x9C";  // ├
+        const char* RT = "\xE2\x94\xA4";  // ┤
+
+        const int BOX_WIDTH = 60;  // Inner width
 
         // Format uptime
         int hours = static_cast<int>(stats.uptime_seconds) / 3600;
         int mins = (static_cast<int>(stats.uptime_seconds) % 3600) / 60;
-        int secs = static_cast<int>(stats.uptime_seconds) % 60;
 
         // Format total hashrate
         std::string hr_str = format_hashrate(stats.total_hashrate);
 
-        // Line 1: Title bar
-        std::cout << BOLD << CYAN << " BloxMiner v1.0.0 " << RESET
-                  << DIM << "| " << RESET
-                  << "Pool: " << WHITE << stats.pool << RESET
-                  << DIM << " | " << RESET
-                  << "Worker: " << WHITE << stats.worker << RESET
-                  << "\033[K\n";
+        // Helper to print horizontal line
+        auto print_hline = [&](const char* left, const char* right) {
+            std::cout << CYAN << left;
+            for (int i = 0; i < BOX_WIDTH; i++) std::cout << H;
+            std::cout << right << RESET << "\033[K\n";
+        };
 
-        // Line 2: Separator (thin)
-        std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "\342\224\200";  // ─ UTF-8
-        std::cout << RESET << "\n";
+        // Line 1: Top border
+        print_hline(TL, TR);
 
-        // Line 3: Main stats
-        std::cout << " " << BOLD << GREEN << "Hashrate: " << hr_str << RESET;
+        // Line 2: Title
+        std::cout << CYAN << V << RESET << "  " << BOLD << WHITE
+                  << "BloxMiner v1.0.0" << RESET << " - VerusHash CPU Miner";
+        std::cout << std::string(BOX_WIDTH - 41, ' ');
+        std::cout << CYAN << V << RESET << "\033[K\n";
 
-        if (stats.cpu_temp > 0) {
-            std::cout << DIM << " \342\224\202 " << RESET;  // │
-            std::cout << YELLOW << "Temp: " << std::fixed << std::setprecision(0)
-                      << stats.cpu_temp << "\302\260C" << RESET;  // °C
-        }
+        // Line 3: Middle separator
+        print_hline(LT, RT);
 
+        // Line 4: Hashrate and Temp
+        std::string temp_str = (stats.cpu_temp > 0)
+            ? std::to_string((int)stats.cpu_temp) + "\xC2\xB0" "C"
+            : "--\xC2\xB0" "C";
+
+        std::cout << CYAN << V << RESET
+                  << "  Hashrate: " << GREEN << std::setw(12) << std::left << hr_str << RESET
+                  << "   Temp: " << YELLOW << std::setw(8) << std::left << temp_str << RESET
+                  << std::string(BOX_WIDTH - 44, ' ')
+                  << CYAN << V << RESET << "\033[K\n";
+
+        // Line 5: Accepted and Rejected
+        std::cout << CYAN << V << RESET
+                  << "  Accepted: " << GREEN << std::setw(12) << std::left << stats.accepted << RESET
+                  << "   Rejected: " << RED << std::setw(6) << std::left << stats.rejected << RESET
+                  << std::string(BOX_WIDTH - 44, ' ')
+                  << CYAN << V << RESET << "\033[K\n";
+
+        // Line 6: Uptime and Power
+        std::stringstream uptime_ss;
+        uptime_ss << hours << "h " << mins << "m";
+        std::stringstream power_ss;
         if (stats.cpu_power > 0) {
-            std::cout << DIM << " \342\224\202 " << RESET;
-            std::cout << MAGENTA << "Power: " << std::fixed << std::setprecision(1)
-                      << stats.cpu_power << "W" << RESET;
-            
-            // Efficiency (KH/W)
-            double efficiency = stats.total_hashrate / 1000.0 / stats.cpu_power;
-            std::cout << DIM << " \342\224\202 " << RESET;
-            std::cout << WHITE << "Eff: " << std::fixed << std::setprecision(1)
-                      << efficiency << " KH/W" << RESET;
+            power_ss << std::fixed << std::setprecision(1) << stats.cpu_power << "W";
+        } else {
+            power_ss << "--W";
         }
+        std::string power_str = power_ss.str();
 
-        std::cout << DIM << " \342\224\202 " << RESET;
-        std::cout << "Uptime: " << std::setfill('0') << std::setw(2) << hours
-                  << ":" << std::setw(2) << mins << ":" << std::setw(2) << secs;
-        std::cout << "\033[K\n";
+        std::cout << CYAN << V << RESET
+                  << "  Uptime: " << std::setw(14) << std::left << uptime_ss.str()
+                  << "   Power: " << MAGENTA << std::setw(8) << std::left << power_str << RESET
+                  << std::string(BOX_WIDTH - 44, ' ')
+                  << CYAN << V << RESET << "\033[K\n";
 
-        // Line 4: Shares
-        std::cout << " Shares: " << GREEN << "\342\234\223 " << stats.accepted << RESET;  // ✓
-        if (stats.rejected > 0) {
-            std::cout << "  " << RED << "\342\234\227 " << stats.rejected << RESET;  // ✗
-        }
-        std::cout << DIM << " \342\224\202 " << RESET;
-        std::cout << "Difficulty: " << std::fixed << std::setprecision(4) << stats.difficulty;
-        std::cout << "\033[K\n";
-
-        // Line 5: Separator
-        std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "\342\224\200";
-        std::cout << RESET << "\n";
-
-        // Lines 6+: Thread hashrates (compact display, 8 per line)
-        std::cout << " Threads: ";
-        int threads_per_line = 8;
-        for (size_t i = 0; i < stats.thread_hashrates.size(); i++) {
-            if (i > 0 && i % threads_per_line == 0) {
-                std::cout << "\033[K\n          ";  // New line with indent
-            }
-            std::cout << DIM << "[" << RESET
-                      << std::setfill('0') << std::setw(2) << i
-                      << DIM << "]" << RESET
-                      << format_hashrate_short(stats.thread_hashrates[i]) << " ";
-        }
-        std::cout << "\033[K\n";
-
-        // Final separator (double line)
-        std::cout << DIM;
-        for (int i = 0; i < width; i++) std::cout << "\342\225\220";  // ═
-        std::cout << RESET << "\033[K\n";
+        // Line 7: Bottom border
+        print_hline(BL, BR);
     }
 
     std::string format_hashrate(double hr) {
