@@ -107,13 +107,11 @@ local_rj=0
 cpu_temp=0
 hs_array=""
 
-# Capture screen output (more reliable than log file with tee buffering)
+# Read stats from file written by miner (reliable, no screen buffer issues)
+STATS_FILE="/tmp/bloxminer_stats.txt"
 STATS_LINE=""
-# Get the miner screen session (HiveOS uses PID.miner format)
-SCREEN_NAME=$(screen -ls | grep -oP '\d+\.miner' | head -1)
-if [[ -n "$SCREEN_NAME" ]] && screen -S "$SCREEN_NAME" -X hardcopy /tmp/miner_screen.txt 2>/dev/null; then
-    sleep 0.1
-    STATS_LINE=$(grep '\[STATS\]' /tmp/miner_screen.txt 2>/dev/null | tail -1)
+if [[ -f "$STATS_FILE" ]]; then
+    STATS_LINE=$(cat "$STATS_FILE" 2>/dev/null)
 fi
 
 if [[ -n "$STATS_LINE" ]]; then
