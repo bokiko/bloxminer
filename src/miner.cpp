@@ -264,7 +264,7 @@ void Miner::mining_thread(uint32_t thread_id) {
     uint32_t nonce = thread_id;  // Each thread starts at different offset
     uint32_t nonce_step = m_config.num_threads;
     
-    LOG_INFO("Mining thread %d started", thread_id);
+    // Thread started silently for cleaner display
     
     // Initialize per-thread stats
     m_stats.init_thread(thread_id);
@@ -337,13 +337,7 @@ void Miner::mining_thread(uint32_t thread_id) {
                 hasher.prepare_key(intermediate);
                 
                 // Debug: log job setup (only thread 0 to avoid flooding)
-                if (thread_id == 0) {
-                    std::string hdr_nonce_before = utils::bytes_to_hex(m_current_job.header + 108, 32);
-                    std::string ns_debug = utils::bytes_to_hex(nonceSpace, 15);
-                    int ver_int = solution_version;
-                    int mm_int = full_block[143+5];
-                    LOG_INFO("[JOB] ver=%d mm=%d extranonce=%s", ver_int, mm_int, ns_debug.substr(0, 14).c_str());
-                }
+                // Debug logging removed for cleaner display
                 
                 // Reset nonce for new job
                 nonce = thread_id;
@@ -403,7 +397,7 @@ void Miner::mining_thread(uint32_t thread_id) {
         }
     }
     
-    LOG_INFO("Mining thread %d stopped", thread_id);
+    // Thread stopped silently
 }
 
 void Miner::on_new_job(const stratum::Job& job) {
