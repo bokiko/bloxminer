@@ -62,19 +62,6 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 
 ---
 
-## Benchmarks
-
-| CPU | Threads | Hashrate | Per Thread |
-|-----|---------|----------|------------|
-| AMD EPYC 7282 | 32 | 24.15 MH/s | 755 KH/s |
-| AMD Ryzen 5600G | 12 | 14.65 MH/s | 1.22 MH/s |
-| AMD Ryzen 9 5950X | 32 | ~28 MH/s | ~875 KH/s |
-| Intel Xeon E5-2680v4 | 28 | ~14 MH/s | ~500 KH/s |
-
-*Performance varies based on CPU model, cooling, and system configuration.*
-
----
-
 ## Features
 
 <table>
@@ -269,24 +256,6 @@ Final Haraka512 (keyed)
     ▼
 Hash Result (32 bytes)
 ```
-
----
-
-## Roadmap
-
-- [x] VerusHash v2.2 implementation
-- [x] Stratum v1 support
-- [x] Pool verification (100% acceptance)
-- [x] CPU temperature monitoring
-- [x] Power consumption monitoring
-- [x] Interactive Ubuntu installer
-- [x] HiveOS integration
-- [x] Sticky stats display
-- [x] JSON API
-- [ ] ARM64 support
-- [ ] Solo mining mode
-- [ ] Benchmark mode
-- [ ] GPU mining (OpenCL)
 
 ---
 
