@@ -26,6 +26,10 @@ struct MinerConfig {
     // Connection settings
     uint32_t reconnect_delay = 5;  // Seconds
     uint32_t timeout = 30;  // Seconds
+    
+    // API settings
+    bool api_enabled = true;
+    uint16_t api_port = 4068;  // Standard mining API port
 };
 
 // Version info

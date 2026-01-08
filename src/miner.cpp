@@ -64,6 +64,18 @@ bool Miner::start() {
     // Start stats thread
     m_stats_thread = std::thread(&Miner::stats_thread, this);
     
+    // Start API server
+    if (m_config.api_enabled) {
+        auto stats_callback = [this]() -> std::string {
+            return get_api_stats_json();
+        };
+        if (m_api_server.start(m_config.api_port, stats_callback)) {
+            LOG_INFO("API server started on port %d", m_config.api_port);
+        } else {
+            LOG_WARN("Failed to start API server on port %d", m_config.api_port);
+        }
+    }
+    
     // Start mining threads
     m_mining_threads.reserve(m_config.num_threads);
     for (uint32_t i = 0; i < m_config.num_threads; i++) {
@@ -82,6 +94,9 @@ void Miner::stop() {
     utils::Display::instance().cleanup();
     
     LOG_INFO("Stopping miner...");
+    
+    // Stop API server
+    m_api_server.stop();
     
     m_running = false;
     m_has_job = false;
@@ -202,11 +217,19 @@ void Miner::stats_thread() {
             else threads_ss << std::fixed << std::setprecision(0) << thr;
         }
 
+        // Calculate efficiency (KH/W) if power is available
+        double efficiency = 0.0;
+        if (sys_stats.cpu_power > 0) {
+            efficiency = hashrate / 1000.0 / sys_stats.cpu_power;
+        }
+
         // Build stats string manually since LOG_INFO uses simple format parsing
         std::stringstream stats_ss;
         stats_ss << "[STATS] hr=" << std::fixed << std::setprecision(2) << hr_value
                  << " unit=" << hr_unit
                  << " temp=" << static_cast<int>(sys_stats.cpu_temp)
+                 << " power=" << std::fixed << std::setprecision(1) << sys_stats.cpu_power
+                 << " eff=" << std::fixed << std::setprecision(1) << efficiency
                  << " ac=" << disp_stats.accepted
                  << " rj=" << disp_stats.rejected
                  << " thr=" << threads_ss.str();
@@ -416,6 +439,64 @@ void Miner::submit_share(const stratum::Job& job, uint32_t nonce, const std::str
 
 bool Miner::check_hash(const uint8_t* hash, const uint8_t* target) {
     return utils::meets_target(hash, target);
+}
+
+std::string Miner::get_api_stats_json() {
+    double hashrate = m_stats.get_hashrate();
+    auto sys_stats = utils::SystemMonitor::instance().get_stats();
+    
+    auto now = std::chrono::steady_clock::now();
+    double uptime = std::chrono::duration<double>(now - m_stats.start_time).count();
+    
+    // Calculate efficiency
+    double efficiency = 0.0;
+    if (sys_stats.cpu_power > 0) {
+        efficiency = hashrate / 1000.0 / sys_stats.cpu_power;  // KH/W
+    }
+    
+    // Build per-thread hashrates array
+    std::stringstream hs_ss;
+    hs_ss << "[";
+    for (uint32_t i = 0; i < m_config.num_threads; i++) {
+        if (i > 0) hs_ss << ",";
+        hs_ss << std::fixed << std::setprecision(1) << (m_stats.get_thread_hashrate(i) / 1000.0);  // KH/s
+    }
+    hs_ss << "]";
+    
+    // Build JSON response
+    std::stringstream json;
+    json << "{"
+         << "\"miner\":\"BloxMiner\","
+         << "\"version\":\"" << VERSION << "\","
+         << "\"algorithm\":\"verushash\","
+         << "\"uptime\":" << std::fixed << std::setprecision(0) << uptime << ","
+         << "\"hashrate\":{";
+    json << "\"total\":" << std::fixed << std::setprecision(2) << (hashrate / 1000.0) << ",";  // KH/s
+    json << "\"threads\":" << hs_ss.str() << ",";
+    json << "\"unit\":\"KH/s\"},"
+         << "\"shares\":{"
+         << "\"accepted\":" << m_stats.shares_accepted.load() << ","
+         << "\"rejected\":" << m_stats.shares_rejected.load() << ","
+         << "\"submitted\":" << m_stats.shares_submitted.load() << "},"
+         << "\"pool\":{";
+    json << "\"host\":\"" << m_config.pool_host << "\","
+         << "\"port\":" << m_config.pool_port << ","
+         << "\"worker\":\"" << m_config.worker_name << "\","
+         << "\"difficulty\":" << std::fixed << std::setprecision(6) << m_current_job.difficulty << "},"
+         << "\"hardware\":{";
+    json << "\"threads\":" << m_config.num_threads << ",";
+    if (sys_stats.temp_available) {
+        json << "\"temp\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_temp << ",";
+    }
+    if (sys_stats.power_available) {
+        json << "\"power\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_power << ",";
+        json << "\"efficiency\":" << std::fixed << std::setprecision(1) << efficiency << ",";
+    }
+    json << "\"efficiency_unit\":\"KH/W\"},"
+         << "\"total_hashes\":" << m_stats.hashes.load()
+         << "}";
+    
+    return json.str();
 }
 
 }  // namespace bloxminer

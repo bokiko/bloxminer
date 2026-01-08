@@ -170,6 +170,12 @@ private:
             std::cout << DIM << " \342\224\202 " << RESET;
             std::cout << MAGENTA << "Power: " << std::fixed << std::setprecision(1)
                       << stats.cpu_power << "W" << RESET;
+            
+            // Efficiency (KH/W)
+            double efficiency = stats.total_hashrate / 1000.0 / stats.cpu_power;
+            std::cout << DIM << " \342\224\202 " << RESET;
+            std::cout << WHITE << "Eff: " << std::fixed << std::setprecision(1)
+                      << efficiency << " KH/W" << RESET;
         }
 
         std::cout << DIM << " \342\224\202 " << RESET;

@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "stratum/stratum_client.hpp"
 #include "verus_hash.h"
+#include "utils/api_server.hpp"
 
 #include <thread>
 #include <vector>
@@ -110,6 +111,9 @@ private:
     // Statistics
     MinerStats m_stats;
     
+    // API Server
+    utils::ApiServer m_api_server;
+    
     // Methods
     void mining_thread(uint32_t thread_id);
     void stratum_thread();
@@ -120,6 +124,9 @@ private:
     void submit_share(const stratum::Job& job, uint32_t nonce, const std::string& solution);
     
     bool check_hash(const uint8_t* hash, const uint8_t* target);
+    
+    // API methods
+    std::string get_api_stats_json();
 };
 
 }  // namespace bloxminer

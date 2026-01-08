@@ -44,6 +44,7 @@ void print_usage(const char* program) {
     std::cout << "  -p, --pass <password>     Pool password (default: x)" << std::endl;
     std::cout << "  -w, --worker <name>       Worker name (default: bloxminer)" << std::endl;
     std::cout << "  -t, --threads <num>       Number of mining threads (default: auto)" << std::endl;
+    std::cout << "  --api-port <port>         API server port (default: 4068, 0 to disable)" << std::endl;
     std::cout << "  -h, --help                Show this help message" << std::endl;
     std::cout << std::endl;
     std::cout << "Example:" << std::endl;
@@ -74,17 +75,18 @@ int main(int argc, char* argv[]) {
     
     // Parse command line options
     static struct option long_options[] = {
-        {"pool",    required_argument, 0, 'o'},
-        {"user",    required_argument, 0, 'u'},
-        {"pass",    required_argument, 0, 'p'},
-        {"worker",  required_argument, 0, 'w'},
-        {"threads", required_argument, 0, 't'},
-        {"help",    no_argument,       0, 'h'},
+        {"pool",     required_argument, 0, 'o'},
+        {"user",     required_argument, 0, 'u'},
+        {"pass",     required_argument, 0, 'p'},
+        {"worker",   required_argument, 0, 'w'},
+        {"threads",  required_argument, 0, 't'},
+        {"api-port", required_argument, 0, 'a'},
+        {"help",     no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "o:u:p:w:t:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "o:u:p:w:t:a:h", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'o':
                 if (!parse_pool(optarg, config.pool_host, config.pool_port)) {
@@ -106,6 +108,23 @@ int main(int argc, char* argv[]) {
                     config.num_threads = static_cast<uint32_t>(std::stoi(optarg));
                 } catch (...) {
                     std::cerr << "Invalid thread count: " << optarg << std::endl;
+                    return 1;
+                }
+                break;
+            case 'a':
+                try {
+                    int port = std::stoi(optarg);
+                    if (port == 0) {
+                        config.api_enabled = false;
+                    } else if (port > 0 && port <= 65535) {
+                        config.api_port = static_cast<uint16_t>(port);
+                        config.api_enabled = true;
+                    } else {
+                        std::cerr << "Invalid API port: " << optarg << std::endl;
+                        return 1;
+                    }
+                } catch (...) {
+                    std::cerr << "Invalid API port: " << optarg << std::endl;
                     return 1;
                 }
                 break;
