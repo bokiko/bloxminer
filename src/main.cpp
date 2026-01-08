@@ -48,7 +48,7 @@ void print_usage(const char* program) {
     std::cout << "  -h, --help                Show this help message" << std::endl;
     std::cout << std::endl;
     std::cout << "Example:" << std::endl;
-    std::cout << "  " << program << " -o eu.luckpool.net:3956 -u RCt6Afs3tia1AHhbpDFnDBjLXBeSqM78ic -w rig1" << std::endl;
+    std::cout << "  " << program << " -o eu.luckpool.net:3956 -u RYourWalletAddress -w rig1" << std::endl;
     std::cout << std::endl;
 }
 

@@ -11,7 +11,7 @@ struct MinerConfig {
     uint16_t pool_port = 3956;  // Verus stratum port
     
     // Mining credentials
-    std::string wallet_address = "RCt6Afs3tia1AHhbpDFnDBjLXBeSqM78ic";
+    std::string wallet_address = "";  // Required - set via -u flag
     std::string worker_name = "bloxminer";
     std::string worker_password = "x";
     
