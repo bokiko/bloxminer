@@ -461,21 +461,27 @@ bool StratumClient::send_message(const std::string& message) {
 std::string StratumClient::receive_line() {
     std::string line;
     char c;
-    
-    while (m_connected) {
+    const size_t MAX_LINE_LENGTH = 65536;  // 64KB limit to prevent memory exhaustion
+
+    while (m_connected && line.length() < MAX_LINE_LENGTH) {
         ssize_t n = recv(m_socket, &c, 1, 0);
         if (n <= 0) {
             m_connected = false;
             return "";
         }
-        
+
         if (c == '\n') {
             return line;
         }
-        
+
         line += c;
     }
-    
+
+    if (line.length() >= MAX_LINE_LENGTH) {
+        utils::Logger::instance().error("Stratum line exceeded 64KB limit, disconnecting");
+        m_connected = false;
+    }
+
     return line;
 }
 

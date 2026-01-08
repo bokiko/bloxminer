@@ -29,29 +29,34 @@ public:
      * Start the API server
      * @param port Port to listen on (default 4068)
      * @param stats_callback Function that returns JSON stats string
+     * @param bind_address Address to bind to (default 127.0.0.1 for security)
      * @return true if started successfully
      */
-    bool start(uint16_t port, StatsCallback stats_callback) {
+    bool start(uint16_t port, StatsCallback stats_callback, const std::string& bind_address = "127.0.0.1") {
         if (m_running) return true;
-        
+
         m_port = port;
         m_stats_callback = stats_callback;
-        
+        m_bind_address = bind_address;
+
         // Create socket
         m_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (m_socket < 0) {
             return false;
         }
-        
+
         // Allow address reuse
         int opt = 1;
         setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
-        // Bind
+
+        // Bind to specified address (default localhost for security)
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
+        if (inet_pton(AF_INET, bind_address.c_str(), &addr.sin_addr) <= 0) {
+            // Fallback to localhost if parse fails
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        }
         addr.sin_port = htons(port);
         
         if (bind(m_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -167,6 +172,7 @@ private:
     std::thread m_thread;
     int m_socket = -1;
     uint16_t m_port = 0;
+    std::string m_bind_address = "127.0.0.1";
     StatsCallback m_stats_callback;
 };
 

@@ -30,10 +30,11 @@ struct MinerConfig {
     // API settings
     bool api_enabled = true;
     uint16_t api_port = 4068;  // Standard mining API port
+    std::string api_bind_address = "127.0.0.1";  // Default to localhost for security
 };
 
 // Version info
-constexpr const char* VERSION = "1.0.1";
+constexpr const char* VERSION = "1.0.2";
 constexpr const char* NAME = "BloxMiner";
 
 }  // namespace bloxminer

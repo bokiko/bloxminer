@@ -69,10 +69,10 @@ bool Miner::start() {
         auto stats_callback = [this]() -> std::string {
             return get_api_stats_json();
         };
-        if (m_api_server.start(m_config.api_port, stats_callback)) {
-            LOG_INFO("API server started on port %d", m_config.api_port);
+        if (m_api_server.start(m_config.api_port, stats_callback, m_config.api_bind_address)) {
+            LOG_INFO("API server started on %s:%d", m_config.api_bind_address.c_str(), m_config.api_port);
         } else {
-            LOG_WARN("Failed to start API server on port %d", m_config.api_port);
+            LOG_WARN("Failed to start API server on %s:%d", m_config.api_bind_address.c_str(), m_config.api_port);
         }
     }
     

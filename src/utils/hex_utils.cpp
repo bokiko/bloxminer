@@ -9,32 +9,59 @@ namespace utils {
 
 static const char HEX_CHARS[] = "0123456789abcdef";
 
-static uint8_t char_to_nibble(char c) {
+// Returns -1 for invalid hex characters (security fix)
+static int8_t char_to_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 0;
+    return -1;  // Invalid character
 }
 
 std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
-    bytes.reserve(hex.length() / 2);
-    
-    for (size_t i = 0; i + 1 < hex.length(); i += 2) {
-        uint8_t byte = (char_to_nibble(hex[i]) << 4) | char_to_nibble(hex[i + 1]);
-        bytes.push_back(byte);
+
+    // Validate even length
+    if (hex.length() % 2 != 0) {
+        return bytes;  // Return empty on odd length
     }
-    
+
+    bytes.reserve(hex.length() / 2);
+
+    for (size_t i = 0; i + 1 < hex.length(); i += 2) {
+        int8_t high = char_to_nibble(hex[i]);
+        int8_t low = char_to_nibble(hex[i + 1]);
+
+        // Validate hex characters
+        if (high < 0 || low < 0) {
+            return {};  // Return empty on invalid character
+        }
+
+        bytes.push_back((static_cast<uint8_t>(high) << 4) | static_cast<uint8_t>(low));
+    }
+
     return bytes;
 }
 
 size_t hex_to_bytes(const std::string& hex, uint8_t* out, size_t out_len) {
     size_t bytes_written = 0;
-    
-    for (size_t i = 0; i + 1 < hex.length() && bytes_written < out_len; i += 2) {
-        out[bytes_written++] = (char_to_nibble(hex[i]) << 4) | char_to_nibble(hex[i + 1]);
+
+    // Validate even length
+    if (hex.length() % 2 != 0) {
+        return 0;  // Return 0 on odd length
     }
-    
+
+    for (size_t i = 0; i + 1 < hex.length() && bytes_written < out_len; i += 2) {
+        int8_t high = char_to_nibble(hex[i]);
+        int8_t low = char_to_nibble(hex[i + 1]);
+
+        // Validate hex characters
+        if (high < 0 || low < 0) {
+            return 0;  // Return 0 bytes written on invalid character
+        }
+
+        out[bytes_written++] = (static_cast<uint8_t>(high) << 4) | static_cast<uint8_t>(low);
+    }
+
     return bytes_written;
 }
 
