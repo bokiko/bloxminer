@@ -161,6 +161,10 @@ private:
     // Pristine key backup - restored before each hash_with_nonce
     // This is more efficient than FixKey which has issues
     u128* m_pristineKey;
+
+    // First hash after prepare_key needs full pristine copy
+    // Subsequent hashes can use optimized FixKey restoration
+    bool m_firstHashAfterPrepare;
     
     // FixKey state for CLHash (kept for compatibility but not used)
     alignas(32) uint32_t m_fixRand[32];

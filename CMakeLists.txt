@@ -23,6 +23,35 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -mtune=native -maes -mavx2 -mpclmul
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -maes -mavx2 -mpclmul")
 set(CMAKE_C_FLAGS_DEBUG "-g -O0 -maes -mavx2 -mpclmul")
 
+# AVX-512 support detection
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512F)
+if(COMPILER_SUPPORTS_AVX512F)
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mavx512f -mavx512vl")
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -mavx512f -mavx512vl")
+    message(STATUS "AVX-512 support enabled")
+endif()
+
+# Profile-Guided Optimization (PGO) options
+# Usage:
+#   1. Build with: cmake .. -DENABLE_PGO_GENERATE=ON && make
+#   2. Run workload to generate profile data
+#   3. Rebuild with: cmake .. -DENABLE_PGO_USE=ON && make
+option(ENABLE_PGO_GENERATE "Generate PGO profile data" OFF)
+option(ENABLE_PGO_USE "Use PGO profile for optimization" OFF)
+
+if(ENABLE_PGO_GENERATE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-generate")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-generate")
+    message(STATUS "PGO profile generation enabled")
+endif()
+
+if(ENABLE_PGO_USE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-use -fprofile-correction")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-use -fprofile-correction")
+    message(STATUS "PGO optimization enabled")
+endif()
+
 # Find required packages
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)

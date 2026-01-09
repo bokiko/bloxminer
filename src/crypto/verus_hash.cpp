@@ -70,8 +70,8 @@ void verus_hash_v2_2(void *result, const void *data, size_t len) {
 // C++ implementation
 namespace verus {
 
-Hasher::Hasher(int solutionVersion) : 
-    m_curBuf(m_buf1), 
+Hasher::Hasher(int solutionVersion) :
+    m_curBuf(m_buf1),
     m_result(m_buf2),
     m_curPos(0),
     m_headerLen(0),
@@ -79,7 +79,8 @@ Hasher::Hasher(int solutionVersion) :
     m_cachedKey(nullptr),
     m_cachedKeySize(0),
     m_keyPrepared(false),
-    m_pristineKey(nullptr)
+    m_pristineKey(nullptr),
+    m_firstHashAfterPrepare(true)
 {
     verus_hash_init();
     
@@ -329,12 +330,15 @@ void Hasher::prepare_key(const uint8_t* intermediate64) {
     // This must be called once per job after hash_half
     genNewCLKey(intermediate64);
     m_keyPrepared = (m_cachedKey != nullptr);
-    
+
     // Save pristine copy of key for restoration before each hash
     // This is more reliable than the FixKey mechanism
     if (m_keyPrepared && m_pristineKey && m_cachedKey) {
         memcpy(m_pristineKey, m_cachedKey, VERUSKEYSIZE);
     }
+
+    // First hash after prepare_key needs full pristine key copy
+    m_firstHashAfterPrepare = true;
 }
 
 void Hasher::hash_with_nonce(const uint8_t* intermediate64, const uint8_t* nonceSpace15, uint8_t* output) {
@@ -350,10 +354,20 @@ void Hasher::hash_with_nonce(const uint8_t* intermediate64, const uint8_t* nonce
         }
     }
     
-    // Restore key from pristine backup before each hash
-    // CLHash modifies the key, so we need to restore it each time
-    // This is faster than FixKey and more reliable
-    memcpy(m_cachedKey, m_pristineKey, VERUSKEYSIZE);
+    // Restore key before each hash - CLHash modifies the key
+    // First hash after prepare_key needs full copy from pristine backup (8832 bytes)
+    // Subsequent hashes use optimized FixKey (restores only 64 modified entries)
+    if (m_firstHashAfterPrepare) {
+        memcpy(m_cachedKey, m_pristineKey, VERUSKEYSIZE);
+        m_firstHashAfterPrepare = false;
+    } else {
+        // Optimized: restore only modified key entries (32+32 = 64 entries vs 552)
+        // FixKey arrays are populated by verusclhashv2_2_full()
+        for (int i = 31; i >= 0; i--) {
+            m_cachedKey[m_fixRandEx[i]] = m_pRandEx[i];
+            m_cachedKey[m_fixRand[i]] = m_pRand[i];
+        }
+    }
     
     // Work on a copy of the intermediate
     alignas(32) uint8_t curBuf[64];

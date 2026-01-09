@@ -10,6 +10,12 @@
 #include <algorithm>
 #include <fstream>
 
+// Thread affinity for CPU pinning
+#ifdef __linux__
+#include <sched.h>
+#include <pthread.h>
+#endif
+
 namespace bloxminer {
 
 Miner::Miner(const MinerConfig& config) : m_config(config) {
@@ -248,6 +254,14 @@ void Miner::stats_thread() {
 }
 
 void Miner::mining_thread(uint32_t thread_id) {
+    // Pin thread to specific CPU core for better cache locality
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % std::thread::hardware_concurrency(), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+
     verus::Hasher hasher;
     alignas(32) uint8_t hash[32];
     alignas(32) uint8_t target[32];
