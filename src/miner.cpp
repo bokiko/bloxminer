@@ -158,7 +158,10 @@ void Miner::stratum_thread() {
         
         // Run receive loop (blocks until disconnected)
         m_stratum.run();
-        
+
+        // Always clean up socket after run() returns to prevent CLOSE_WAIT accumulation
+        m_stratum.disconnect();
+
         if (m_running) {
             utils::Logger::instance().disconnected("Connection lost, reconnecting...");
             std::this_thread::sleep_for(std::chrono::seconds(m_config.reconnect_delay));

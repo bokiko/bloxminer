@@ -131,9 +131,17 @@ StratumClient::~StratumClient() {
 }
 
 bool StratumClient::connect(const std::string& host, uint16_t port) {
+    // Safety: ensure any existing socket is closed before creating new one
+    if (m_socket >= 0) {
+        shutdown(m_socket, SHUT_RDWR);
+        close(m_socket);
+        m_socket = -1;
+    }
+    m_connected = false;
+
     m_host = host;
     m_port = port;
-    
+
     // Resolve hostname
     struct addrinfo hints{}, *result;
     hints.ai_family = AF_INET;
