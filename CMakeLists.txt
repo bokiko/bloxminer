@@ -24,12 +24,18 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -maes -mavx2 -mpclmul")
 set(CMAKE_C_FLAGS_DEBUG "-g -O0 -maes -mavx2 -mpclmul")
 
 # AVX-512 support detection
+# Note: Zen2/Zen3 (Ryzen 3000/5000) do NOT support AVX-512, only Zen4+ does
+# Use -DDISABLE_AVX512=ON for Ryzen 3000/5000 systems
+option(DISABLE_AVX512 "Disable AVX-512 (required for Zen2/Zen3 CPUs)" OFF)
+
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512F)
-if(COMPILER_SUPPORTS_AVX512F)
+if(COMPILER_SUPPORTS_AVX512F AND NOT DISABLE_AVX512)
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mavx512f -mavx512vl")
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -mavx512f -mavx512vl")
     message(STATUS "AVX-512 support enabled")
+elseif(DISABLE_AVX512)
+    message(STATUS "AVX-512 disabled by user (Zen2/Zen3 compatibility)")
 endif()
 
 # Profile-Guided Optimization (PGO) options

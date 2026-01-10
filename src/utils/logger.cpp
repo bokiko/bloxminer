@@ -164,6 +164,9 @@ void Logger::disconnected(const std::string& reason) {
 }
 
 void Logger::new_job(const std::string& job_id, double difficulty) {
+    // Job notifications are DEBUG level - skip if log level is higher
+    if (m_level > LogLevel::DEBUG) return;
+
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

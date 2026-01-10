@@ -578,7 +578,7 @@ void StratumClient::handle_notification(const std::string& method, const std::st
         
         if (diff > 0) {
             m_difficulty = diff;
-            LOG_INFO("Difficulty set to %f", diff);
+            LOG_DEBUG("Difficulty set to %f", diff);
         }
     } else if (method == "mining.set_target") {
         // Pool sends target directly (Verus pools often use this)
@@ -617,7 +617,7 @@ void StratumClient::handle_notification(const std::string& method, const std::st
                             double diff = (0xFFFF * pow(2.0, 208)) / target_val;
                             m_difficulty = diff;
                             
-                            LOG_INFO("Target set: %s (diff ~%f)", target_hex.substr(0, 16).c_str(), diff);
+                            LOG_DEBUG("Target set: %s (diff ~%f)", target_hex.substr(0, 16).c_str(), diff);
                         }
                     }
                 }
@@ -627,7 +627,7 @@ void StratumClient::handle_notification(const std::string& method, const std::st
         // Some pools send this
         m_extranonce1 = extract_string(params, "extranonce1");
         m_extranonce2_size = extract_int(params, "extranonce2_size");
-        LOG_INFO("Extranonce updated: %s", m_extranonce1.c_str());
+        LOG_DEBUG("Extranonce updated: %s", m_extranonce1.c_str());
     }
 }
 

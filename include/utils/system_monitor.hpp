@@ -96,28 +96,68 @@ private:
     }
     
     void find_power_sensor() {
-        // Look for RAPL power sensors
+        // Look for RAPL power sensors first
         // AMD: /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj
         // Intel: same path structure
-        
+
         std::vector<std::string> rapl_paths = {
             "/sys/class/powercap/intel-rapl/intel-rapl:0",
             "/sys/class/powercap/intel-rapl:0",
             "/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0"
         };
-        
+
         for (const auto& path : rapl_paths) {
             std::ifstream test(path + "/energy_uj");
             if (test.is_open()) {
                 m_rapl_path = path;
                 test.close();
-                
+
                 // Read initial energy value
                 m_last_energy = read_energy_uj();
                 m_last_energy_time = std::chrono::steady_clock::now();
-                break;
+                return;  // RAPL found, done
             }
         }
+
+        // RAPL not available, try hwmon power sensors (AMD systems)
+        find_hwmon_power_sensor();
+    }
+
+    void find_hwmon_power_sensor() {
+        // Scan /sys/class/hwmon/ for power sensors
+        // AMD exposes power via hwmon on some systems
+        DIR* dir = opendir("/sys/class/hwmon");
+        if (!dir) return;
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
+
+            std::string hwmon_path = std::string("/sys/class/hwmon/") + entry->d_name;
+
+            // Check for power sensor files (in order of preference)
+            std::vector<std::string> power_files = {
+                hwmon_path + "/power1_average",  // amdgpu/k10temp average power
+                hwmon_path + "/power1_input"     // instantaneous power
+            };
+
+            for (const auto& power_file : power_files) {
+                std::ifstream test(power_file);
+                if (test.is_open()) {
+                    // Verify it returns a valid reading
+                    uint64_t value = 0;
+                    test >> value;
+                    test.close();
+
+                    if (value > 0) {
+                        m_hwmon_power_path = power_file;
+                        closedir(dir);
+                        return;
+                    }
+                }
+            }
+        }
+        closedir(dir);
     }
     
     double read_hwmon_temp() {
@@ -175,23 +215,28 @@ private:
     }
     
     double read_rapl_power() {
+        // Try hwmon power sensor first (if RAPL was not available)
+        if (!m_hwmon_power_path.empty()) {
+            return read_hwmon_power();
+        }
+
         if (m_rapl_path.empty()) return 0.0;
-        
+
         auto now = std::chrono::steady_clock::now();
         uint64_t current_energy = read_energy_uj();
-        
+
         if (m_last_energy == 0 || current_energy == 0) {
             m_last_energy = current_energy;
             m_last_energy_time = now;
             return 0.0;
         }
-        
+
         // Calculate time delta in seconds
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_energy_time);
         double seconds = duration.count() / 1000.0;
-        
+
         if (seconds < 0.1) return m_last_power;  // Too fast, return cached value
-        
+
         // Calculate power (energy delta / time delta)
         // Handle wraparound (energy counter is typically 32-bit)
         uint64_t energy_delta;
@@ -201,19 +246,36 @@ private:
             // Wraparound
             energy_delta = (0xFFFFFFFFULL - m_last_energy) + current_energy;
         }
-        
+
         // Convert microjoules to watts
         double power = (energy_delta / 1000000.0) / seconds;
-        
+
         // Update for next reading
         m_last_energy = current_energy;
         m_last_energy_time = now;
         m_last_power = power;
-        
+
         return power;
+    }
+
+    double read_hwmon_power() {
+        if (m_hwmon_power_path.empty()) return 0.0;
+
+        std::ifstream file(m_hwmon_power_path);
+        if (!file.is_open()) return 0.0;
+
+        uint64_t power_uw = 0;  // microwatts
+        file >> power_uw;
+        file.close();
+
+        if (power_uw == 0) return 0.0;
+
+        // Convert microwatts to watts
+        return power_uw / 1000000.0;
     }
     
     std::string m_hwmon_path;
+    std::string m_hwmon_power_path;  // hwmon power sensor path (AMD fallback)
     std::string m_rapl_path;
     uint64_t m_last_energy = 0;
     std::chrono::steady_clock::time_point m_last_energy_time;
