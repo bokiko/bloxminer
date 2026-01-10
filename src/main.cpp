@@ -60,17 +60,19 @@ void print_usage(const char* program) {
     std::cout << "Usage: " << program << " [options]" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
-    std::cout << "  -o, --pool <host:port>    Pool address (default: eu.luckpool.net:3956)" << std::endl;
+    std::cout << "  -o, --pool <host:port>    Pool address (can specify multiple for failover)" << std::endl;
     std::cout << "  -u, --user <wallet>       Wallet address" << std::endl;
     std::cout << "  -p, --pass <password>     Pool password (default: x)" << std::endl;
     std::cout << "  -w, --worker <name>       Worker name (default: bloxminer)" << std::endl;
     std::cout << "  -t, --threads <num>       Number of mining threads (default: auto)" << std::endl;
     std::cout << "  --api-port <port>         API server port (default: 4068, 0 to disable)" << std::endl;
     std::cout << "  --api-bind <addr>         API bind address (default: 127.0.0.1)" << std::endl;
+    std::cout << "  -q, --quiet               Quiet mode - reduce log verbosity (only warnings/errors)" << std::endl;
     std::cout << "  -h, --help                Show this help message" << std::endl;
     std::cout << std::endl;
-    std::cout << "Example:" << std::endl;
+    std::cout << "Examples:" << std::endl;
     std::cout << "  " << program << " -o eu.luckpool.net:3956 -u RYourWalletAddress -w rig1" << std::endl;
+    std::cout << "  " << program << " -o primary:3956 -o backup:3956 -u RWallet  # Failover pools" << std::endl;
     std::cout << std::endl;
 }
 
@@ -104,19 +106,31 @@ int main(int argc, char* argv[]) {
         {"threads",  required_argument, 0, 't'},
         {"api-port", required_argument, 0, 'a'},
         {"api-bind", required_argument, 0, 'b'},
+        {"quiet",    no_argument,       0, 'q'},
         {"help",     no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
+    bool quiet_mode = false;
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "o:u:p:w:t:a:b:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "o:u:p:w:t:a:b:qh", long_options, nullptr)) != -1) {
         switch (opt) {
-            case 'o':
-                if (!parse_pool(optarg, config.pool_host, config.pool_port)) {
+            case 'o': {
+                PoolConfig pool;
+                if (!parse_pool(optarg, pool.host, pool.port)) {
                     std::cerr << "Invalid pool address: " << optarg << std::endl;
                     return 1;
                 }
+                pool.priority = static_cast<int>(config.pools.size());  // First pool = priority 0
+                config.pools.push_back(pool);
+                // Also set legacy fields to first pool for backwards compatibility
+                if (config.pools.size() == 1) {
+                    config.pool_host = pool.host;
+                    config.pool_port = pool.port;
+                }
                 break;
+            }
             case 'u':
                 config.wallet_address = optarg;
                 break;
@@ -163,6 +177,9 @@ int main(int argc, char* argv[]) {
             case 'b':
                 config.api_bind_address = optarg;
                 break;
+            case 'q':
+                quiet_mode = true;
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -170,6 +187,15 @@ int main(int argc, char* argv[]) {
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    // If no pools specified, use the default pool
+    if (config.pools.empty()) {
+        PoolConfig default_pool;
+        default_pool.host = config.pool_host;
+        default_pool.port = config.pool_port;
+        default_pool.priority = 0;
+        config.pools.push_back(default_pool);
     }
 
     // Auto-detect thread count if not specified
@@ -209,6 +235,11 @@ int main(int argc, char* argv[]) {
     // Initialize Display with sticky header BEFORE any LOG calls
     // This sets up the scroll region so logs appear below the header
     utils::Display::instance().init(num_threads);
+
+    // Set log level based on quiet mode
+    if (quiet_mode) {
+        utils::Logger::instance().set_level(utils::LogLevel::WARN);
+    }
 
     LOG_INFO("CPU supports VerusHash requirements - OK");
 

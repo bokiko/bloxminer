@@ -2,13 +2,27 @@
 
 #include <string>
 #include <cstdint>
+#include <vector>
 
 namespace bloxminer {
 
+/**
+ * Configuration for a single pool
+ */
+struct PoolConfig {
+    std::string host;
+    uint16_t port = 3956;
+    int priority = 0;      // lower = higher priority
+    int fail_count = 0;    // consecutive failures
+};
+
 struct MinerConfig {
-    // Pool settings
+    // Pool settings (legacy single pool - for backwards compatibility)
     std::string pool_host = "eu.luckpool.net";
     uint16_t pool_port = 3956;  // Verus stratum port
+
+    // Multiple pool support (failover)
+    std::vector<PoolConfig> pools;
     
     // Mining credentials
     std::string wallet_address = "";  // Required - set via -u flag

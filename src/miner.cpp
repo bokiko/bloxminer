@@ -45,8 +45,20 @@ bool Miner::start() {
     
     LOG_INFO("Starting BloxMiner v%s", VERSION);
     LOG_INFO("Using %d mining threads", m_config.num_threads);
-    LOG_INFO("Pool: %s:%d", m_config.pool_host.c_str(), m_config.pool_port);
+    if (m_config.pools.size() > 1) {
+        LOG_INFO("Configured %zu pools (failover enabled)", m_config.pools.size());
+        for (size_t i = 0; i < m_config.pools.size(); i++) {
+            LOG_INFO("  Pool %zu: %s:%d", i + 1, m_config.pools[i].host.c_str(), m_config.pools[i].port);
+        }
+    } else {
+        LOG_INFO("Pool: %s:%d", m_config.pool_host.c_str(), m_config.pool_port);
+    }
     LOG_INFO("Wallet: %s", m_config.wallet_address.c_str());
+
+    // Initialize failover state
+    m_current_pool_index = 0;
+    m_last_primary_retry = std::chrono::steady_clock::now();
+    m_current_backoff_seconds = 5;
     
     m_running = true;
     m_stats.start_time = std::chrono::steady_clock::now();
@@ -133,45 +145,113 @@ void Miner::stop() {
 }
 
 void Miner::stratum_thread() {
+    constexpr int MAX_CONSECUTIVE_FAILURES = 3;
+    constexpr int PRIMARY_RETRY_INTERVAL_SECONDS = 300;  // 5 minutes
+    constexpr uint32_t MAX_BACKOFF_SECONDS = 60;
+
+    int consecutive_failures = 0;
+
     while (m_running) {
-        // Connect to pool
-        if (!m_stratum.connect(m_config.pool_host, m_config.pool_port)) {
-            LOG_ERROR("Failed to connect to pool, retrying in %d seconds...", m_config.reconnect_delay);
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.reconnect_delay));
-            continue;
+        // Get current pool
+        const PoolConfig& current_pool = m_config.pools[m_current_pool_index];
+
+        // Log pool info
+        if (m_config.pools.size() > 1) {
+            LOG_INFO("Connecting to pool %zu/%zu: %s:%d",
+                     m_current_pool_index + 1, m_config.pools.size(),
+                     current_pool.host.c_str(), current_pool.port);
         }
-        
+
+        // Connect to pool
+        if (!m_stratum.connect(current_pool.host, current_pool.port)) {
+            LOG_ERROR("Failed to connect to %s:%d", current_pool.host.c_str(), current_pool.port);
+            consecutive_failures++;
+            goto handle_failure;
+        }
+
         // Subscribe
         if (!m_stratum.subscribe()) {
-            LOG_ERROR("Failed to subscribe, reconnecting...");
+            LOG_ERROR("Failed to subscribe to %s:%d", current_pool.host.c_str(), current_pool.port);
             m_stratum.disconnect();
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.reconnect_delay));
-            continue;
+            consecutive_failures++;
+            goto handle_failure;
         }
-        
+
         // Authorize
-        std::string username = m_config.wallet_address;
-        if (!m_config.worker_name.empty()) {
-            username += "." + m_config.worker_name;
+        {
+            std::string username = m_config.wallet_address;
+            if (!m_config.worker_name.empty()) {
+                username += "." + m_config.worker_name;
+            }
+
+            if (!m_stratum.authorize(username, m_config.worker_password)) {
+                LOG_ERROR("Failed to authorize on %s:%d", current_pool.host.c_str(), current_pool.port);
+                m_stratum.disconnect();
+                consecutive_failures++;
+                goto handle_failure;
+            }
         }
-        
-        if (!m_stratum.authorize(username, m_config.worker_password)) {
-            LOG_ERROR("Failed to authorize, reconnecting...");
-            m_stratum.disconnect();
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.reconnect_delay));
-            continue;
-        }
-        
+
+        // Connection successful - reset failure tracking
+        consecutive_failures = 0;
+        m_current_backoff_seconds = 5;  // Reset backoff on success
+        m_config.pools[m_current_pool_index].fail_count = 0;
+
+        // Update legacy fields for compatibility
+        m_config.pool_host = current_pool.host;
+        m_config.pool_port = current_pool.port;
+
         // Run receive loop (blocks until disconnected)
         m_stratum.run();
 
-        // Always clean up socket after run() returns to prevent CLOSE_WAIT accumulation
+        // Always clean up socket after run() returns
         m_stratum.disconnect();
 
         if (m_running) {
-            utils::Logger::instance().disconnected("Connection lost, reconnecting...");
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.reconnect_delay));
+            utils::Logger::instance().disconnected("Connection lost");
+            consecutive_failures++;
         }
+        continue;
+
+    handle_failure:
+        if (!m_running) break;
+
+        // Update fail count for current pool
+        m_config.pools[m_current_pool_index].fail_count++;
+
+        // Check if we should switch to backup pool
+        if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES && m_config.pools.size() > 1) {
+            size_t next_pool = (m_current_pool_index + 1) % m_config.pools.size();
+
+            // Don't switch if we're on a backup and primary might be back
+            if (m_current_pool_index != 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - m_last_primary_retry).count();
+                if (elapsed >= PRIMARY_RETRY_INTERVAL_SECONDS) {
+                    LOG_INFO("Retrying primary pool after %d seconds...", PRIMARY_RETRY_INTERVAL_SECONDS);
+                    next_pool = 0;
+                    m_last_primary_retry = now;
+                }
+            }
+
+            if (next_pool != m_current_pool_index) {
+                LOG_WARN("Switching to pool %zu/%zu: %s:%d",
+                         next_pool + 1, m_config.pools.size(),
+                         m_config.pools[next_pool].host.c_str(),
+                         m_config.pools[next_pool].port);
+                m_current_pool_index = next_pool;
+                consecutive_failures = 0;  // Reset for new pool
+                m_current_backoff_seconds = 5;  // Reset backoff for new pool
+            }
+        }
+
+        // Exponential backoff: 5s → 10s → 20s → 60s max
+        LOG_INFO("Retrying in %u seconds...", m_current_backoff_seconds);
+        std::this_thread::sleep_for(std::chrono::seconds(m_current_backoff_seconds));
+
+        // Increase backoff for next failure
+        m_current_backoff_seconds = std::min(m_current_backoff_seconds * 2, MAX_BACKOFF_SECONDS);
     }
 }
 
@@ -196,6 +276,8 @@ void Miner::stats_thread() {
         disp_stats.pool = m_config.pool_host + ":" + std::to_string(m_config.pool_port);
         disp_stats.worker = m_config.worker_name;
         disp_stats.difficulty = m_current_job.difficulty;
+        disp_stats.current_pool_index = m_current_pool_index;
+        disp_stats.total_pools = m_config.pools.size();
         
         auto now = std::chrono::steady_clock::now();
         disp_stats.uptime_seconds = std::chrono::duration<double>(now - m_stats.start_time).count();
@@ -493,7 +575,9 @@ std::string Miner::get_api_stats_json() {
     json << "\"host\":\"" << m_config.pool_host << "\","
          << "\"port\":" << m_config.pool_port << ","
          << "\"worker\":\"" << m_config.worker_name << "\","
-         << "\"difficulty\":" << std::fixed << std::setprecision(6) << m_current_job.difficulty << "},"
+         << "\"difficulty\":" << std::fixed << std::setprecision(6) << m_current_job.difficulty << ","
+         << "\"current_index\":" << m_current_pool_index << ","
+         << "\"total_pools\":" << m_config.pools.size() << "},"
          << "\"hardware\":{";
     json << "\"threads\":" << m_config.num_threads << ",";
     if (sys_stats.temp_available) {

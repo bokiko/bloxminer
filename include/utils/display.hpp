@@ -37,6 +37,9 @@ public:
         std::string worker;
         double difficulty = 0;
         double uptime_seconds = 0;
+        // Pool failover info
+        size_t current_pool_index = 0;
+        size_t total_pools = 1;
     };
 
     // Initialize terminal for sticky header mode
@@ -145,10 +148,15 @@ private:
         // Format total hashrate
         std::string hr_str = format_hashrate(stats.total_hashrate);
 
-        // Format pool (truncate if too long)
+        // Format pool with failover indicator
         std::string pool_str = stats.pool;
-        if (pool_str.length() > 25) {
-            pool_str = pool_str.substr(0, 22) + "...";
+        if (stats.total_pools > 1) {
+            std::stringstream ps;
+            ps << pool_str << " (" << (stats.current_pool_index + 1) << "/" << stats.total_pools << ")";
+            pool_str = ps.str();
+        }
+        if (pool_str.length() > 30) {
+            pool_str = pool_str.substr(0, 27) + "...";
         }
 
         // Format difficulty
@@ -190,8 +198,8 @@ private:
         goto_row();
         std::cout << CYAN << V << RESET
                   << "  Hashrate: " << GREEN << std::setw(14) << std::left << hr_str << RESET
-                  << "  Pool: " << CYAN << std::setw(25) << std::left << pool_str << RESET
-                  << std::string(BOX_WIDTH - 55 > 0 ? BOX_WIDTH - 55 : 0, ' ')
+                  << "  Pool: " << CYAN << std::setw(30) << std::left << pool_str << RESET
+                  << std::string(BOX_WIDTH - 60 > 0 ? BOX_WIDTH - 60 : 0, ' ')
                   << CYAN << V << RESET;
 
         // Line 5: Accepted, Rejected, Difficulty
@@ -213,7 +221,7 @@ private:
         if (stats.cpu_power > 0) {
             power_ss << std::fixed << std::setprecision(1) << stats.cpu_power << "W";
         } else {
-            power_ss << "--W";
+            power_ss << "N/A";
         }
 
         goto_row();

@@ -93,6 +93,11 @@ private:
     // State
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_has_job{false};
+
+    // Pool failover state
+    size_t m_current_pool_index{0};
+    std::chrono::steady_clock::time_point m_last_primary_retry;
+    uint32_t m_current_backoff_seconds{5};  // Exponential backoff: 5 → 10 → 20 → 60
     
     // Current job
     stratum::Job m_current_job;
