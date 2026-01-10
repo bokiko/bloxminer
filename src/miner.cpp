@@ -51,9 +51,9 @@ bool Miner::start() {
     m_running = true;
     m_stats.start_time = std::chrono::steady_clock::now();
     m_stats.num_threads = m_config.num_threads;
-    
-    // Initialize display with sticky header
-    utils::Display::instance().init(m_config.num_threads);
+
+    // Display is initialized in main.cpp before LOG calls
+    // No need to re-initialize here
     
     // Setup stratum callbacks
     m_stratum.on_job([this](const stratum::Job& job) {

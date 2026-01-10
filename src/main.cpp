@@ -1,6 +1,7 @@
 #include "../include/config.hpp"
 #include "../include/miner.hpp"
 #include "../include/utils/logger.hpp"
+#include "../include/utils/display.hpp"
 #include "verus_hash.h"
 
 #include <iostream>
@@ -43,12 +44,12 @@ void signal_handler(int signum) {
 
 void print_banner() {
     std::cout << R"(
-  ____  _            __  __ _                 
- | __ )| | _____  __| \/ (_)_ __   ___ _ __ 
+  ____  _            __  __ _
+ | __ )| | _____  __| \/ (_)_ __   ___ _ __
  |  _ \| |/ _ \ \/ /| |\/| | '_ \ / _ \ '__|
- | |_) | | (_) >  < | |  | | | | |  __/ |   
- |____/|_|\___/_/\_\|_|  |_|_| |_|\___|_|   
-                                             
+ | |_) | | (_) >  < | |  | | | | |  __/ |
+ |____/|_|\___/_/\_\|_|  |_|_| |_|\___|_|
+
 )" << std::endl;
     std::cout << "  BloxMiner v" << VERSION << " - VerusHash CPU Miner" << std::endl;
     std::cout << "  ===========================================" << std::endl;
@@ -80,20 +81,20 @@ bool parse_pool(const std::string& pool, std::string& host, uint16_t& port) {
         port = 3956;  // Default Verus stratum port
         return true;
     }
-    
+
     host = pool.substr(0, colon);
     try {
         port = static_cast<uint16_t>(std::stoi(pool.substr(colon + 1)));
     } catch (...) {
         return false;
     }
-    
+
     return true;
 }
 
 int main(int argc, char* argv[]) {
     MinerConfig config;
-    
+
     // Parse command line options
     static struct option long_options[] = {
         {"pool",     required_argument, 0, 'o'},
@@ -106,7 +107,7 @@ int main(int argc, char* argv[]) {
         {"help",     no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int opt;
     while ((opt = getopt_long(argc, argv, "o:u:p:w:t:a:b:h", long_options, nullptr)) != -1) {
         switch (opt) {
@@ -171,9 +172,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Auto-detect thread count if not specified
+    uint32_t num_threads = config.num_threads;
+    if (num_threads == 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) {
+            num_threads = 4;  // Fallback
+        }
+    }
+
+    // Print banner before clearing screen for display
     print_banner();
-    
-    // Validate configuration
+
+    // Validate configuration before initializing display
     if (config.wallet_address.empty()) {
         std::cerr << "Error: Wallet address is required (-u option)" << std::endl;
         print_usage(argv[0]);
@@ -188,35 +199,39 @@ int main(int argc, char* argv[]) {
         std::cerr << "Continuing anyway..." << std::endl;
     }
 
-    // Check CPU features
+    // Check CPU features before initializing display
     if (!verus::Hasher::supported()) {
         std::cerr << "Error: Your CPU does not support required features." << std::endl;
         std::cerr << "VerusHash requires AES-NI, AVX, and PCLMUL for efficient mining." << std::endl;
         return 1;
     }
-    
+
+    // Initialize Display with sticky header BEFORE any LOG calls
+    // This sets up the scroll region so logs appear below the header
+    utils::Display::instance().init(num_threads);
+
     LOG_INFO("CPU supports VerusHash requirements - OK");
-    
+
     // Setup signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    
+
     // Create and start miner
     Miner miner(config);
     g_miner = &miner;
-    
+
     if (!miner.start()) {
         std::cerr << "Failed to start miner" << std::endl;
         return 1;
     }
-    
+
     // Wait for miner to finish
     while (miner.is_running()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    
+
     g_miner = nullptr;
-    
+
     // Print final stats
     const auto& stats = miner.get_stats();
     std::cout << std::endl;
@@ -224,6 +239,6 @@ int main(int argc, char* argv[]) {
     std::cout << "  Total hashes: " << stats.hashes.load() << std::endl;
     std::cout << "  Shares accepted: " << stats.shares_accepted.load() << std::endl;
     std::cout << "  Shares rejected: " << stats.shares_rejected.load() << std::endl;
-    
+
     return 0;
 }
