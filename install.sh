@@ -147,7 +147,7 @@ build_miner() {
 configure_miner() {
     log_step "Configuring BloxMiner..."
     echo ""
-    
+
     # Wallet
     echo -e "${BOLD}Enter your Verus (VRSC) wallet address:${NC}"
     read -p "> " WALLET
@@ -155,86 +155,86 @@ configure_miner() {
         log_error "Wallet address is required!"
         read -p "> " WALLET
     done
-    
+
     echo ""
-    
+
     # Pool
     echo -e "${BOLD}Enter pool address (default: pool.verus.io:9999):${NC}"
     read -p "> " POOL
     POOL="${POOL:-pool.verus.io:9999}"
-    
+
+    # Parse pool host and port
+    POOL_HOST="${POOL%:*}"
+    POOL_PORT="${POOL##*:}"
+    if [ "$POOL_PORT" = "$POOL_HOST" ]; then
+        POOL_PORT="9999"
+    fi
+
     echo ""
-    
+
     # Worker name
     echo -e "${BOLD}Enter worker name (default: $(hostname)):${NC}"
     read -p "> " WORKER
     WORKER="${WORKER:-$(hostname)}"
-    
+
     echo ""
-    
-    # Threads
+
+    # Threads (0 = auto)
     MAX_THREADS=$(nproc)
-    echo -e "${BOLD}Enter number of mining threads (1-$MAX_THREADS, default: $MAX_THREADS):${NC}"
+    echo -e "${BOLD}Enter number of mining threads (1-$MAX_THREADS, default: auto):${NC}"
     read -p "> " THREADS
-    THREADS="${THREADS:-$MAX_THREADS}"
-    
+    THREADS="${THREADS:-0}"
+
     # Validate threads
-    if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || [ "$THREADS" -lt 1 ] || [ "$THREADS" -gt "$MAX_THREADS" ]; then
-        log_warn "Invalid thread count. Using $MAX_THREADS threads."
-        THREADS=$MAX_THREADS
+    if ! [[ "$THREADS" =~ ^[0-9]+$ ]]; then
+        THREADS=0
+    elif [ "$THREADS" -gt "$MAX_THREADS" ]; then
+        log_warn "Thread count exceeds CPU count. Using auto."
+        THREADS=0
     fi
-    
+
     echo ""
     echo -e "${GREEN}Configuration:${NC}"
     echo "  Wallet:  $WALLET"
-    echo "  Pool:    $POOL"
+    echo "  Pool:    $POOL_HOST:$POOL_PORT"
     echo "  Worker:  $WORKER"
-    echo "  Threads: $THREADS"
+    echo "  Threads: $([ "$THREADS" = "0" ] && echo "auto ($MAX_THREADS)" || echo "$THREADS")"
     echo ""
-    
-    # Save config
-    CONFIG_FILE="$HOME/bloxminer/config.sh"
-    cat > "$CONFIG_FILE" << EOF
-# BloxMiner Configuration
-# Generated on $(date)
 
-WALLET="$WALLET"
-POOL="$POOL"
-WORKER="$WORKER"
-THREADS="$THREADS"
+    # Save JSON config
+    CONFIG_FILE="$HOME/bloxminer/bloxminer.json"
+    cat > "$CONFIG_FILE" << EOF
+{
+  "wallet": "$WALLET",
+  "pools": [
+    {"host": "$POOL_HOST", "port": $POOL_PORT}
+  ],
+  "worker": "$WORKER",
+  "threads": $THREADS
+}
 EOF
-    
+
     log_info "Configuration saved to $CONFIG_FILE"
 }
 
 # Create run script
 create_run_script() {
     log_step "Creating run scripts..."
-    
-    # Main run script
+
+    # Main run script (config loaded automatically from bloxminer.json)
     cat > "$HOME/bloxminer/run.sh" << 'EOF'
 #!/usr/bin/env bash
 # BloxMiner Run Script
-
 cd "$(dirname "$0")"
-
-# Load config
-source config.sh
-
-# Run miner
-exec ./build/bloxminer -o "$POOL" -u "$WALLET" -w "$WORKER" -t "$THREADS"
+exec ./build/bloxminer
 EOF
     chmod +x "$HOME/bloxminer/run.sh"
-    
+
     # Background run script
     cat > "$HOME/bloxminer/run-background.sh" << 'EOF'
 #!/usr/bin/env bash
 # BloxMiner Background Run Script
-
 cd "$(dirname "$0")"
-
-# Load config
-source config.sh
 
 LOG_FILE="$HOME/bloxminer/miner.log"
 
@@ -246,7 +246,7 @@ echo "  View logs:   tail -f $LOG_FILE"
 echo "  Stop miner:  pkill -f bloxminer"
 echo ""
 
-nohup ./build/bloxminer -o "$POOL" -u "$WALLET" -w "$WORKER" -t "$THREADS" > "$LOG_FILE" 2>&1 &
+nohup ./build/bloxminer > "$LOG_FILE" 2>&1 &
 
 echo "Miner started with PID: $!"
 EOF
@@ -293,7 +293,7 @@ print_instructions() {
     echo "  pkill -f bloxminer"
     echo ""
     echo -e "${BOLD}Edit Configuration:${NC}"
-    echo "  nano ~/bloxminer/config.sh"
+    echo "  nano ~/bloxminer/bloxminer.json"
     echo ""
     echo -e "${BOLD}Install as System Service (optional):${NC}"
     echo "  sudo cp ~/bloxminer/bloxminer.service /etc/systemd/system/"

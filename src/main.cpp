@@ -1,4 +1,5 @@
 #include "../include/config.hpp"
+#include "../include/config_manager.hpp"
 #include "../include/miner.hpp"
 #include "../include/utils/logger.hpp"
 #include "../include/utils/display.hpp"
@@ -60,6 +61,7 @@ void print_usage(const char* program) {
     std::cout << "Usage: " << program << " [options]" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
+    std::cout << "  -c, --config <path>       Config file path (default: bloxminer.json)" << std::endl;
     std::cout << "  -o, --pool <host:port>    Pool address (can specify multiple for failover)" << std::endl;
     std::cout << "  -u, --user <wallet>       Wallet address" << std::endl;
     std::cout << "  -p, --pass <password>     Pool password (default: x)" << std::endl;
@@ -70,8 +72,13 @@ void print_usage(const char* program) {
     std::cout << "  -q, --quiet               Quiet mode - reduce log verbosity (only warnings/errors)" << std::endl;
     std::cout << "  -h, --help                Show this help message" << std::endl;
     std::cout << std::endl;
+    std::cout << "Config File:" << std::endl;
+    std::cout << "  On first run without arguments, interactive setup creates bloxminer.json" << std::endl;
+    std::cout << "  CLI arguments override config file values" << std::endl;
+    std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
-    std::cout << "  " << program << " -o eu.luckpool.net:3956 -u RYourWalletAddress -w rig1" << std::endl;
+    std::cout << "  " << program << "                                    # Use config file or interactive setup" << std::endl;
+    std::cout << "  " << program << " -o eu.luckpool.net:3956 -u RWallet -w rig1" << std::endl;
     std::cout << "  " << program << " -o primary:3956 -o backup:3956 -u RWallet  # Failover pools" << std::endl;
     std::cout << std::endl;
 }
@@ -95,10 +102,9 @@ bool parse_pool(const std::string& pool, std::string& host, uint16_t& port) {
 }
 
 int main(int argc, char* argv[]) {
-    MinerConfig config;
-
-    // Parse command line options
+    // Step 1: Parse command line options first pass to get config path and help
     static struct option long_options[] = {
+        {"config",   required_argument, 0, 'c'},
         {"pool",     required_argument, 0, 'o'},
         {"user",     required_argument, 0, 'u'},
         {"pass",     required_argument, 0, 'p'},
@@ -111,47 +117,61 @@ int main(int argc, char* argv[]) {
         {0, 0, 0, 0}
     };
 
+    std::string custom_config_path;
     bool quiet_mode = false;
 
+    // Track which CLI args were explicitly set
+    bool cli_wallet_set = false;
+    bool cli_pools_set = false;
+    bool cli_worker_set = false;
+    bool cli_password_set = false;
+    bool cli_threads_set = false;
+    bool cli_api_port_set = false;
+    bool cli_api_bind_set = false;
+
+    // Temporary storage for CLI values
+    MinerConfig cli_config;
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "o:u:p:w:t:a:b:qh", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:o:u:p:w:t:a:b:qh", long_options, nullptr)) != -1) {
         switch (opt) {
+            case 'c':
+                custom_config_path = optarg;
+                break;
             case 'o': {
                 PoolConfig pool;
                 if (!parse_pool(optarg, pool.host, pool.port)) {
                     std::cerr << "Invalid pool address: " << optarg << std::endl;
                     return 1;
                 }
-                pool.priority = static_cast<int>(config.pools.size());  // First pool = priority 0
-                config.pools.push_back(pool);
-                // Also set legacy fields to first pool for backwards compatibility
-                if (config.pools.size() == 1) {
-                    config.pool_host = pool.host;
-                    config.pool_port = pool.port;
-                }
+                pool.priority = static_cast<int>(cli_config.pools.size());
+                cli_config.pools.push_back(pool);
+                cli_pools_set = true;
                 break;
             }
             case 'u':
-                config.wallet_address = optarg;
+                cli_config.wallet_address = optarg;
+                cli_wallet_set = true;
                 break;
             case 'p':
-                config.worker_password = optarg;
+                cli_config.worker_password = optarg;
+                cli_password_set = true;
                 break;
             case 'w':
-                config.worker_name = optarg;
+                cli_config.worker_name = optarg;
+                cli_worker_set = true;
                 break;
             case 't':
                 try {
-                    config.num_threads = static_cast<uint32_t>(std::stoi(optarg));
-
-                    // Bounds check: max 2x hardware threads or 256
+                    cli_config.num_threads = static_cast<uint32_t>(std::stoi(optarg));
                     uint32_t hw_threads = std::thread::hardware_concurrency();
                     uint32_t max_threads = std::max(256u, hw_threads > 0 ? hw_threads * 2 : 256u);
-                    if (config.num_threads > max_threads) {
-                        std::cerr << "Thread count " << config.num_threads
+                    if (cli_config.num_threads > max_threads) {
+                        std::cerr << "Thread count " << cli_config.num_threads
                                   << " exceeds maximum (" << max_threads << ")" << std::endl;
                         return 1;
                     }
+                    cli_threads_set = true;
                 } catch (...) {
                     std::cerr << "Invalid thread count: " << optarg << std::endl;
                     return 1;
@@ -161,21 +181,23 @@ int main(int argc, char* argv[]) {
                 try {
                     int port = std::stoi(optarg);
                     if (port == 0) {
-                        config.api_enabled = false;
+                        cli_config.api_enabled = false;
                     } else if (port > 0 && port <= 65535) {
-                        config.api_port = static_cast<uint16_t>(port);
-                        config.api_enabled = true;
+                        cli_config.api_port = static_cast<uint16_t>(port);
+                        cli_config.api_enabled = true;
                     } else {
                         std::cerr << "Invalid API port: " << optarg << std::endl;
                         return 1;
                     }
+                    cli_api_port_set = true;
                 } catch (...) {
                     std::cerr << "Invalid API port: " << optarg << std::endl;
                     return 1;
                 }
                 break;
             case 'b':
-                config.api_bind_address = optarg;
+                cli_config.api_bind_address = optarg;
+                cli_api_bind_set = true;
                 break;
             case 'q':
                 quiet_mode = true;
@@ -187,6 +209,51 @@ int main(int argc, char* argv[]) {
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    // Step 2: Load config file (if exists)
+    MinerConfig config;
+    auto file_config = ConfigManager::load_config(custom_config_path);
+    bool config_loaded = false;
+
+    if (file_config) {
+        config = *file_config;
+        config_loaded = true;
+    }
+
+    // Step 3: Merge CLI args over config file values (CLI takes precedence)
+    if (cli_wallet_set) config.wallet_address = cli_config.wallet_address;
+    if (cli_pools_set) config.pools = cli_config.pools;
+    if (cli_worker_set) config.worker_name = cli_config.worker_name;
+    if (cli_password_set) config.worker_password = cli_config.worker_password;
+    if (cli_threads_set) config.num_threads = cli_config.num_threads;
+    if (cli_api_port_set) {
+        config.api_port = cli_config.api_port;
+        config.api_enabled = cli_config.api_enabled;
+    }
+    if (cli_api_bind_set) config.api_bind_address = cli_config.api_bind_address;
+
+    // Update legacy pool fields if CLI pools were set
+    if (cli_pools_set && !cli_config.pools.empty()) {
+        config.pool_host = cli_config.pools[0].host;
+        config.pool_port = cli_config.pools[0].port;
+    }
+
+    // Step 4: Interactive setup if no config file AND no wallet provided AND interactive terminal
+    if (!config_loaded && config.wallet_address.empty() && ConfigManager::is_interactive_terminal()) {
+        print_banner();
+        config = ConfigManager::interactive_setup();
+
+        // Offer to save configuration
+        std::cout << "Save this configuration? [Y/n]: ";
+        std::string save_input;
+        std::getline(std::cin, save_input);
+        if (save_input.empty() || save_input[0] == 'y' || save_input[0] == 'Y') {
+            if (ConfigManager::save_config(config)) {
+                std::cout << "Configuration saved to bloxminer.json\n" << std::endl;
+            }
+        }
+        std::cout << std::endl;
     }
 
     // If no pools specified, use the default pool
@@ -207,13 +274,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Print banner before clearing screen for display
-    print_banner();
+    // Print banner (skip if already printed during interactive setup)
+    if (config_loaded || cli_wallet_set) {
+        print_banner();
+    }
 
     // Validate configuration before initializing display
     if (config.wallet_address.empty()) {
-        std::cerr << "Error: Wallet address is required (-u option)" << std::endl;
-        print_usage(argv[0]);
+        std::cerr << "Error: Wallet address is required" << std::endl;
+        std::cerr << "  Run without arguments for interactive setup, or use:" << std::endl;
+        std::cerr << "  " << argv[0] << " -u <wallet_address>" << std::endl;
         return 1;
     }
 

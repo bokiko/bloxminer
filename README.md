@@ -129,8 +129,82 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# Run
-./bloxminer -o pool.verus.io:9999 -u YOUR_WALLET -w miner1 -t 4
+# Run (interactive setup on first run)
+./bloxminer
+```
+
+### Updating
+
+```bash
+cd bloxminer
+git pull
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+---
+
+## Configuration
+
+BloxMiner saves your settings in `bloxminer.json` so you don't need to enter them every time.
+
+### First Run (Interactive Setup)
+
+```
+$ ./bloxminer
+
+========================================
+   BloxMiner First-Run Setup
+========================================
+
+Enter your Verus (VRSC) wallet address:
+> RYourWalletAddress
+
+Enter pool address [pool.verus.io:9999]:
+>
+
+Enter worker name [hostname]:
+> rig1
+
+Enter thread count (1-32) [auto=32]:
+>
+
+Save this configuration? [Y/n]: y
+Configuration saved to bloxminer.json
+```
+
+### Config File Format
+
+```json
+{
+  "wallet": "RYourWalletAddress",
+  "pools": [
+    {"host": "pool.verus.io", "port": 9999},
+    {"host": "na.luckpool.net", "port": 3956}
+  ],
+  "worker": "rig1",
+  "threads": 0,
+  "api": {
+    "enabled": true,
+    "port": 4068,
+    "bind": "127.0.0.1"
+  }
+}
+```
+
+### Config File Locations
+
+1. `./bloxminer.json` (current directory - checked first)
+2. `~/.config/bloxminer/config.json` (user global)
+
+### CLI Overrides
+
+Command-line arguments always override config file values:
+
+```bash
+./bloxminer -t 8              # Override thread count
+./bloxminer -o other:3956     # Override pool
 ```
 
 ---
@@ -138,13 +212,14 @@ make -j$(nproc)
 ## Usage
 
 ```bash
-./bloxminer -o <pool:port> -u <wallet_address> [options]
+./bloxminer [options]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-o, --pool` | Pool address (host:port). Repeat for failover pools | Required |
-| `-u, --user` | Wallet address | Required |
+| `-c, --config` | Config file path | bloxminer.json |
+| `-o, --pool` | Pool address (host:port). Repeat for failover | From config |
+| `-u, --user` | Wallet address | From config |
 | `-w, --worker` | Worker name | hostname |
 | `-p, --pass` | Pool password | x |
 | `-t, --threads` | Mining threads | Auto-detect |
@@ -155,20 +230,17 @@ make -j$(nproc)
 ### Examples
 
 ```bash
-# Verus.io pool with 4 threads
-./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w miner1 -t 4
+# Use config file (recommended)
+./bloxminer
 
-# LuckPool with 8 threads
-./bloxminer -o na.luckpool.net:3956 -u RYourWalletAddress -w rig1 -t 8
+# Override specific options
+./bloxminer -t 8 -q
 
-# All available threads
-./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress
+# Full command line (no config needed)
+./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w rig1 -t 4
 
-# Failover pools (auto-switch on disconnect)
-./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -o eu.luckpool.net:3956 -u RYourWalletAddress
-
-# Quiet mode (less log noise)
-./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -q
+# Failover pools
+./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -u RYourWalletAddress
 ```
 
 ---

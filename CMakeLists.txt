@@ -66,6 +66,7 @@ find_package(OpenSSL REQUIRED)
 set(SOURCES
     src/main.cpp
     src/miner.cpp
+    src/config_manager.cpp
     src/stratum/stratum_client.cpp
     src/utils/hex_utils.cpp
     src/utils/logger.cpp
