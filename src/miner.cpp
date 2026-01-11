@@ -266,12 +266,19 @@ void Miner::stats_thread() {
         // Get system stats (temp, power)
         auto sys_stats = utils::SystemMonitor::instance().get_stats();
         
+        // Calculate efficiency (KH/W)
+        double efficiency = 0.0;
+        if (sys_stats.rig_power > 0) {
+            efficiency = hashrate / 1000.0 / sys_stats.rig_power;
+        }
+
         // Build display stats
         utils::Display::Stats disp_stats;
         disp_stats.total_hashrate = hashrate;
         disp_stats.cpu_temp = sys_stats.cpu_temp;
         disp_stats.cpu_power = sys_stats.cpu_power;
         disp_stats.rig_power = sys_stats.rig_power;
+        disp_stats.efficiency = efficiency;
         disp_stats.accepted = m_stats.shares_accepted.load();
         disp_stats.rejected = m_stats.shares_rejected.load();
         disp_stats.pool = m_config.pool_host + ":" + std::to_string(m_config.pool_port);
@@ -307,12 +314,6 @@ void Miner::stats_thread() {
             if (thr >= 1e6) threads_ss << std::fixed << std::setprecision(1) << (thr/1e6) << "M";
             else if (thr >= 1e3) threads_ss << std::fixed << std::setprecision(1) << (thr/1e3) << "K";
             else threads_ss << std::fixed << std::setprecision(0) << thr;
-        }
-
-        // Calculate efficiency (KH/W) if power is available
-        double efficiency = 0.0;
-        if (sys_stats.rig_power > 0) {
-            efficiency = hashrate / 1000.0 / sys_stats.rig_power;
         }
 
         // Build stats string manually since LOG_INFO uses simple format parsing

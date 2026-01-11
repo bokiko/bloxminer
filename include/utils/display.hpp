@@ -34,6 +34,7 @@ public:
         double cpu_temp = 0;
         double cpu_power = 0;     // CPU power only (from RAPL)
         double rig_power = 0;     // Total rig power (CPU + GPUs)
+        double efficiency = 0;    // KH/W
         std::string pool;
         std::string worker;
         double difficulty = 0;
@@ -212,31 +213,31 @@ private:
                   << std::string(BOX_WIDTH - 56 > 0 ? BOX_WIDTH - 56 : 0, ' ')
                   << CYAN << V << RESET;
 
-        // Line 6: CPU Temp, CPU Power, Rig Power, Uptime
+        // Line 6: CPU Temp, Rig Power, Efficiency, Uptime
         std::string temp_str = (stats.cpu_temp > 0)
             ? std::to_string((int)stats.cpu_temp) + "C"
             : "--C";
         std::stringstream uptime_ss;
         uptime_ss << hours << "h " << mins << "m";
-        std::stringstream cpu_power_ss;
-        if (stats.cpu_power > 0) {
-            cpu_power_ss << std::fixed << std::setprecision(0) << stats.cpu_power << "W";
-        } else {
-            cpu_power_ss << "N/A";
-        }
         std::stringstream rig_power_ss;
         if (stats.rig_power > 0) {
             rig_power_ss << std::fixed << std::setprecision(0) << stats.rig_power << "W";
         } else {
             rig_power_ss << "N/A";
         }
+        std::stringstream eff_ss;
+        if (stats.efficiency > 0) {
+            eff_ss << std::fixed << std::setprecision(0) << stats.efficiency << " KH/W";
+        } else {
+            eff_ss << "N/A";
+        }
 
         goto_row();
         std::cout << CYAN << V << RESET
                   << "  Temp: " << YELLOW << std::setw(5) << std::left << temp_str << RESET
-                  << "  CPU: " << MAGENTA << std::setw(5) << std::left << cpu_power_ss.str() << RESET
-                  << "  Rig: " << MAGENTA << std::setw(5) << std::left << rig_power_ss.str() << RESET
-                  << "  Uptime: " << std::setw(10) << std::left << uptime_ss.str()
+                  << "  Power: " << MAGENTA << std::setw(5) << std::left << rig_power_ss.str() << RESET
+                  << "  Eff: " << GREEN << std::setw(10) << std::left << eff_ss.str() << RESET
+                  << "  Uptime: " << std::setw(8) << std::left << uptime_ss.str()
                   << std::string(BOX_WIDTH - 55 > 0 ? BOX_WIDTH - 55 : 0, ' ')
                   << CYAN << V << RESET;
 
