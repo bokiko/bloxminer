@@ -11,6 +11,10 @@
 
 set -e
 
+# Global state
+SKIP_CONFIG=false
+RESTORE_CONFIG=false
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,6 +65,11 @@ check_root() {
     fi
 }
 
+# Read from terminal (works with curl | bash)
+read_input() {
+    read "$@" </dev/tty
+}
+
 # Check system requirements
 check_system() {
     log_step "Checking system requirements..."
@@ -74,7 +83,7 @@ check_system() {
     source /etc/os-release
     if [[ "$ID" != "ubuntu" && "$ID" != "debian" && "$ID_LIKE" != *"debian"* && "$ID_LIKE" != *"ubuntu"* ]]; then
         log_warn "This script is designed for Ubuntu/Debian. Your OS: $ID"
-        read -p "Continue anyway? [y/N] " -n 1 -r
+        read_input -p "Continue anyway? [y/N] " -n 1 -r REPLY
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             exit 1
@@ -116,51 +125,94 @@ install_deps() {
 # Clone and build
 build_miner() {
     log_step "Building BloxMiner..."
-    
+
     INSTALL_DIR="$HOME/bloxminer"
-    
-    # Clean previous installation
+
+    # Handle previous installation
     if [ -d "$INSTALL_DIR" ]; then
         log_warn "Previous installation found at $INSTALL_DIR"
-        read -p "Remove and reinstall? [Y/n] " -n 1 -r
+        echo ""
+        echo "  [U] Update - pull latest changes (keeps your config)"
+        echo "  [R] Reinstall - fresh installation"
+        echo "  [S] Skip - keep current version"
+        echo ""
+        read_input -p "Choose [U/r/s]: " -n 1 -r REPLY
         echo
-        if [[ $REPLY =~ ^[Nn]$ ]]; then
-            log_info "Keeping existing installation."
-            return
-        fi
-        rm -rf "$INSTALL_DIR"
+
+        case "${REPLY:-U}" in
+            [Uu]|"")
+                log_info "Updating existing installation..."
+                cd "$INSTALL_DIR"
+                git fetch origin
+                git reset --hard origin/master
+                mkdir -p build && cd build
+                cmake .. -DCMAKE_BUILD_TYPE=Release
+                make -j$(nproc)
+                log_info "Update complete!"
+                SKIP_CONFIG=true
+                return
+                ;;
+            [Rr])
+                log_info "Reinstalling..."
+                # Backup config if exists
+                if [ -f "$INSTALL_DIR/bloxminer.json" ]; then
+                    cp "$INSTALL_DIR/bloxminer.json" /tmp/bloxminer.json.bak
+                    RESTORE_CONFIG=true
+                fi
+                rm -rf "$INSTALL_DIR"
+                ;;
+            [Ss])
+                log_info "Skipping build, keeping existing installation."
+                SKIP_CONFIG=true
+                return
+                ;;
+        esac
     fi
-    
+
     # Clone
     git clone --depth 1 https://github.com/bokiko/bloxminer.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
-    
+
+    # Restore config if we backed it up
+    if [ "$RESTORE_CONFIG" = true ] && [ -f /tmp/bloxminer.json.bak ]; then
+        cp /tmp/bloxminer.json.bak "$INSTALL_DIR/bloxminer.json"
+        rm /tmp/bloxminer.json.bak
+        log_info "Restored previous configuration"
+        SKIP_CONFIG=true
+    fi
+
     # Build
     mkdir -p build && cd build
     cmake .. -DCMAKE_BUILD_TYPE=Release
     make -j$(nproc)
-    
+
     log_info "Build complete!"
 }
 
 # Interactive configuration
 configure_miner() {
+    # Skip if config already exists (update/restore)
+    if [ "$SKIP_CONFIG" = true ]; then
+        log_info "Using existing configuration"
+        return
+    fi
+
     log_step "Configuring BloxMiner..."
     echo ""
 
     # Wallet
     echo -e "${BOLD}Enter your Verus (VRSC) wallet address:${NC}"
-    read -p "> " WALLET
+    read_input -p "> " WALLET
     while [ -z "$WALLET" ]; do
         log_error "Wallet address is required!"
-        read -p "> " WALLET
+        read_input -p "> " WALLET
     done
 
     echo ""
 
     # Pool
     echo -e "${BOLD}Enter pool address (default: pool.verus.io:9999):${NC}"
-    read -p "> " POOL
+    read_input -p "> " POOL
     POOL="${POOL:-pool.verus.io:9999}"
 
     # Parse pool host and port
@@ -174,7 +226,7 @@ configure_miner() {
 
     # Worker name
     echo -e "${BOLD}Enter worker name (default: $(hostname)):${NC}"
-    read -p "> " WORKER
+    read_input -p "> " WORKER
     WORKER="${WORKER:-$(hostname)}"
 
     echo ""
@@ -182,7 +234,7 @@ configure_miner() {
     # Threads (0 = auto)
     MAX_THREADS=$(nproc)
     echo -e "${BOLD}Enter number of mining threads (1-$MAX_THREADS, default: auto):${NC}"
-    read -p "> " THREADS
+    read_input -p "> " THREADS
     THREADS="${THREADS:-0}"
 
     # Validate threads
@@ -308,7 +360,7 @@ print_instructions() {
 # Ask to start mining
 ask_start() {
     echo ""
-    read -p "Start mining now? [Y/n] " -n 1 -r
+    read_input -p "Start mining now? [Y/n] " -n 1 -r REPLY
     echo
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         cd "$HOME/bloxminer"

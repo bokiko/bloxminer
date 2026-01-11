@@ -73,6 +73,15 @@ make -j$(nproc)
 
 ### Updating
 
+Run the installer again - it will detect existing installation and offer to update:
+
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/install.sh | bash
+# Choose [U] Update when prompted (default)
+```
+
+Or update manually:
+
 ```bash
 cd ~/bloxminer
 git pull
