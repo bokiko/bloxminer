@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.0.1-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.0.3-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Language-C++-00599C?style=flat-square&logo=cplusplus" alt="C++">
   <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
   <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -52,11 +52,13 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 
 ```
 +------------------------------------------------------------+
-|  BloxMiner v1.0.1 - VerusHash CPU Miner                    |
+|  BloxMiner v1.0.3 - VerusHash CPU Miner                    |
 +------------------------------------------------------------+
-|  Hashrate: 24.15 MH/s     Temp: 55C                        |
-|  Accepted: 367            Rejected: 0                      |
-|  Uptime: 3h 24m           Power: 110.6W                    |
+|  Hashrate: 27.67 MH/s     Temp: 54C       Pool: (1/3)      |
+|  Accepted: 367            Rejected: 0     Diff: 128        |
+|  Uptime: 3h 24m           Power: 110.6W   Eff: 250 KH/W    |
++------------------------------------------------------------+
+|  Thread hashrates: 865K 867K 864K 866K 865K 868K ...       |
 +------------------------------------------------------------+
 ```
 
@@ -86,14 +88,24 @@ BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing 
 </td>
 </tr>
 <tr>
-<td colspan="2">
+<td width="50%">
+
+### Reliability
+- Failover pool support (multiple -o)
+- Exponential backoff reconnection
+- Auto pool switching after 3 failures
+- Primary pool retry every 5 minutes
+
+</td>
+<td width="50%">
 
 ### Monitoring
-- Real-time sticky stats display
+- Real-time htop-style stats display
 - CPU temperature monitoring
-- Power consumption (RAPL)
+- Power consumption (RAPL + AMD hwmon)
 - Per-thread hashrate breakdown
 - JSON API on port 4068
+- Quiet mode for reduced log noise
 
 </td>
 </tr>
@@ -131,12 +143,14 @@ make -j$(nproc)
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-o, --pool` | Pool address (host:port) | Required |
+| `-o, --pool` | Pool address (host:port). Repeat for failover pools | Required |
 | `-u, --user` | Wallet address | Required |
 | `-w, --worker` | Worker name | hostname |
 | `-p, --pass` | Pool password | x |
 | `-t, --threads` | Mining threads | Auto-detect |
-| `--api-port` | API port | 4068 |
+| `-q, --quiet` | Quiet mode (warnings/errors only) | Off |
+| `--api-port` | API port (0 to disable) | 4068 |
+| `--api-bind` | API bind address | 127.0.0.1 |
 
 ### Examples
 
@@ -149,6 +163,12 @@ make -j$(nproc)
 
 # All available threads
 ./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress
+
+# Failover pools (auto-switch on disconnect)
+./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -o eu.luckpool.net:3956 -u RYourWalletAddress
+
+# Quiet mode (less log noise)
+./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -q
 ```
 
 ---
@@ -164,7 +184,7 @@ curl http://localhost:4068
 ```json
 {
   "miner": "BloxMiner",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "algorithm": "verushash",
   "uptime": 12345,
   "hashrate": {
