@@ -12,7 +12,37 @@ echo "=========================================="
 
 # Install build dependencies
 apt-get update -qq
-apt-get install -y -qq build-essential cmake libssl-dev git
+apt-get install -y -qq build-essential cmake libssl-dev git lm-sensors bc
+
+# Load CPU temp sensors
+modprobe k10temp 2>/dev/null || modprobe coretemp 2>/dev/null || true
+
+# Setup CPU power monitoring (RAPL permissions)
+echo "Setting up CPU power monitoring..."
+if [ -d /sys/class/powercap/intel-rapl ]; then
+    # Set permissions now (for current session)
+    chmod -R o+r /sys/class/powercap/intel-rapl/ 2>/dev/null || true
+
+    # Create udev rule for persistent permissions
+    UDEV_RULE="/etc/udev/rules.d/99-rapl-power.rules"
+    if [ ! -f "$UDEV_RULE" ]; then
+        cat > "$UDEV_RULE" << 'RAPLEOF'
+# Allow non-root users to read CPU power (RAPL)
+SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl/"
+RAPLEOF
+        udevadm control --reload-rules 2>/dev/null || true
+        echo "  RAPL udev rule created"
+    fi
+
+    # Verify it works
+    if cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj >/dev/null 2>&1; then
+        echo "  CPU power monitoring enabled!"
+    else
+        echo "  Warning: RAPL read failed. CPU power may show as N/A."
+    fi
+else
+    echo "  RAPL not available on this system"
+fi
 
 # Clean previous installation
 rm -rf "$INSTALL_DIR"
