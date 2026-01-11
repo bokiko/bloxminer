@@ -48,7 +48,7 @@ struct MinerConfig {
 };
 
 // Version info
-constexpr const char* VERSION = "1.0.3";
+constexpr const char* VERSION = "1.1.0";
 constexpr const char* NAME = "BloxMiner";
 
 }  // namespace bloxminer

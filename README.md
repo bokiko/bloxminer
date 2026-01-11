@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.0.3-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.1.0-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Language-C++-00599C?style=flat-square&logo=cplusplus" alt="C++">
   <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
   <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -293,7 +293,7 @@ nano ~/bloxminer/bloxminer.json
 
 ```
 +------------------------------------------------------------+
-|  BloxMiner v1.0.3 - VerusHash CPU Miner                    |
+|  BloxMiner v1.1.0 - VerusHash CPU Miner                    |
 +------------------------------------------------------------+
 |  Hashrate: 27.67 MH/s     Temp: 54C       Pool: (1/3)      |
 |  Accepted: 367            Rejected: 0     Diff: 128        |
@@ -316,7 +316,7 @@ curl http://localhost:4068
 ```json
 {
   "miner": "BloxMiner",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "algorithm": "verushash",
   "uptime": 12345,
   "hashrate": {
