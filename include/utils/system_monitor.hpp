@@ -341,17 +341,28 @@ private:
         if (seconds < 0.1) return m_last_power;  // Too fast, return cached value
 
         // Calculate power (energy delta / time delta)
-        // Handle wraparound (energy counter is typically 32-bit)
+        // Handle wraparound - if current < last, counter wrapped
         uint64_t energy_delta;
         if (current_energy >= m_last_energy) {
             energy_delta = current_energy - m_last_energy;
         } else {
-            // Wraparound
-            energy_delta = (0xFFFFFFFFULL - m_last_energy) + current_energy;
+            // Wraparound - just use the new value as delta (approximation)
+            // This loses one sample but avoids huge incorrect values
+            m_last_energy = current_energy;
+            m_last_energy_time = now;
+            return m_last_power;  // Return cached value during wraparound
         }
 
         // Convert microjoules to watts
         double power = (energy_delta / 1000000.0) / seconds;
+
+        // Sanity check - CPU power should never exceed 500W
+        if (power > 500.0) {
+            // Invalid reading, skip this sample
+            m_last_energy = current_energy;
+            m_last_energy_time = now;
+            return m_last_power;
+        }
 
         // Update for next reading
         m_last_energy = current_energy;
