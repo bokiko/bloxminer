@@ -27,6 +27,7 @@
 - [Installation](#installation)
   - [One-Line Install (Recommended)](#one-line-install-recommended)
   - [Manual Install](#manual-install)
+  - [Updating](#updating)
   - [HiveOS](#hiveos)
 - [Usage](#usage)
 - [Configuration](#configuration)
@@ -92,15 +93,66 @@ make -j$(nproc)
 
 ### HiveOS
 
-**Flight Sheet:**
-```
-Installation URL: https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
-```
+#### Quick Install (Terminal)
 
-**Terminal:**
 ```bash
 curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
 ```
+
+The installer automatically:
+- Installs build dependencies
+- Detects Zen 2/Zen 3 CPUs and disables AVX-512 (prevents crashes)
+- Sets up RAPL power monitoring with persistent udev rules
+- Builds optimized binary for your CPU
+
+#### Flight Sheet Setup
+
+1. **Create New Flight Sheet**
+   - Coin: `VRSC` (Verus)
+   - Wallet: Select your Verus wallet
+   - Pool: Configure your pool (e.g., `pool.verus.io:9999`)
+
+2. **Add Miner**
+   - Miner: `Custom`
+   - Installation URL:
+     ```
+     https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+     ```
+   - Hash algorithm: `verushash`
+   - Wallet and worker template: `%WAL%.%WORKER_NAME%`
+   - Pool URL: `%URL%`
+   - Pass: Number of threads (e.g., `32`) or leave empty for auto
+
+3. **Apply Flight Sheet** to your rig
+
+#### Flight Sheet Fields
+
+| Field | Value | Notes |
+|-------|-------|-------|
+| Miner | `custom` | Required |
+| Installation URL | `https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh` | First install only |
+| Miner name | `bloxminer` | After install |
+| Hash algorithm | `verushash` | |
+| Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
+| Pool URL | `stratum+tcp://pool.verus.io:9999` | Your pool |
+| Pass | `32` | Thread count (optional) |
+
+#### HiveOS Features
+
+- **Auto CPU Detection**: Zen 2/Zen 3 (Ryzen 3000/5000) automatically built without AVX-512
+- **Power Monitoring**: CPU power via RAPL shown in miner stats
+- **Stats Integration**: Hashrate, temperature, accepted/rejected shares reported to HiveOS dashboard
+- **Per-Thread Stats**: Individual thread hashrates visible in miner output
+
+#### Updating on HiveOS
+
+Re-run the installer to update:
+
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
+```
+
+Or via Miner actions in HiveOS web interface.
 
 ---
 
