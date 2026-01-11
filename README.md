@@ -22,100 +22,38 @@
 
 ---
 
-## Quick Install
+## Index
 
-### Ubuntu/Debian (Interactive)
+- [Installation](#installation)
+  - [One-Line Install (Recommended)](#one-line-install-recommended)
+  - [Manual Install](#manual-install)
+  - [HiveOS](#hiveos)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Features](#features)
+- [API](#api)
+- [Requirements](#requirements)
+- [Algorithm](#algorithm)
+- [License](#license)
+
+---
+
+## Installation
+
+### One-Line Install (Recommended)
+
 ```bash
 curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/install.sh | bash
 ```
-The installer will ask for your wallet, pool, and thread count, then start mining.
 
-### HiveOS (Flight Sheet)
-```
-Installation URL: https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
-```
+The installer will:
+1. Install build dependencies (cmake, libssl-dev, etc.)
+2. Clone and build BloxMiner to `~/bloxminer`
+3. Prompt for your wallet, pool, worker name, and thread count
+4. Save configuration to `~/bloxminer/bloxminer.json`
+5. Create run scripts and offer to start mining
 
-### HiveOS (Terminal)
-```bash
-curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
-```
-
----
-
-## Overview
-
-BloxMiner is a CPU miner for [Verus Coin (VRSC)](https://verus.io) implementing the VerusHash v2.2 algorithm. Designed for maximum performance on modern x86-64 CPUs with AES-NI, AVX2, and PCLMULQDQ hardware acceleration.
-
----
-
-## Live Stats Display
-
-```
-+------------------------------------------------------------+
-|  BloxMiner v1.0.3 - VerusHash CPU Miner                    |
-+------------------------------------------------------------+
-|  Hashrate: 27.67 MH/s     Temp: 54C       Pool: (1/3)      |
-|  Accepted: 367            Rejected: 0     Diff: 128        |
-|  Uptime: 3h 24m           Power: 110.6W   Eff: 250 KH/W    |
-+------------------------------------------------------------+
-|  Thread hashrates: 865K 867K 864K 866K 865K 868K ...       |
-+------------------------------------------------------------+
-```
-
----
-
-## Features
-
-<table>
-<tr>
-<td width="50%">
-
-### Performance
-- VerusHash v2.2 mainnet algorithm
-- AES-NI hardware acceleration
-- AVX2 vector optimizations
-- PCLMULQDQ carry-less multiplication
-
-</td>
-<td width="50%">
-
-### Compatibility
-- Multi-threaded (auto-detect cores)
-- Stratum v1 protocol
-- All major Verus pools
-- HiveOS native support
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### Reliability
-- Failover pool support (multiple -o)
-- Exponential backoff reconnection
-- Auto pool switching after 3 failures
-- Primary pool retry every 5 minutes
-
-</td>
-<td width="50%">
-
-### Monitoring
-- Real-time htop-style stats display
-- CPU temperature monitoring
-- Power consumption (RAPL + AMD hwmon)
-- Per-thread hashrate breakdown
-- JSON API on port 4068
-- Quiet mode for reduced log noise
-
-</td>
-</tr>
-</table>
-
----
-
-## Quick Start
-
-### Ubuntu/Debian
+### Manual Install
 
 ```bash
 # Install dependencies
@@ -123,37 +61,112 @@ sudo apt update
 sudo apt install build-essential cmake libssl-dev git
 
 # Clone and build
-git clone https://github.com/bokiko/bloxminer.git
-cd bloxminer
+git clone https://github.com/bokiko/bloxminer.git ~/bloxminer
+cd ~/bloxminer
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# Run (interactive setup on first run)
+# Run (interactive setup on first run if no config exists)
 ./bloxminer
 ```
 
 ### Updating
 
 ```bash
-cd bloxminer
+cd ~/bloxminer
 git pull
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
+### HiveOS
+
+**Flight Sheet:**
+```
+Installation URL: https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+```
+
+**Terminal:**
+```bash
+curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
+```
+
+---
+
+## Usage
+
+After installation, run the miner:
+
+```bash
+# Using run script (recommended)
+cd ~/bloxminer && ./run.sh
+
+# Run in background
+cd ~/bloxminer && ./run-background.sh
+
+# View logs (background mode)
+tail -f ~/bloxminer/miner.log
+
+# Stop miner
+pkill -f bloxminer
+```
+
+### Command Line Options
+
+```bash
+./bloxminer [options]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-c, --config` | Config file path | bloxminer.json |
+| `-o, --pool` | Pool address (host:port). Repeat for failover | From config |
+| `-u, --user` | Wallet address | From config |
+| `-w, --worker` | Worker name | hostname |
+| `-p, --pass` | Pool password | x |
+| `-t, --threads` | Mining threads (0 = auto) | Auto-detect |
+| `-q, --quiet` | Quiet mode (warnings/errors only) | Off |
+| `--api-port` | API port (0 to disable) | 4068 |
+| `--api-bind` | API bind address | 127.0.0.1 |
+
+### Examples
+
+```bash
+# Use saved config (recommended)
+./bloxminer
+
+# Override thread count
+./bloxminer -t 8
+
+# Full command line (no config needed)
+./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w rig1 -t 4
+
+# Multiple failover pools
+./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -u RYourWalletAddress
+```
+
+### Install as System Service
+
+```bash
+sudo cp ~/bloxminer/bloxminer.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable bloxminer
+sudo systemctl start bloxminer
+```
+
 ---
 
 ## Configuration
 
-BloxMiner saves your settings in `bloxminer.json` so you don't need to enter them every time.
+BloxMiner saves settings to `bloxminer.json` so you don't need to enter them every time.
 
 ### First Run (Interactive Setup)
 
-```
-$ ./bloxminer
+If no config file exists and no wallet is provided via CLI, the miner prompts for configuration:
 
+```
 ========================================
    BloxMiner First-Run Setup
 ========================================
@@ -198,49 +211,35 @@ Configuration saved to bloxminer.json
 1. `./bloxminer.json` (current directory - checked first)
 2. `~/.config/bloxminer/config.json` (user global)
 
-### CLI Overrides
-
-Command-line arguments always override config file values:
+### Edit Configuration
 
 ```bash
-./bloxminer -t 8              # Override thread count
-./bloxminer -o other:3956     # Override pool
+nano ~/bloxminer/bloxminer.json
 ```
 
 ---
 
-## Usage
+## Features
 
-```bash
-./bloxminer [options]
+| Category | Features |
+|----------|----------|
+| **Performance** | VerusHash v2.2, AES-NI acceleration, AVX2 optimizations, PCLMULQDQ |
+| **Reliability** | Failover pools, exponential backoff, auto pool switching, primary retry |
+| **Monitoring** | htop-style display, per-thread hashrates, CPU temp, power consumption |
+| **Compatibility** | Multi-threaded auto-detect, Stratum v1, all major pools, HiveOS |
+
+### Live Stats Display
+
 ```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-c, --config` | Config file path | bloxminer.json |
-| `-o, --pool` | Pool address (host:port). Repeat for failover | From config |
-| `-u, --user` | Wallet address | From config |
-| `-w, --worker` | Worker name | hostname |
-| `-p, --pass` | Pool password | x |
-| `-t, --threads` | Mining threads | Auto-detect |
-| `-q, --quiet` | Quiet mode (warnings/errors only) | Off |
-| `--api-port` | API port (0 to disable) | 4068 |
-| `--api-bind` | API bind address | 127.0.0.1 |
-
-### Examples
-
-```bash
-# Use config file (recommended)
-./bloxminer
-
-# Override specific options
-./bloxminer -t 8 -q
-
-# Full command line (no config needed)
-./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w rig1 -t 4
-
-# Failover pools
-./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -u RYourWalletAddress
++------------------------------------------------------------+
+|  BloxMiner v1.0.3 - VerusHash CPU Miner                    |
++------------------------------------------------------------+
+|  Hashrate: 27.67 MH/s     Temp: 54C       Pool: (1/3)      |
+|  Accepted: 367            Rejected: 0     Diff: 128        |
+|  Uptime: 3h 24m           Power: 110.6W   Eff: 250 KH/W    |
++------------------------------------------------------------+
+|  Thread hashrates: 865K 867K 864K 866K 865K 868K ...       |
++------------------------------------------------------------+
 ```
 
 ---
@@ -261,7 +260,7 @@ curl http://localhost:4068
   "uptime": 12345,
   "hashrate": {
     "total": 24150.5,
-    "threads": [755.2, 758.1, ...],
+    "threads": [755.2, 758.1],
     "unit": "KH/s"
   },
   "shares": {
@@ -293,59 +292,26 @@ Most Intel (Haswell+) and AMD (Zen+) processors are supported.
 
 ---
 
-## Tech Stack
-
-| Component | Technology |
-|-----------|------------|
-| **Language** | C++17 |
-| **Build** | CMake |
-| **Crypto** | OpenSSL, AES-NI intrinsics |
-| **Protocol** | Stratum v1 |
-| **Monitoring** | RAPL, lm-sensors |
-
----
-
-## Project Structure
-
-```
-bloxminer/
-├── src/
-│   ├── main.cpp              # Entry point
-│   ├── miner.cpp             # Mining engine
-│   ├── crypto/               # Haraka, CLHash, VerusHash
-│   ├── stratum/              # Pool communication
-│   └── utils/                # Hex, logging, display
-├── include/                  # Header files
-├── tests/                    # Test programs
-├── install.sh                # Ubuntu installer
-├── h-install.sh              # HiveOS installer
-├── h-stats.sh                # HiveOS stats parser
-├── CMakeLists.txt
-└── README.md
-```
-
----
-
 ## Algorithm
 
 VerusHash v2.2 combines multiple cryptographic primitives for ASIC resistance:
 
 ```
 Block Data (1487 bytes)
-    │
-    ▼
+    |
+    v
 Haraka512 Chain (AES-NI accelerated)
-    │
-    ▼
+    |
+    v
 Key Generation (8832 bytes via Haraka256)
-    │
-    ▼
+    |
+    v
 CLHash v2.2 (32 iterations + AES mixing)
-    │
-    ▼
+    |
+    v
 Final Haraka512 (keyed)
-    │
-    ▼
+    |
+    v
 Hash Result (32 bytes)
 ```
 
