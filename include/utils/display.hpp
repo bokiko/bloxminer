@@ -32,7 +32,8 @@ public:
         uint64_t accepted = 0;
         uint64_t rejected = 0;
         double cpu_temp = 0;
-        double cpu_power = 0;
+        double cpu_power = 0;     // CPU power only (from RAPL)
+        double rig_power = 0;     // Total rig power (CPU + GPUs)
         std::string pool;
         std::string worker;
         double difficulty = 0;
@@ -211,24 +212,31 @@ private:
                   << std::string(BOX_WIDTH - 56 > 0 ? BOX_WIDTH - 56 : 0, ' ')
                   << CYAN << V << RESET;
 
-        // Line 6: CPU Temp, Power, Uptime
+        // Line 6: CPU Temp, CPU Power, Rig Power, Uptime
         std::string temp_str = (stats.cpu_temp > 0)
             ? std::to_string((int)stats.cpu_temp) + "C"
             : "--C";
         std::stringstream uptime_ss;
         uptime_ss << hours << "h " << mins << "m";
-        std::stringstream power_ss;
+        std::stringstream cpu_power_ss;
         if (stats.cpu_power > 0) {
-            power_ss << std::fixed << std::setprecision(1) << stats.cpu_power << "W";
+            cpu_power_ss << std::fixed << std::setprecision(0) << stats.cpu_power << "W";
         } else {
-            power_ss << "N/A";
+            cpu_power_ss << "N/A";
+        }
+        std::stringstream rig_power_ss;
+        if (stats.rig_power > 0) {
+            rig_power_ss << std::fixed << std::setprecision(0) << stats.rig_power << "W";
+        } else {
+            rig_power_ss << "N/A";
         }
 
         goto_row();
         std::cout << CYAN << V << RESET
-                  << "  CPU Temp: " << YELLOW << std::setw(8) << std::left << temp_str << RESET
-                  << "  Power: " << MAGENTA << std::setw(10) << std::left << power_ss.str() << RESET
-                  << "  Uptime: " << std::setw(12) << std::left << uptime_ss.str()
+                  << "  Temp: " << YELLOW << std::setw(5) << std::left << temp_str << RESET
+                  << "  CPU: " << MAGENTA << std::setw(5) << std::left << cpu_power_ss.str() << RESET
+                  << "  Rig: " << MAGENTA << std::setw(5) << std::left << rig_power_ss.str() << RESET
+                  << "  Uptime: " << std::setw(10) << std::left << uptime_ss.str()
                   << std::string(BOX_WIDTH - 55 > 0 ? BOX_WIDTH - 55 : 0, ' ')
                   << CYAN << V << RESET;
 

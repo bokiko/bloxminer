@@ -15,10 +15,12 @@ namespace utils {
 
 struct SystemStats {
     double cpu_temp = 0.0;        // Celsius
-    double cpu_power = 0.0;       // Watts (if available)
+    double cpu_power = 0.0;       // Watts (CPU only, from RAPL)
+    double rig_power = 0.0;       // Watts (total system: CPU + GPUs)
     double cpu_usage = 0.0;       // Percentage
     bool temp_available = false;
-    bool power_available = false;
+    bool cpu_power_available = false;
+    bool rig_power_available = false;
 };
 
 class SystemMonitor {
@@ -34,7 +36,9 @@ public:
         stats.cpu_temp = get_cpu_temp();
         stats.temp_available = (stats.cpu_temp > 0);
         stats.cpu_power = get_cpu_power();
-        stats.power_available = (stats.cpu_power > 0);
+        stats.cpu_power_available = (stats.cpu_power > 0);
+        stats.rig_power = get_rig_power();
+        stats.rig_power_available = (stats.rig_power > 0);
         return stats;
     }
     
@@ -53,10 +57,33 @@ public:
         return 0.0;
     }
     
-    // Get CPU power in Watts (AMD RAPL or Intel RAPL)
+    // Get CPU power in Watts (from RAPL only)
     double get_cpu_power() {
-        // Try RAPL (Running Average Power Limit)
         return read_rapl_power();
+    }
+
+    // Get total rig power in Watts (sum of all power sensors)
+    double get_rig_power() {
+        double total = 0.0;
+
+        // Add CPU power from RAPL
+        double cpu = read_rapl_power();
+        if (cpu > 0) total += cpu;
+
+        // Add all hwmon power sensors (GPUs, etc.)
+        for (const auto& path : m_all_power_paths) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                uint64_t power_uw = 0;
+                file >> power_uw;
+                file.close();
+                if (power_uw > 0) {
+                    total += power_uw / 1000000.0;  // microwatts to watts
+                }
+            }
+        }
+
+        return total;
     }
     
 private:
@@ -64,35 +91,49 @@ private:
         // Initialize - find sensor paths
         find_temp_sensor();
         find_power_sensor();
+        find_all_power_sensors();
     }
     
     void find_temp_sensor() {
         // Search for CPU temp sensor in hwmon
+        // Priority: k10temp (AMD) > coretemp (Intel) > zenpower > cpu_thermal > acpitz
         DIR* dir = opendir("/sys/class/hwmon");
         if (!dir) return;
-        
+
+        std::string fallback_path;  // Lower priority sensor
+
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
             if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
-            
+
             std::string hwmon_path = std::string("/sys/class/hwmon/") + entry->d_name;
-            
+
             // Check name
             std::ifstream name_file(hwmon_path + "/name");
             if (name_file.is_open()) {
                 std::string name;
                 std::getline(name_file, name);
                 name_file.close();
-                
-                // Look for CPU temp sensors
-                if (name == "k10temp" || name == "coretemp" || name == "zenpower" ||
-                    name == "cpu_thermal" || name == "acpitz") {
+
+                // High priority: actual CPU temp sensors
+                if (name == "k10temp" || name == "coretemp" || name == "zenpower") {
                     m_hwmon_path = hwmon_path;
-                    break;
+                    break;  // Found best option, stop searching
+                }
+                // Low priority: fallback sensors (may not be accurate)
+                if (name == "cpu_thermal" || name == "acpitz") {
+                    if (fallback_path.empty()) {
+                        fallback_path = hwmon_path;
+                    }
                 }
             }
         }
         closedir(dir);
+
+        // Use fallback if no high-priority sensor found
+        if (m_hwmon_path.empty() && !fallback_path.empty()) {
+            m_hwmon_path = fallback_path;
+        }
     }
     
     void find_power_sensor() {
@@ -124,8 +165,8 @@ private:
     }
 
     void find_hwmon_power_sensor() {
-        // Scan /sys/class/hwmon/ for power sensors
-        // AMD exposes power via hwmon on some systems
+        // Scan /sys/class/hwmon/ for CPU power sensors
+        // Skip GPU power sensors (amdgpu, nvidia, etc.)
         DIR* dir = opendir("/sys/class/hwmon");
         if (!dir) return;
 
@@ -135,10 +176,29 @@ private:
 
             std::string hwmon_path = std::string("/sys/class/hwmon/") + entry->d_name;
 
+            // Check sensor name - skip GPU sensors
+            std::ifstream name_file(hwmon_path + "/name");
+            if (name_file.is_open()) {
+                std::string name;
+                std::getline(name_file, name);
+                name_file.close();
+
+                // Skip GPU power sensors
+                if (name == "amdgpu" || name == "nvidia" || name == "nouveau" ||
+                    name == "radeon" || name.find("gpu") != std::string::npos) {
+                    continue;
+                }
+
+                // Only use CPU-related power sensors
+                if (name != "k10temp" && name != "coretemp" && name != "zenpower") {
+                    continue;
+                }
+            }
+
             // Check for power sensor files (in order of preference)
             std::vector<std::string> power_files = {
-                hwmon_path + "/power1_average",  // amdgpu/k10temp average power
-                hwmon_path + "/power1_input"     // instantaneous power
+                hwmon_path + "/power1_average",
+                hwmon_path + "/power1_input"
             };
 
             for (const auto& power_file : power_files) {
@@ -159,7 +219,42 @@ private:
         }
         closedir(dir);
     }
-    
+
+    void find_all_power_sensors() {
+        // Find ALL hwmon power sensors for total rig power
+        // This includes GPUs, which we excluded from CPU power
+        DIR* dir = opendir("/sys/class/hwmon");
+        if (!dir) return;
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
+
+            std::string hwmon_path = std::string("/sys/class/hwmon/") + entry->d_name;
+
+            // Check for power sensor files
+            std::vector<std::string> power_files = {
+                hwmon_path + "/power1_average",
+                hwmon_path + "/power1_input"
+            };
+
+            for (const auto& power_file : power_files) {
+                std::ifstream test(power_file);
+                if (test.is_open()) {
+                    uint64_t value = 0;
+                    test >> value;
+                    test.close();
+
+                    if (value > 0) {
+                        m_all_power_paths.push_back(power_file);
+                        break;  // Only one per hwmon device
+                    }
+                }
+            }
+        }
+        closedir(dir);
+    }
+
     double read_hwmon_temp() {
         if (m_hwmon_path.empty()) return 0.0;
         
@@ -277,6 +372,7 @@ private:
     std::string m_hwmon_path;
     std::string m_hwmon_power_path;  // hwmon power sensor path (AMD fallback)
     std::string m_rapl_path;
+    std::vector<std::string> m_all_power_paths;  // All power sensors for rig total
     uint64_t m_last_energy = 0;
     std::chrono::steady_clock::time_point m_last_energy_time;
     double m_last_power = 0.0;

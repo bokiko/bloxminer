@@ -271,6 +271,7 @@ void Miner::stats_thread() {
         disp_stats.total_hashrate = hashrate;
         disp_stats.cpu_temp = sys_stats.cpu_temp;
         disp_stats.cpu_power = sys_stats.cpu_power;
+        disp_stats.rig_power = sys_stats.rig_power;
         disp_stats.accepted = m_stats.shares_accepted.load();
         disp_stats.rejected = m_stats.shares_rejected.load();
         disp_stats.pool = m_config.pool_host + ":" + std::to_string(m_config.pool_port);
@@ -310,8 +311,8 @@ void Miner::stats_thread() {
 
         // Calculate efficiency (KH/W) if power is available
         double efficiency = 0.0;
-        if (sys_stats.cpu_power > 0) {
-            efficiency = hashrate / 1000.0 / sys_stats.cpu_power;
+        if (sys_stats.rig_power > 0) {
+            efficiency = hashrate / 1000.0 / sys_stats.rig_power;
         }
 
         // Build stats string manually since LOG_INFO uses simple format parsing
@@ -319,7 +320,7 @@ void Miner::stats_thread() {
         stats_ss << "[STATS] hr=" << std::fixed << std::setprecision(2) << hr_value
                  << " unit=" << hr_unit
                  << " temp=" << static_cast<int>(sys_stats.cpu_temp)
-                 << " power=" << std::fixed << std::setprecision(1) << sys_stats.cpu_power
+                 << " power=" << std::fixed << std::setprecision(1) << sys_stats.rig_power
                  << " eff=" << std::fixed << std::setprecision(1) << efficiency
                  << " ac=" << disp_stats.accepted
                  << " rj=" << disp_stats.rejected
@@ -541,10 +542,10 @@ std::string Miner::get_api_stats_json() {
     auto now = std::chrono::steady_clock::now();
     double uptime = std::chrono::duration<double>(now - m_stats.start_time).count();
     
-    // Calculate efficiency
+    // Calculate efficiency based on rig power
     double efficiency = 0.0;
-    if (sys_stats.cpu_power > 0) {
-        efficiency = hashrate / 1000.0 / sys_stats.cpu_power;  // KH/W
+    if (sys_stats.rig_power > 0) {
+        efficiency = hashrate / 1000.0 / sys_stats.rig_power;  // KH/W
     }
     
     // Build per-thread hashrates array
@@ -583,8 +584,8 @@ std::string Miner::get_api_stats_json() {
     if (sys_stats.temp_available) {
         json << "\"temp\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_temp << ",";
     }
-    if (sys_stats.power_available) {
-        json << "\"power\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_power << ",";
+    if (sys_stats.rig_power_available) {
+        json << "\"power\":" << std::fixed << std::setprecision(1) << sys_stats.rig_power << ",";
         json << "\"efficiency\":" << std::fixed << std::setprecision(1) << efficiency << ",";
     }
     json << "\"efficiency_unit\":\"KH/W\"},"
