@@ -106,7 +106,7 @@ check_system() {
 # Install dependencies
 install_deps() {
     log_step "Installing build dependencies..."
-    
+
     sudo apt-get update -qq
     sudo apt-get install -y -qq \
         build-essential \
@@ -115,11 +115,44 @@ install_deps() {
         git \
         lm-sensors \
         bc
-    
+
     # Try to load CPU temp sensor
     sudo modprobe k10temp 2>/dev/null || sudo modprobe coretemp 2>/dev/null || true
-    
+
     log_info "Dependencies installed!"
+}
+
+# Setup CPU power monitoring (RAPL permissions)
+setup_power_monitoring() {
+    log_step "Setting up CPU power monitoring..."
+
+    # Check if RAPL exists
+    if [ ! -d /sys/class/powercap/intel-rapl ]; then
+        log_warn "RAPL not available on this system. CPU power monitoring disabled."
+        return
+    fi
+
+    # Set permissions now (for current session)
+    sudo chmod -R o+r /sys/class/powercap/intel-rapl/ 2>/dev/null || true
+
+    # Create udev rule for persistent permissions
+    UDEV_RULE="/etc/udev/rules.d/99-rapl-power.rules"
+    if [ ! -f "$UDEV_RULE" ]; then
+        log_info "Creating udev rule for RAPL power monitoring..."
+        sudo tee "$UDEV_RULE" > /dev/null << 'EOF'
+# Allow non-root users to read CPU power (RAPL)
+SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl/"
+EOF
+        sudo udevadm control --reload-rules 2>/dev/null || true
+    fi
+
+    # Verify it works
+    if cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj >/dev/null 2>&1; then
+        log_info "CPU power monitoring enabled!"
+    else
+        log_warn "Could not enable RAPL. CPU power will show as N/A."
+        log_warn "To fix manually: sudo chmod -R o+r /sys/class/powercap/intel-rapl/"
+    fi
 }
 
 # Clone and build
@@ -374,6 +407,7 @@ main() {
     check_root
     check_system
     install_deps
+    setup_power_monitoring
     build_miner
     configure_miner
     create_run_script

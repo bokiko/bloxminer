@@ -266,10 +266,11 @@ void Miner::stats_thread() {
         // Get system stats (temp, power)
         auto sys_stats = utils::SystemMonitor::instance().get_stats();
         
-        // Calculate efficiency (KH/W)
+        // Calculate efficiency (KH/W) - use total power if available
         double efficiency = 0.0;
-        if (sys_stats.rig_power > 0) {
-            efficiency = hashrate / 1000.0 / sys_stats.rig_power;
+        double total_power = sys_stats.cpu_power + sys_stats.gpu_power;
+        if (total_power > 0) {
+            efficiency = hashrate / 1000.0 / total_power;
         }
 
         // Build display stats
@@ -277,7 +278,7 @@ void Miner::stats_thread() {
         disp_stats.total_hashrate = hashrate;
         disp_stats.cpu_temp = sys_stats.cpu_temp;
         disp_stats.cpu_power = sys_stats.cpu_power;
-        disp_stats.rig_power = sys_stats.rig_power;
+        disp_stats.rig_power = sys_stats.gpu_power;
         disp_stats.efficiency = efficiency;
         disp_stats.accepted = m_stats.shares_accepted.load();
         disp_stats.rejected = m_stats.shares_rejected.load();
@@ -321,7 +322,8 @@ void Miner::stats_thread() {
         stats_ss << "[STATS] hr=" << std::fixed << std::setprecision(2) << hr_value
                  << " unit=" << hr_unit
                  << " temp=" << static_cast<int>(sys_stats.cpu_temp)
-                 << " power=" << std::fixed << std::setprecision(1) << sys_stats.rig_power
+                 << " cpu_pwr=" << std::fixed << std::setprecision(1) << sys_stats.cpu_power
+                 << " gpu_pwr=" << std::fixed << std::setprecision(1) << sys_stats.gpu_power
                  << " eff=" << std::fixed << std::setprecision(1) << efficiency
                  << " ac=" << disp_stats.accepted
                  << " rj=" << disp_stats.rejected
@@ -543,10 +545,11 @@ std::string Miner::get_api_stats_json() {
     auto now = std::chrono::steady_clock::now();
     double uptime = std::chrono::duration<double>(now - m_stats.start_time).count();
     
-    // Calculate efficiency based on rig power
+    // Calculate efficiency based on total power (CPU + GPU)
     double efficiency = 0.0;
-    if (sys_stats.rig_power > 0) {
-        efficiency = hashrate / 1000.0 / sys_stats.rig_power;  // KH/W
+    double total_power = sys_stats.cpu_power + sys_stats.gpu_power;
+    if (total_power > 0) {
+        efficiency = hashrate / 1000.0 / total_power;  // KH/W
     }
     
     // Build per-thread hashrates array
@@ -585,8 +588,14 @@ std::string Miner::get_api_stats_json() {
     if (sys_stats.temp_available) {
         json << "\"temp\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_temp << ",";
     }
-    if (sys_stats.rig_power_available) {
-        json << "\"power\":" << std::fixed << std::setprecision(1) << sys_stats.rig_power << ",";
+    if (sys_stats.cpu_power_available) {
+        json << "\"cpu_power\":" << std::fixed << std::setprecision(1) << sys_stats.cpu_power << ",";
+    }
+    if (sys_stats.gpu_power_available) {
+        json << "\"gpu_power\":" << std::fixed << std::setprecision(1) << sys_stats.gpu_power << ",";
+    }
+    if (total_power > 0) {
+        json << "\"total_power\":" << std::fixed << std::setprecision(1) << total_power << ",";
         json << "\"efficiency\":" << std::fixed << std::setprecision(1) << efficiency << ",";
     }
     json << "\"efficiency_unit\":\"KH/W\"},"

@@ -213,17 +213,23 @@ private:
                   << std::string(BOX_WIDTH - 56 > 0 ? BOX_WIDTH - 56 : 0, ' ')
                   << CYAN << V << RESET;
 
-        // Line 6: CPU Temp, Rig Power, Efficiency, Uptime
+        // Line 6: CPU Temp, CPU Power, GPU Power, Efficiency, Uptime
         std::string temp_str = (stats.cpu_temp > 0)
             ? std::to_string((int)stats.cpu_temp) + "C"
             : "--C";
         std::stringstream uptime_ss;
         uptime_ss << hours << "h " << mins << "m";
-        std::stringstream rig_power_ss;
-        if (stats.rig_power > 0) {
-            rig_power_ss << std::fixed << std::setprecision(0) << stats.rig_power << "W";
+        std::stringstream cpu_power_ss;
+        if (stats.cpu_power > 0) {
+            cpu_power_ss << std::fixed << std::setprecision(0) << stats.cpu_power << "W";
         } else {
-            rig_power_ss << "N/A";
+            cpu_power_ss << "N/A";
+        }
+        std::stringstream gpu_power_ss;
+        if (stats.rig_power > 0) {
+            gpu_power_ss << std::fixed << std::setprecision(0) << stats.rig_power << "W";
+        } else {
+            gpu_power_ss << "N/A";
         }
         std::stringstream eff_ss;
         if (stats.efficiency > 0) {
@@ -234,11 +240,12 @@ private:
 
         goto_row();
         std::cout << CYAN << V << RESET
-                  << "  Temp: " << YELLOW << std::setw(5) << std::left << temp_str << RESET
-                  << "  Power: " << MAGENTA << std::setw(5) << std::left << rig_power_ss.str() << RESET
-                  << "  Eff: " << GREEN << std::setw(10) << std::left << eff_ss.str() << RESET
-                  << "  Uptime: " << std::setw(8) << std::left << uptime_ss.str()
-                  << std::string(BOX_WIDTH - 55 > 0 ? BOX_WIDTH - 55 : 0, ' ')
+                  << "  " << YELLOW << std::setw(5) << std::left << temp_str << RESET
+                  << " CPU: " << MAGENTA << std::setw(4) << std::left << cpu_power_ss.str() << RESET
+                  << " GPU: " << MAGENTA << std::setw(4) << std::left << gpu_power_ss.str() << RESET
+                  << " Eff: " << GREEN << std::setw(9) << std::left << eff_ss.str() << RESET
+                  << " Up: " << std::setw(7) << std::left << uptime_ss.str()
+                  << std::string(BOX_WIDTH - 53 > 0 ? BOX_WIDTH - 53 : 0, ' ')
                   << CYAN << V << RESET;
 
         // Line 7: Separator before thread hashrates

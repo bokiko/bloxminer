@@ -16,11 +16,11 @@ namespace utils {
 struct SystemStats {
     double cpu_temp = 0.0;        // Celsius
     double cpu_power = 0.0;       // Watts (CPU only, from RAPL)
-    double rig_power = 0.0;       // Watts (total system: CPU + GPUs)
+    double gpu_power = 0.0;       // Watts (GPUs only, from amdgpu hwmon)
     double cpu_usage = 0.0;       // Percentage
     bool temp_available = false;
     bool cpu_power_available = false;
-    bool rig_power_available = false;
+    bool gpu_power_available = false;
 };
 
 class SystemMonitor {
@@ -37,8 +37,8 @@ public:
         stats.temp_available = (stats.cpu_temp > 0);
         stats.cpu_power = get_cpu_power();
         stats.cpu_power_available = (stats.cpu_power > 0);
-        stats.rig_power = get_rig_power();
-        stats.rig_power_available = (stats.rig_power > 0);
+        stats.gpu_power = get_gpu_power();
+        stats.gpu_power_available = (stats.gpu_power > 0);
         return stats;
     }
     
@@ -62,16 +62,12 @@ public:
         return read_rapl_power();
     }
 
-    // Get total rig power in Watts (sum of all power sensors)
-    double get_rig_power() {
+    // Get GPU power in Watts (sum of all GPU power sensors)
+    double get_gpu_power() {
         double total = 0.0;
 
-        // Add CPU power from RAPL
-        double cpu = read_rapl_power();
-        if (cpu > 0) total += cpu;
-
-        // Add all hwmon power sensors (GPUs, etc.)
-        for (const auto& path : m_all_power_paths) {
+        // Sum all GPU power sensors (amdgpu, nvidia, etc.)
+        for (const auto& path : m_gpu_power_paths) {
             std::ifstream file(path);
             if (file.is_open()) {
                 uint64_t power_uw = 0;
@@ -91,7 +87,7 @@ private:
         // Initialize - find sensor paths
         find_temp_sensor();
         find_power_sensor();
-        find_all_power_sensors();
+        find_gpu_power_sensors();
     }
     
     void find_temp_sensor() {
@@ -220,9 +216,8 @@ private:
         closedir(dir);
     }
 
-    void find_all_power_sensors() {
-        // Find ALL hwmon power sensors for total rig power
-        // This includes GPUs, which we excluded from CPU power
+    void find_gpu_power_sensors() {
+        // Find GPU-specific power sensors (amdgpu, nvidia, nouveau, radeon)
         DIR* dir = opendir("/sys/class/hwmon");
         if (!dir) return;
 
@@ -231,6 +226,19 @@ private:
             if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
 
             std::string hwmon_path = std::string("/sys/class/hwmon/") + entry->d_name;
+
+            // Check sensor name - only include GPU sensors
+            std::ifstream name_file(hwmon_path + "/name");
+            if (!name_file.is_open()) continue;
+
+            std::string name;
+            std::getline(name_file, name);
+            name_file.close();
+
+            // Only GPU power sensors
+            if (name != "amdgpu" && name != "nvidia" && name != "nouveau" && name != "radeon") {
+                continue;
+            }
 
             // Check for power sensor files
             std::vector<std::string> power_files = {
@@ -246,7 +254,7 @@ private:
                     test.close();
 
                     if (value > 0) {
-                        m_all_power_paths.push_back(power_file);
+                        m_gpu_power_paths.push_back(power_file);
                         break;  // Only one per hwmon device
                     }
                 }
@@ -372,7 +380,7 @@ private:
     std::string m_hwmon_path;
     std::string m_hwmon_power_path;  // hwmon power sensor path (AMD fallback)
     std::string m_rapl_path;
-    std::vector<std::string> m_all_power_paths;  // All power sensors for rig total
+    std::vector<std::string> m_gpu_power_paths;  // GPU power sensors (amdgpu, nvidia, etc.)
     uint64_t m_last_energy = 0;
     std::chrono::steady_clock::time_point m_last_energy_time;
     double m_last_power = 0.0;
