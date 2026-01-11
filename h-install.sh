@@ -55,7 +55,22 @@ rm -rf bloxminer
 git clone https://github.com/bokiko/bloxminer.git
 cd bloxminer
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+
+# Detect CPU - disable AVX-512 for Zen 2/Zen 3 (Ryzen 3000/5000)
+CMAKE_OPTS="-DCMAKE_BUILD_TYPE=Release"
+CPU_FAMILY=$(cat /proc/cpuinfo | grep -m1 "cpu family" | awk '{print $4}')
+CPU_MODEL=$(cat /proc/cpuinfo | grep -m1 "model[^a-z]" | awk '{print $3}')
+CPU_NAME=$(cat /proc/cpuinfo | grep -m1 "model name" | cut -d: -f2)
+
+# AMD Zen 2 (family 23, model 49/96/104/113/144) and Zen 3 (family 25, model <16)
+# These CPUs do NOT support AVX-512
+if [[ "$CPU_FAMILY" == "23" ]] || [[ "$CPU_FAMILY" == "25" && "$CPU_MODEL" -lt 16 ]]; then
+    echo "Detected Zen 2/Zen 3 CPU:$CPU_NAME"
+    echo "  Disabling AVX-512 (not supported on this CPU)"
+    CMAKE_OPTS="$CMAKE_OPTS -DDISABLE_AVX512=ON"
+fi
+
+cmake .. $CMAKE_OPTS
 make -j$(nproc)
 
 # Install binary
