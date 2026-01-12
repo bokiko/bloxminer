@@ -137,6 +137,8 @@ The installer automatically:
 | Pool URL | `stratum+tcp://pool.verus.io:9999` | Your pool |
 | Pass | `32` | Thread count (optional) |
 
+> **Important**: After first install, **clear the Installation URL field** (leave empty). HiveOS parses the miner name from the URL, which can cause issues if left populated.
+
 #### HiveOS Features
 
 - **Auto CPU Detection**: Zen 2/Zen 3 (Ryzen 3000/5000) automatically built without AVX-512
@@ -284,24 +286,29 @@ nano ~/bloxminer/bloxminer.json
 
 | Category | Features |
 |----------|----------|
-| **Performance** | VerusHash v2.2, AES-NI acceleration, AVX2 optimizations, PCLMULQDQ |
-| **Reliability** | Failover pools, exponential backoff, auto pool switching, primary retry |
-| **Monitoring** | htop-style display, per-thread hashrates, CPU temp, power consumption |
-| **Compatibility** | Multi-threaded auto-detect, Stratum v1, all major pools, HiveOS |
+| **Performance** | VerusHash v2.2, AES-NI acceleration, AVX2 optimizations, thread affinity |
+| **Reliability** | Failover pools, exponential backoff (5s→60s), auto pool switching after 3 failures, primary pool retry every 5 min |
+| **Monitoring** | htop-style display, per-thread hashrates, CPU temp, separate CPU/GPU power (RAPL + hwmon) |
+| **Compatibility** | Multi-threaded auto-detect, Stratum v1, all major pools, HiveOS ready |
 
 ### Live Stats Display
 
 ```
-+------------------------------------------------------------+
-|  BloxMiner v1.1.0 - VerusHash CPU Miner                    |
-+------------------------------------------------------------+
-|  Hashrate: 27.67 MH/s     Temp: 54C       Pool: (1/3)      |
-|  Accepted: 367            Rejected: 0     Diff: 128        |
-|  Uptime: 3h 24m           Power: 110.6W   Eff: 250 KH/W    |
-+------------------------------------------------------------+
-|  Thread hashrates: 865K 867K 864K 866K 865K 868K ...       |
-+------------------------------------------------------------+
++--------------------------------------------------------------+
+|  BloxMiner v1.1.0 - VerusHash CPU Miner                      |
++--------------------------------------------------------------+
+|  Hashrate: 26.97 MH/s     Accepted: 132      Rejected: 0     |
+|  55C   CPU: 101W  GPU: N/A  Eff: 268 KH/W    Up: 1h 24m      |
+|  Pool: pool.verus.io:9999                    Diff: 128       |
++--------------------------------------------------------------+
+|  Thread hashrates (KH/s):                                    |
+|  897 899 842 853 840 833 847 848 839 841 825 827 822 825 ... |
++--------------------------------------------------------------+
 ```
+
+- **CPU/GPU Power**: Separate readings from RAPL (CPU) and hwmon (AMD GPU)
+- **Efficiency**: Hashrate per watt (KH/W)
+- **Scroll region**: Logs scroll below header without overwriting stats
 
 ---
 
@@ -320,19 +327,20 @@ curl http://localhost:4068
   "algorithm": "verushash",
   "uptime": 12345,
   "hashrate": {
-    "total": 24150.5,
-    "threads": [755.2, 758.1],
+    "total": 26970.5,
+    "threads": [897.4, 899.2, 842.1, ...],
     "unit": "KH/s"
   },
   "shares": {
-    "accepted": 367,
+    "accepted": 132,
     "rejected": 0
   },
   "hardware": {
     "threads": 32,
     "temp": 55,
-    "power": 110.6,
-    "efficiency": 218.4,
+    "cpu_power": 101.0,
+    "gpu_power": 0.0,
+    "efficiency": 268.0,
     "efficiency_unit": "KH/W"
   }
 }
