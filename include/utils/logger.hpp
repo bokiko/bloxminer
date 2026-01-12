@@ -108,13 +108,19 @@ private:
         while (*fmt) {
             if (*fmt == '%' && *(fmt + 1)) {
                 fmt++;
+                // Skip length modifiers (l, ll, h, hh, z)
+                while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z') {
+                    fmt++;
+                }
                 switch (*fmt) {
                     case 's':
                     case 'd':
                     case 'u':
                     case 'f':
                     case 'x':
+                    case 'X':
                     case 'p':
+                    case 'i':
                         ss << value;
                         format_into(ss, fmt + 1, args...);
                         return;
