@@ -188,7 +188,7 @@ private:
         // Line 2: Title
         goto_row();
         std::cout << CYAN << V << RESET << "  " << BOLD << WHITE
-                  << "BloxMiner v1.1.0" << RESET << " - VerusHash CPU Miner";
+                  << "BloxMiner v1.1.1" << RESET << " - VerusHash CPU Miner";
         int padding = BOX_WIDTH - 41;
         std::cout << std::string(padding > 0 ? padding : 0, ' ');
         std::cout << CYAN << V << RESET;
