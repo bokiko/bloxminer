@@ -164,6 +164,7 @@ private:
     // Stratum state
     std::string m_extranonce1;
     size_t m_extranonce2_size;
+    std::string m_recv_buffer;
     std::atomic<double> m_difficulty;
     std::atomic<uint64_t> m_message_id;
     

@@ -32,15 +32,15 @@ bool validate_verus_address(const std::string& addr) {
     return true;
 }
 
-// Global miner pointer for signal handling
-static Miner* g_miner = nullptr;
+// Async-signal-safe shutdown flag; checked in the main loop
+static std::atomic<bool> g_shutdown_requested{false};
 
 void signal_handler(int signum) {
     (void)signum;
-    std::cout << "\nInterrupt received, shutting down..." << std::endl;
-    if (g_miner) {
-        g_miner->stop();
-    }
+    g_shutdown_requested.store(true, std::memory_order_relaxed);
+    // write() is async-signal-safe; std::cout/std::endl are not
+    const char msg[] = "\nInterrupt received, shutting down...\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
 
 void print_banner() {
@@ -164,11 +164,9 @@ int main(int argc, char* argv[]) {
             case 't':
                 try {
                     cli_config.num_threads = static_cast<uint32_t>(std::stoi(optarg));
-                    uint32_t hw_threads = std::thread::hardware_concurrency();
-                    uint32_t max_threads = std::max(256u, hw_threads > 0 ? hw_threads * 2 : 256u);
-                    if (cli_config.num_threads > max_threads) {
+                    if (cli_config.num_threads > MinerStats::MAX_THREADS) {
                         std::cerr << "Thread count " << cli_config.num_threads
-                                  << " exceeds maximum (" << max_threads << ")" << std::endl;
+                                  << " exceeds maximum (" << MinerStats::MAX_THREADS << ")" << std::endl;
                         return 1;
                     }
                     cli_threads_set = true;

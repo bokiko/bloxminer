@@ -14,6 +14,9 @@
 #ifdef __linux__
 #include <sched.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #endif
 
 namespace bloxminer {
@@ -284,8 +287,11 @@ void Miner::stats_thread() {
         disp_stats.rejected = m_stats.shares_rejected.load();
         disp_stats.pool = m_config.pool_host + ":" + std::to_string(m_config.pool_port);
         disp_stats.worker = m_config.worker_name;
-        disp_stats.difficulty = m_current_job.difficulty;
-        disp_stats.current_pool_index = m_current_pool_index;
+        {
+            std::lock_guard<std::mutex> lock(m_job_mutex);
+            disp_stats.difficulty = m_current_job.difficulty;
+            disp_stats.current_pool_index = m_current_pool_index;
+        }
         disp_stats.total_pools = m_config.pools.size();
         
         auto now = std::chrono::steady_clock::now();
@@ -331,21 +337,39 @@ void Miner::stats_thread() {
         LOG_INFO("%s", stats_ss.str().c_str());
         
         // Write stats to file for HiveOS h-stats.sh (avoids screen buffer issues)
-        std::ofstream stats_file("/tmp/bloxminer_stats.txt", std::ios::trunc);
-        if (stats_file.is_open()) {
-            stats_file << stats_ss.str() << std::endl;
-            stats_file.close();
+        // SEC-001: Use per-user directory to prevent /tmp symlink attack.
+        // O_NOFOLLOW refuses to open if path is a symlink.
+#ifdef __linux__
+        {
+            char uid_dir[64];
+            snprintf(uid_dir, sizeof(uid_dir), "/tmp/bloxminer-%d", static_cast<int>(getuid()));
+            mkdir(uid_dir, 0700);
+            char stats_path[128];
+            snprintf(stats_path, sizeof(stats_path), "%s/stats.txt", uid_dir);
+            int fd = open(stats_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+            if (fd >= 0) {
+                std::string content = stats_ss.str() + "\n";
+                write(fd, content.c_str(), content.size());
+                close(fd);
+            }
         }
+#endif
     }
 }
 
 void Miner::mining_thread(uint32_t thread_id) {
-    // Pin thread to specific CPU core for better cache locality
+    // Pin thread to specific CPU core for better cache locality.
+    // Skip if hw == 0 (sandbox/container) or oversubscribed (would alias cores).
 #ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(thread_id % std::thread::hardware_concurrency(), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw > 0 && m_config.num_threads <= hw) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(thread_id, &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        }
+    }
 #endif
 
     verus::Hasher hasher;
@@ -465,7 +489,7 @@ void Miner::mining_thread(uint32_t thread_id) {
             // Use two-stage hash with proper FillExtra rotation
             // This matches ccminer's Verus2hash exactly
             hasher.hash_with_nonce(intermediate, nonceSpace, hash);
-            m_stats.hashes++;
+            // PERF-001: only per-thread counter; get_hashrate() sums these instead of a shared atomic
             m_stats.thread_hashes[thread_id]++;
             
             // Debug sampling disabled for production
@@ -541,10 +565,19 @@ bool Miner::check_hash(const uint8_t* hash, const uint8_t* target) {
 std::string Miner::get_api_stats_json() {
     double hashrate = m_stats.get_hashrate();
     auto sys_stats = utils::SystemMonitor::instance().get_stats();
-    
+
     auto now = std::chrono::steady_clock::now();
     double uptime = std::chrono::duration<double>(now - m_stats.start_time).count();
-    
+
+    // Snapshot job fields under lock to avoid data race with on_new_job/stratum_thread
+    double snap_difficulty;
+    size_t snap_pool_index;
+    {
+        std::lock_guard<std::mutex> lock(m_job_mutex);
+        snap_difficulty = m_current_job.difficulty;
+        snap_pool_index = m_current_pool_index;
+    }
+
     // Calculate efficiency based on total power (CPU + GPU)
     double efficiency = 0.0;
     double total_power = sys_stats.cpu_power + sys_stats.gpu_power;
@@ -580,8 +613,8 @@ std::string Miner::get_api_stats_json() {
     json << "\"host\":\"" << m_config.pool_host << "\","
          << "\"port\":" << m_config.pool_port << ","
          << "\"worker\":\"" << m_config.worker_name << "\","
-         << "\"difficulty\":" << std::fixed << std::setprecision(6) << m_current_job.difficulty << ","
-         << "\"current_index\":" << m_current_pool_index << ","
+         << "\"difficulty\":" << std::fixed << std::setprecision(6) << snap_difficulty << ","
+         << "\"current_index\":" << snap_pool_index << ","
          << "\"total_pools\":" << m_config.pools.size() << "},"
          << "\"hardware\":{";
     json << "\"threads\":" << m_config.num_threads << ",";

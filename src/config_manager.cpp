@@ -267,8 +267,9 @@ MinerConfig ConfigManager::interactive_setup() {
     } else {
         try {
             config.num_threads = static_cast<uint32_t>(std::stoul(input));
-            if (config.num_threads > max_threads * 2) {
-                config.num_threads = max_threads;
+            if (config.num_threads > 256u) {
+                std::cout << "Thread count capped at 256 (hardware limit).\n";
+                config.num_threads = 256u;
             }
         } catch (...) {
             config.num_threads = 0;
