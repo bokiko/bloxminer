@@ -17,31 +17,15 @@ apt-get install -y -qq build-essential cmake libssl-dev git lm-sensors bc
 # Load CPU temp sensors
 modprobe k10temp 2>/dev/null || modprobe coretemp 2>/dev/null || true
 
-# Setup CPU power monitoring (RAPL permissions)
+# CPU power monitoring via RAPL
+# RAPL counters are restricted to root (Linux >= 5.10, CVE-2020-8694/8695 PLATYPUS fix).
+# We do not re-open them to all users. HiveOS runs the miner as root, so power
+# monitoring works without any extra permissions in that environment.
 echo "Setting up CPU power monitoring..."
 if [ -d /sys/class/powercap/intel-rapl ]; then
-    # Set permissions now (for current session)
-    chmod -R o+r /sys/class/powercap/intel-rapl/ 2>/dev/null || true
-
-    # Create udev rule for persistent permissions
-    UDEV_RULE="/etc/udev/rules.d/99-rapl-power.rules"
-    if [ ! -f "$UDEV_RULE" ]; then
-        cat > "$UDEV_RULE" << 'RAPLEOF'
-# Allow non-root users to read CPU power (RAPL)
-SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl/"
-RAPLEOF
-        udevadm control --reload-rules 2>/dev/null || true
-        echo "  RAPL udev rule created"
-    fi
-
-    # Verify it works
-    if cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj >/dev/null 2>&1; then
-        echo "  CPU power monitoring enabled!"
-    else
-        echo "  Warning: RAPL read failed. CPU power may show as N/A."
-    fi
+    echo "  RAPL present. CPU power available when running as root (HiveOS default)."
 else
-    echo "  RAPL not available on this system"
+    echo "  RAPL not available on this system. CPU power will show as N/A."
 fi
 
 # Clean previous installation
@@ -75,7 +59,8 @@ make -j$(nproc)
 
 # Install binary
 cp bloxminer "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/bloxminer"
+chown root:root "$INSTALL_DIR/bloxminer"
+chmod 755 "$INSTALL_DIR/bloxminer"
 
 # Create h-manifest.conf
 cat > "$INSTALL_DIR/h-manifest.conf" << 'EOF'
@@ -154,7 +139,8 @@ cpu_temp=0
 hs_array=""
 
 # Read stats from file written by miner (reliable, no screen buffer issues)
-STATS_FILE="/tmp/bloxminer_stats.txt"
+# SEC-001: per-user dir matches the writer in miner.cpp
+STATS_FILE="/tmp/bloxminer-${UID}/stats.txt"
 STATS_LINE=""
 if [[ -f "$STATS_FILE" ]]; then
     STATS_LINE=$(cat "$STATS_FILE" 2>/dev/null)
@@ -262,10 +248,10 @@ STATSEOF
 EOF
 chmod +x "$INSTALL_DIR/h-stats.sh"
 
-# Set directory permissions so HiveOS can write config
-chmod 777 "$INSTALL_DIR"
+# Set directory permissions — HiveOS agent writes config as root, so 755/644 is sufficient
+chmod 755 "$INSTALL_DIR"
 touch "$INSTALL_DIR/config.txt"
-chmod 666 "$INSTALL_DIR/config.txt"
+chmod 644 "$INSTALL_DIR/config.txt"
 
 # Cleanup
 rm -rf /tmp/bloxminer

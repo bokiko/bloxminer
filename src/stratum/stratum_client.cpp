@@ -20,6 +20,31 @@
 // Simple JSON parsing helpers (avoiding external dependency)
 namespace {
 
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
 std::string extract_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
@@ -75,16 +100,6 @@ double extract_double(const std::string& json, const std::string& key) {
     return num.empty() ? 0.0 : std::stod(num);
 }
 
-bool extract_bool(const std::string& json, const std::string& key) {
-    std::string search = "\"" + key + "\"";
-    size_t pos = json.find(search);
-    if (pos == std::string::npos) return false;
-    
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return false;
-    
-    return json.find("true", pos) < json.find(',', pos);
-}
 
 std::vector<std::string> extract_string_array(const std::string& json, size_t start_pos) {
     std::vector<std::string> result;
@@ -139,6 +154,7 @@ bool StratumClient::connect(const std::string& host, uint16_t port) {
     }
     m_connected = false;
 
+    m_recv_buffer.clear();
     m_host = host;
     m_port = port;
 
@@ -184,7 +200,8 @@ bool StratumClient::connect(const std::string& host, uint16_t port) {
 void StratumClient::disconnect() {
     m_running = false;
     m_connected = false;
-    
+    m_recv_buffer.clear();
+
     if (m_socket >= 0) {
         shutdown(m_socket, SHUT_RDWR);
         close(m_socket);
@@ -261,7 +278,7 @@ bool StratumClient::authorize(const std::string& username, const std::string& pa
     std::stringstream ss;
     ss << "{\"id\":" << auth_id
        << ",\"method\":\"mining.authorize\""
-       << ",\"params\":[\"" << username << "\",\"" << password << "\"]}\n";
+       << ",\"params\":[\"" << json_escape(username) << "\",\"" << json_escape(password) << "\"]}\n";
     
     if (!send_message(ss.str())) {
         return false;
@@ -334,9 +351,14 @@ void StratumClient::submit_share(const Share& share) {
     // - bytes 7-10: header[128:131] = bytes 20-23 of nNonce (padding, zeros)
     // - bytes 11-14: mining nonce (4 bytes, little-endian)
     uint8_t nonceSpace[15] = {0};
-    
+
+    // BUG-001: validate extranonce1 before computing sizes to prevent stack overflow
+    if (m_extranonce1.length() % 2 != 0 || m_extranonce1.length() > 16) {
+        LOG_WARN("Invalid extranonce1 length (%zu), skipping share", m_extranonce1.length());
+        return;
+    }
     size_t xnonce1_bytes = m_extranonce1.length() / 2;
-    
+
     // Copy extranonce1 at bytes 0-3
     utils::hex_to_bytes(m_extranonce1, nonceSpace, xnonce1_bytes);
     // bytes 4-6: first 3 bytes of extranonce2 (zeros) - already zeroed
@@ -446,9 +468,9 @@ void StratumClient::submit_share(const Share& share) {
     // ccminer format: user, jobid, timehex, noncestr, solhex
     std::stringstream ss;
     ss << "{\"method\":\"mining.submit\",\"params\":["
-       << "\"" << m_username << "\""
-       << ",\"" << share.job_id << "\""
-       << ",\"" << share.ntime << "\""
+       << "\"" << json_escape(m_username) << "\""
+       << ",\"" << json_escape(share.job_id) << "\""
+       << ",\"" << json_escape(share.ntime) << "\""
        << ",\"" << noncestr << "\""
        << ",\"" << full_solution << "\"]"
        << ",\"id\":" << submit_id << "}\n";
@@ -467,30 +489,35 @@ bool StratumClient::send_message(const std::string& message) {
 }
 
 std::string StratumClient::receive_line() {
-    std::string line;
-    char c;
     const size_t MAX_LINE_LENGTH = 65536;  // 64KB limit to prevent memory exhaustion
+    char tmp[4096];
 
-    while (m_connected && line.length() < MAX_LINE_LENGTH) {
-        ssize_t n = recv(m_socket, &c, 1, 0);
+    while (m_connected) {
+        // Check if a complete line is already in the buffer
+        size_t nl = m_recv_buffer.find('\n');
+        if (nl != std::string::npos) {
+            std::string line = m_recv_buffer.substr(0, nl);
+            m_recv_buffer.erase(0, nl + 1);
+            return line;
+        }
+
+        // Guard against runaway lines before reading more
+        if (m_recv_buffer.size() >= MAX_LINE_LENGTH) {
+            utils::Logger::instance().error("Stratum line exceeded 64KB limit, disconnecting");
+            m_connected = false;
+            m_recv_buffer.clear();
+            return "";
+        }
+
+        ssize_t n = recv(m_socket, tmp, sizeof(tmp), 0);
         if (n <= 0) {
             m_connected = false;
             return "";
         }
-
-        if (c == '\n') {
-            return line;
-        }
-
-        line += c;
+        m_recv_buffer.append(tmp, static_cast<size_t>(n));
     }
 
-    if (line.length() >= MAX_LINE_LENGTH) {
-        utils::Logger::instance().error("Stratum line exceeded 64KB limit, disconnecting");
-        m_connected = false;
-    }
-
-    return line;
+    return "";
 }
 
 void StratumClient::run() {
@@ -624,10 +651,15 @@ void StratumClient::handle_notification(const std::string& method, const std::st
             }
         }
     } else if (method == "mining.set_extranonce") {
-        // Some pools send this
-        m_extranonce1 = extract_string(params, "extranonce1");
-        m_extranonce2_size = extract_int(params, "extranonce2_size");
-        LOG_DEBUG("Extranonce updated: %s", m_extranonce1.c_str());
+        // Some pools send this; reject oversized extranonce1 (BUG-001)
+        std::string new_extranonce1 = extract_string(params, "extranonce1");
+        if (new_extranonce1.length() > 16) {
+            LOG_WARN("Extranonce1 from pool too long (%zu chars), ignoring", new_extranonce1.length());
+        } else if (!new_extranonce1.empty()) {
+            m_extranonce1 = new_extranonce1;
+            m_extranonce2_size = extract_int(params, "extranonce2_size");
+            LOG_DEBUG("Extranonce updated: %s", m_extranonce1.c_str());
+        }
     }
 }
 

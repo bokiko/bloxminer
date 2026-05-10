@@ -132,27 +132,13 @@ setup_power_monitoring() {
         return
     fi
 
-    # Set permissions now (for current session)
-    sudo chmod -R o+r /sys/class/powercap/intel-rapl/ 2>/dev/null || true
-
-    # Create udev rule for persistent permissions
-    UDEV_RULE="/etc/udev/rules.d/99-rapl-power.rules"
-    if [ ! -f "$UDEV_RULE" ]; then
-        log_info "Creating udev rule for RAPL power monitoring..."
-        sudo tee "$UDEV_RULE" > /dev/null << 'EOF'
-# Allow non-root users to read CPU power (RAPL)
-SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R o+r /sys/class/powercap/intel-rapl/"
-EOF
-        sudo udevadm control --reload-rules 2>/dev/null || true
-    fi
-
-    # Verify it works
-    if cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj >/dev/null 2>&1; then
-        log_info "CPU power monitoring enabled!"
-    else
-        log_warn "Could not enable RAPL. CPU power will show as N/A."
-        log_warn "To fix manually: sudo chmod -R o+r /sys/class/powercap/intel-rapl/"
-    fi
+    # RAPL counters are restricted to root (Linux >= 5.10) to mitigate the PLATYPUS
+    # side-channel attack (CVE-2020-8694/8695). We do not re-open them to all users.
+    # CPU power monitoring works automatically when bloxminer runs as root (e.g. via
+    # the systemd unit). For non-root use, grant read access to the binary only:
+    #   sudo setcap cap_dac_read_search+ep <path>/bloxminer
+    log_info "CPU power monitoring requires root or cap_dac_read_search capability."
+    log_info "It will be reported as N/A when run without sufficient privileges."
 }
 
 # Clone and build
@@ -187,9 +173,11 @@ build_miner() {
                 ;;
             [Rr])
                 log_info "Reinstalling..."
-                # Backup config if exists
+                # Backup config if exists, using mktemp to avoid TOCTOU on fixed /tmp path
                 if [ -f "$INSTALL_DIR/bloxminer.json" ]; then
-                    cp "$INSTALL_DIR/bloxminer.json" /tmp/bloxminer.json.bak
+                    BACKUP_FILE="$(mktemp -t bloxminer.json.XXXXXXXX)" || exit 1
+                    chmod 600 "$BACKUP_FILE"
+                    cp -- "$INSTALL_DIR/bloxminer.json" "$BACKUP_FILE"
                     RESTORE_CONFIG=true
                 fi
                 rm -rf "$INSTALL_DIR"
@@ -207,9 +195,9 @@ build_miner() {
     cd "$INSTALL_DIR"
 
     # Restore config if we backed it up
-    if [ "$RESTORE_CONFIG" = true ] && [ -f /tmp/bloxminer.json.bak ]; then
-        cp /tmp/bloxminer.json.bak "$INSTALL_DIR/bloxminer.json"
-        rm /tmp/bloxminer.json.bak
+    if [ "$RESTORE_CONFIG" = true ] && [ -n "${BACKUP_FILE:-}" ] && [ -f "$BACKUP_FILE" ]; then
+        cp -- "$BACKUP_FILE" "$INSTALL_DIR/bloxminer.json"
+        rm -f -- "$BACKUP_FILE"
         log_info "Restored previous configuration"
         SKIP_CONFIG=true
     fi
