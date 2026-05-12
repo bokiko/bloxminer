@@ -18,8 +18,8 @@ struct PoolConfig {
 
 struct MinerConfig {
     // Pool settings (legacy single pool - for backwards compatibility)
-    std::string pool_host = "eu.luckpool.net";
-    uint16_t pool_port = 3956;  // Verus stratum port
+    std::string pool_host = "pool.verus.io";
+    uint16_t pool_port = 9999;  // Verus stratum port
 
     // Multiple pool support (failover)
     std::vector<PoolConfig> pools;

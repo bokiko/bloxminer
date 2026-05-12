@@ -102,5 +102,11 @@ target_link_libraries(bloxminer PRIVATE
 # Enable link-time optimization
 set_property(TARGET bloxminer PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
+# Test: config defaults stay aligned with interactive/config-manager defaults
+add_executable(test_config_defaults tests/test_config_defaults.cpp)
+target_include_directories(test_config_defaults PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Install
 install(TARGETS bloxminer DESTINATION bin)
