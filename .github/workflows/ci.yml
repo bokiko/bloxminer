@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: sudo apt-get install -y -qq shellcheck jq netcat-openbsd
+      - name: syntax
+        run: for f in bloxminer/*.sh build/*.sh tools/*.sh tests/*/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck -s bash bloxminer/h-config.sh bloxminer/h-run.sh bloxminer/h-stats.sh build/*.sh tools/*.sh tests/*/*.sh
+      - name: HiveOS script tests
+        run: tests/hive/test_hive_scripts.sh
+      - name: hashing-identity tool controls
+        run: tests/tools/test_hashing_identity.sh
+
+  engine:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: release build (same script as the published binary)
+        run: build/build.sh -O3 out
+      - name: patched source for unit tests and a sanitizer build
+        run: tests/engine/prepare_source.sh src
+      - name: sensor unit tests (fake sysfs)
+        run: |
+          clang++-14 -std=c++11 -Wall -g -fsanitize=address,undefined -Isrc tests/engine/test_sys.cpp src/blox_sys.cpp -o test_sys
+          setarch -R ./test_sys
+      - name: sanitizer build
+        run: |
+          cd src && ./autogen.sh >/dev/null 2>&1 && CC=clang-14 CXX=clang++-14 CFLAGS="" CXXFLAGS="" ./configure >/dev/null
+          make -j"$(nproc)" HIVE_ARCH_FLAGS="-march=x86-64-v3 -maes -mpclmul -fno-strict-aliasing" \
+            HIVE_OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address,undefined" >/dev/null
+      # clang 14's ASan crashes at random on kernels with vm.mmap_rnd_bits=32 (even a hello world);
+      # setarch -R runs the sanitizer steps without address randomisation
+      - name: option and config parsing (release + sanitizer builds)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          tests/engine/cli_test.sh out/bloxminer-O3
+          setarch -R tests/engine/cli_test.sh src/ccminer
+      - name: malformed pool messages (release + sanitizer builds)
+        run: |
+          python3 tests/engine/stratum_fuzz.py out/bloxminer-O3
+          setarch -R python3 tests/engine/stratum_fuzz.py src/ccminer

@@ -1,27 +1,53 @@
 #!/usr/bin/env bash
-# Assemble the HiveOS custom-miner release archive: bloxminer-<version>.tar.gz
-# Usage (Ubuntu 22.04 x86-64): build/package.sh <path-to-built-ccminer> [outdir]
+# Assemble the HiveOS custom-miner release archive bloxminer-<version>.tar.gz (deterministic tar) + SHA256SUMS.
+# Usage (Ubuntu 22.04 x86-64): build/package.sh <binary built by build/build.sh> [outdir]
+# The binary must have its <binary>.provenance next to it; the package's SOURCE.md is generated from it.
 set -euo pipefail
-BIN=${1:?path to ccminer built by build/build.sh}; OUT=${2:-$PWD}
+BIN=${1:?path to the binary built by build/build.sh}
+OUT=${2:-$PWD}; mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+PROV="$BIN.provenance"
+[[ -f $PROV ]] || { echo "missing $PROV (build with build/build.sh)"; exit 1; }
+p() { sed -n "s/^$1=//p" "$PROV"; }
+[[ $(p binary_sha256) == $(sha256sum "$BIN" | cut -d' ' -f1) ]] || { echo "$PROV does not describe $BIN (sha256 differs)"; exit 1; }
+[[ $(p patch_sha256) == $(sha256sum "$HERE/build/bloxminer.patch" | cut -d' ' -f1) ]] || { echo "binary was built from a different bloxminer.patch"; exit 1; }
 VER=$(sed -n 's/^CUSTOM_VERSION=//p' "$HERE/bloxminer/h-manifest.conf")
+[[ $(p version) == "$VER" ]] || { echo "binary version $(p version) != h-manifest.conf CUSTOM_VERSION $VER"; exit 1; }
 LIBOMP=/usr/lib/llvm-14/lib/libomp.so.5   # from Ubuntu 22.04 package libomp5-14
+[[ $(p libomp_sha256) == $(sha256sum "$LIBOMP" | cut -d' ' -f1) ]] || { echo "this host's libomp.so.5 differs from the one the binary was built with"; exit 1; }
+
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-mkdir "$W/bloxminer"
-cp "$HERE"/bloxminer/h-config.sh "$HERE"/bloxminer/h-run.sh "$HERE"/bloxminer/h-stats.sh "$HERE"/bloxminer/h-manifest.conf "$W/bloxminer/"
-cp "$BIN" "$W/bloxminer/ccminer"; cp -L "$LIBOMP" "$W/bloxminer/libomp.so.5"
-# distribution notices: GPL for ccminer/BloxMiner, LLVM license for libomp, and where the exact source is
-cp "$HERE/LICENSE" "$W/bloxminer/LICENSE"
-cp /usr/share/doc/libomp5-14/copyright "$W/bloxminer/LICENSE.libomp"
-COMMIT=$(sed -n 's/^COMMIT=\${COMMIT:-\([0-9a-f]*\)}.*/\1/p' "$HERE/build/build.sh")
-cat > "$W/bloxminer/SOURCE.md" <<SRC
-BloxMiner $VER — corresponding source (GPL-3.0)
-ccminer: https://github.com/monkins1010/ccminer (branch Verus2.2) at commit $COMMIT
-patch + build script: https://github.com/bokiko/bloxminer/tree/$VER/build (bloxminer.patch, build.sh)
-compiler: $(clang-14 --version | head -1)
-ccminer sha256: $(sha256sum "$BIN" | cut -d' ' -f1)
-libomp.so.5: Ubuntu 22.04 package libomp5-14 $(dpkg-query -W -f='${Version}' libomp5-14 2>/dev/null) (Apache-2.0 WITH LLVM-exception, see LICENSE.libomp)
+D="$W/bloxminer"; mkdir "$D"
+cp "$HERE"/bloxminer/h-config.sh "$HERE"/bloxminer/h-run.sh "$HERE"/bloxminer/h-stats.sh "$HERE"/bloxminer/h-manifest.conf "$D/"
+cp "$BIN" "$D/bloxminer"; cp -L "$LIBOMP" "$D/libomp.so.5"
+# distribution notices: GPL-3.0 for BloxMiner/ccminer; libomp's copyright file plus the full Apache-2.0 text it refers to
+cp "$HERE/LICENSE" "$D/LICENSE"
+cp /usr/share/doc/libomp5-14/copyright "$D/LICENSE.libomp"
+cp /usr/share/common-licenses/Apache-2.0 "$D/LICENSE.Apache-2.0"
+cat > "$D/SOURCE.md" <<SRC
+BloxMiner $VER - corresponding source (GPL-3.0)
+
+The bloxminer binary is monkins1010/ccminer (branch Verus2.2) at commit $(p upstream_commit)
+with build/bloxminer.patch applied, built by build/build.sh:
+  https://github.com/bokiko/bloxminer/tree/$VER/build
+
+bloxminer sha256        $(p binary_sha256)
+bloxminer.patch sha256  $(p patch_sha256)
+compiler                $(p compiler)
+flags                   $(p arch_flags) $(p opt)
+build OS                $(p os)
+needs                   $(p glibc_min) or newer (Ubuntu 22.04+)
+
+Build packages (a rebuild with these versions reproduces the binary bit for bit):
+$(sed -n 's/^pkg\.\([^=]*\)=/  \1 /p' "$PROV")
+
+libomp.so.5: Ubuntu 22.04 package libomp5-14 $(p pkg.libomp5-14), Apache-2.0 WITH LLVM-exception
+(see LICENSE.libomp and LICENSE.Apache-2.0).
 SRC
-chmod 755 "$W/bloxminer" "$W/bloxminer"/*.sh "$W/bloxminer/ccminer"; chmod 644 "$W/bloxminer/h-manifest.conf" "$W/bloxminer/libomp.so.5" "$W/bloxminer/LICENSE" "$W/bloxminer/LICENSE.libomp" "$W/bloxminer/SOURCE.md"
-tar --owner=0 --group=0 --numeric-owner --sort=name --mtime='2026-09-27 00:00:00Z' -C "$W" -czf "$OUT/bloxminer-$VER.tar.gz" bloxminer
-cd "$OUT"; sha256sum "bloxminer-$VER.tar.gz"; (cd "$W/bloxminer" && sha256sum ccminer libomp.so.5)
+chmod 755 "$D" "$D"/*.sh "$D/bloxminer"
+chmod 644 "$D/h-manifest.conf" "$D/libomp.so.5" "$D/LICENSE" "$D/LICENSE.libomp" "$D/LICENSE.Apache-2.0" "$D/SOURCE.md"
+TGZ="bloxminer-$VER.tar.gz"
+tar --owner=0 --group=0 --numeric-owner --sort=name --mtime='2026-09-27 00:00:00Z' -C "$W" -cf - bloxminer | gzip -n -9 > "$OUT/$TGZ"
+cd "$OUT"
+{ sha256sum "$TGZ"; (cd "$D" && sha256sum bloxminer libomp.so.5 | sed 's#  #  bloxminer/#'); } > SHA256SUMS
+cat SHA256SUMS

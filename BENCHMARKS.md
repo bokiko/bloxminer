@@ -21,8 +21,10 @@ Accepted-share counts per run (30–130) are likewise too small to resolve 1 %.
 | same binary, pinning off (`HCV_NO_AFFINITY=1`) | 48.11 | 48.16 |
 | Oink's own source (1997eda) + patch, same flags | 48.72 | 48.48 |
 
-Not the source code, and not pinning (pinning is slightly faster). Oink's release was built with clang 14 `-march=native`;
-adding **`-mtune=znver3`** to the portable `-march=x86-64-v3` closed the gap. `-march=znver3` gave a byte-identical binary.
+The source revisions tested did not explain the gap (Oink's own source built the same way was just as slow), and
+thread pinning did not recover it (unpinned was slightly slower). Oink's release was built with clang 14 `-march=native`;
+adding **`-mtune=znver3`** to the portable `-march=x86-64-v3` recovered comparable measured speed. `-march=znver3` gave a
+byte-identical binary.
 
 ## 2. BloxMiner flags vs Oink (MH/s, alternated pairs)
 
@@ -52,7 +54,30 @@ shares during the measured windows: 7 vs 8. Sample SD within a slot 0.1–1.0 %;
 
 Tuned for AMD Zen 3; runs on any x86-64-v3 CPU with AES-NI / PCLMUL. Intel is untested.
 
-## 3. ARM (not part of this package)
+## 3. BloxMiner 2.1.0
+
+The 2.1.0 hashing functions are instruction-identical to 2.0.0 (`tools/hashing-identity.sh`, 15/15). 2.1.0 adds a service
+thread that samples sensors every 2 s and redraws the screen; its speed was measured again with the balanced ABBA method.
+
+**Method.** The exact release package (`bloxminer-2.1.0.tar.gz`, binary `3fd67be2…`) with the
+HiveOS default config (no sticky header, log file on) against Oink70's ccminer 3.8.3a, both in a detached `screen` (a pty,
+as under HiveOS), 2 × Ryzen 9 5950X on HiveOS 22.04, same pool, test worker names. Order per rig BloxMiner, Oink, Oink,
+BloxMiner; 2 min warm-up + 10 min measured per slot; summary `KHS` every 30 s; two rounds on each rig. Every sample was checked for the
+right miner (API `NAME`/`VER`), a finite rate and a place inside its slot's measured window (a first attempt was discarded
+because the Oink binary had lost its execute bit and produced no samples).
+
+| Rig, round | BloxMiner slot 1 | Oink slot 2 | Oink slot 3 | BloxMiner slot 4 |
+|---|---|---|---|---|
+| cask10 r1 | 50407.51 | 50692.62 | 50561.58 | 49913.73 |
+| cask10 r2 | 50130.65 | 50029.15 | 49957.42 | 50504.38 |
+| cask18 r1 | 49985.54 | 49779.50 | 50216.77 | 49478.04 |
+| cask18 r2 | 48956.71 | 49843.35 | 49412.96 | 50046.54 |
+
+(kH/s, 20 samples per slot.) BloxMiner 49 927.89 vs Oink 50 061.67 kH/s: **−0.27 %** (cask10 −0.14 %, cask18 −0.39 %),
+within the slot-to-slot noise (about ±1 %).
+
+## 4. ARM (not part of this package)
 
 Orange Pi 5 (RK3588), 2 × 1 h each, pool-side: primo-arm-miner 1.1.0 **8.13 / 8.33 MH/s** vs Oink ARM ccminer
-7.20 / 7.26 MH/s (+13.6 %). Pool numbers count only shares sent to the user's pool, so primo's 2 % fee is already excluded.
+7.20 / 7.26 MH/s (+13.8 % from these numbers; an earlier summary said +13.6 %). Pool numbers count only shares sent to
+the user's pool, so primo's 2 % fee is already excluded.

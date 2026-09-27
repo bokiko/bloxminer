@@ -1,5 +1,6 @@
 # Release artefacts (built by build/build.sh, published as GitHub release assets)
 bloxminer/ccminer
+bloxminer/bloxminer
 bloxminer/libomp.so.5
 bloxminer/config.json
 *.tar.gz

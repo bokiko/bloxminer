@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Tests for bloxminer/h-config.sh and bloxminer/h-stats.sh (Linux: needs jq, nc, timeout, python3).
+# Usage: tests/hive/test_hive_scripts.sh
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd); PKG=$(cd "$HERE/../../bloxminer" && pwd)
+T=$(mktemp -d); trap 'kill "$API_PID" 2>/dev/null; rm -rf "$T"' EXIT
+pass=0; fail=0; API_PID=
+ok()  { pass=$((pass+1)); printf '%-52s ok\n' "$1"; }
+bad() { fail=$((fail+1)); printf '%-52s FAIL: %s\n' "$1" "$2"; }
+
+export BLOX_DIR=$T/pkg
+mkdir -p "$BLOX_DIR"
+cp "$PKG"/h-config.sh "$PKG"/h-stats.sh "$BLOX_DIR"/
+sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config.json#" \
+    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log/bloxminer#" "$PKG/h-manifest.conf" > "$BLOX_DIR/h-manifest.conf"
+CONF=$T/config.json
+NPROC=$(nproc); (( NPROC > 128 )) && NPROC=128
+
+# ------------------------------------------------------------------ h-config
+hc() {  # url template pass extra -> runs h-config, sets $out $rc
+	out=$(CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 bash "$BLOX_DIR/h-config.sh" 2>&1); rc=$?
+}
+jqc() { jq -r "$1" "$CONF"; }
+check_cfg() {  # name, jq expression that must be true
+	if [[ $rc == 0 ]] && [[ $(jq -r "$2" "$CONF" 2>/dev/null) == true ]]; then ok "$1"; else bad "$1" "rc=$rc out=$out cfg=$(cat "$CONF" 2>/dev/null)"; fi
+}
+check_out() {  # name, text the h-config output must contain
+	if grep -qF -- "$2" <<< "$out"; then ok "$1"; else bad "$1" "out=$out"; fi
+}
+check_fail() {  # name, expected message
+	if [[ $rc != 0 ]] && grep -qF -- "$2" <<< "$out"; then ok "$1"; else bad "$1" "rc=$rc out=$out"; fi
+}
+
+hc "pool.example.com:9999" "W.rig" "" ""
+check_cfg "host:port gets stratum+tcp://, all CPUs" ".pools[0].url == \"stratum+tcp://pool.example.com:9999\" and .threads == $NPROC and .pass == \"x\""
+check_cfg "fixed keys: algo, local API, log file" '.algo == "verus" and ."api-bind" == "127.0.0.1:4068" and ."api-allow" == "127.0.0.1" and (."log-file" | endswith("/log/bloxminer.log")) and ."ccd-temp-map" == "auto"'
+hc $'stratum+tcp://a:1\nstratum+tcp://b:2' "W.rig" "" ""
+check_cfg "only the first URL line" '.pools[0].url == "stratum+tcp://a:1"'
+hc "" "W.rig" "" "";                    check_fail "empty URL rejected" "pool URL in the flight sheet is empty"
+hc "p:1" "W.rig" "8" "";                check_cfg  "Pass 8 = 8 threads, pool pass x" '.threads == 8 and .pass == "x"'
+hc "p:1" "W.rig" "08" "";               check_cfg  "Pass 08 = 8 (decimal, not octal)" '.threads == 8'
+hc "p:1" "W.rig" "032" "";              check_cfg  "Pass 032 = 32" '.threads == 32'
+hc "p:1" "W.rig" "128" "";              check_cfg  "Pass 128 accepted" '.threads == 128'
+hc "p:1" "W.rig" "" "";                 check_cfg  "dashboard off by default" '."no-dashboard" == true and (has("dashboard") | not)'
+hc "p:1" "W.rig" "" '"dashboard": true';  check_cfg "dashboard true: header on, key stripped" '(has("no-dashboard") | not) and (has("dashboard") | not)'
+check_out "dashboard true: Miner log warning" 'Miner log'
+hc "p:1" "W.rig" "" '"dashboard": false'; check_cfg "dashboard false = default" '."no-dashboard" == true and (has("dashboard") | not)'
+hc "p:1" "W.rig" "" '"dashboard": "true"'; check_fail "dashboard \"true\" (string) rejected" '"dashboard" must be true or false (got "true")'
+hc "p:1" "W.rig" "" '"dashboard": 1';     check_fail "dashboard 1 rejected" '"dashboard" must be true or false (got 1)'
+hc "p:1" "W.rig" "" '"dashboard": null';  check_fail "dashboard null rejected" '"dashboard" must be true or false (got null)'
+hc "p:1" "W.rig" "" '"no-dashboard": false'; check_cfg "raw no-dashboard false ignored (still off)" '."no-dashboard" == true'
+check_out "raw no-dashboard: ignored message" 'ignored (set by BloxMiner): no-dashboard'
+hc "p:1" "W.rig" "" '"no-dashboard": true, "dashboard": true'; check_cfg "dashboard true wins over raw no-dashboard" '(has("no-dashboard") | not)'
+hc "p:1" "W.rig" "0" "";                check_fail "Pass 0 rejected" "must be 1-128"
+hc "p:1" "W.rig" "129" "";              check_fail "Pass 129 rejected" "must be 1-128"
+hc "p:1" "W.rig" "99999" "";            check_fail "Pass 99999 rejected" "must be 1-128"
+hc "p:1" "W.rig" "s3cret" "";           check_cfg  "text Pass = pool password" ".pass == \"s3cret\" and .threads == $NPROC"
+hc "p:1" "W.rig" "" '"threads": 12';    check_cfg  "Extra threads 12" '.threads == 12'
+hc "p:1" "W.rig" "" '"threads": "16"';  check_cfg  "Extra threads \"16\"" '.threads == 16'
+hc "p:1" "W.rig" "4" '"threads": 12';   check_cfg  "Extra threads wins over Pass" '.threads == 12'
+hc "p:1" "W.rig" "" '"threads": 12.5';  check_fail "Extra threads 12.5 rejected" "must be 1-128"
+hc "p:1" "W.rig" "" '"threads": 0';     check_fail "Extra threads 0 rejected" "must be 1-128"
+hc "p:1" "W.rig" "" '"threads": false'; check_fail "Extra threads false rejected" "must be 1-128"
+hc "p:1" "W.rig" "" '"threads": null';  check_fail "Extra threads null rejected" "must be 1-128"
+hc "p:1" "W.rig" "" '"ccd-temp-map": 2'; check_fail "Extra ccd-temp-map 2 rejected" "must be \"auto\""
+hc "p:1" "W.rig" "" '"ccd-temp-map": 1'; check_cfg "Extra ccd-temp-map 1 (number) normalised" '."ccd-temp-map" == "1"'
+hc "p:1" "W.rig" "" '"pass": "1234"';   check_cfg  "numeric pool password via Extra" '.pass == "1234"'
+hc "p:1" "W.rig" "" '"ccd-temp-map": "1"'; check_cfg "Extra ccd-temp-map overrides" '."ccd-temp-map" == "1"'
+hc "p:1" "W.rig" "" '"algo": "x11", "api-bind": "0.0.0.0:4068", "api-allow": "0/0", "log-file": "/tmp/x"'
+check_cfg "protected keys stay fixed" '.algo == "verus" and ."api-bind" == "127.0.0.1:4068" and ."api-allow" == "127.0.0.1" and (."log-file" | endswith("bloxminer.log"))'
+if grep -qF "ignored" <<< "$out"; then ok "ignored keys are reported"; else bad "ignored keys are reported" "$out"; fi
+# user text containing quotes and command substitutions must end up as literal JSON strings, never executed
+evil_user="W.rig\"; touch $T/pwned1; \""
+evil_extra="\"user2\": \"\$(touch $T/pwned2)\""
+hc "p:1" "$evil_user" "" "$evil_extra"
+if [[ ! -e $T/pwned1 && ! -e $T/pwned2 && $(jqc .user) == "$evil_user" && $(jqc .user2) == "\$(touch $T/pwned2)" ]]; then
+	ok "quotes/command text stay literal JSON"
+else
+	bad "quotes/command text stay literal JSON" "$(cat "$CONF")"
+fi
+echo '{"old":true}' > "$CONF"
+hc "p:1" "W.rig" "" 'not json at all'
+if [[ $rc != 0 && $(cat "$CONF") == '{"old":true}' ]]; then ok "bad Extra config leaves old config intact"; else bad "bad Extra config leaves old config intact" "rc=$rc $(cat "$CONF")"; fi
+if ls "$T"/config.json.tmp.* >/dev/null 2>&1; then bad "no temp file left behind" "$(ls "$T")"; else ok "no temp file left behind"; fi
+
+# ------------------------------------------------------------------ h-stats (fake API)
+PORT=$((20000 + RANDOM % 20000)); export BLOX_API_PORT=$PORT
+echo '{"threads": 4}' > "$CONF"
+SUM_OK='NAME=bloxminer;VER=2.1.0;API=1.9;ALGO=verus;GPUS=1;KHS=12000.00;SOLV=0;ACC=15;REJ=1;ACCMN=1.0;DIFF=1;NETKHS=0;POOLS=1;WAIT=0;UPTIME=321;TS=1;LASTWORK=5;STALL=0;FRESHKHS=11900.00;POWER=136;TEMP=64;CORES=2;ENGINE=ccminer-3.8.3|'
+CORES_OK='GEN=9;AGE=1.2;ROWS=2;THREADS=4/4;PERCORE=1;STALL=0|ROW=0;PKG=0;CORE=0;CPUS=0,2;KHS=6000.00;TEMP=61;SRC=ccd|ROW=1;PKG=0;CORE=1;CPUS=1,3;KHS=5900.00;TEMP=;SRC=none|'
+
+stats_case() {  # name summary cores jq-assertion
+	kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+	PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT       # a fresh port per case: no rebind races
+	jq -n --arg s "$2" --arg c "$3" '{summary: $s, cores: $c}' > "$T/replies.json"
+	: > "$T/api.out"
+	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+	grep -q ready "$T/api.out" || { bad "$1" "fake API did not start: $(cat "$T/api.out")"; return; }
+	local res; res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+	if [[ $(jq -r "$4" <<< "$res" 2>/dev/null) == true ]]; then ok "$1"; else bad "$1" "$res"; fi
+}
+
+stats_case "complete per-core reply" "$SUM_OK" "$CORES_OK" \
+	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "2.1.0" and .stats.algo == "verushash"'
+stats_case "numbers are JSON numbers" "$SUM_OK" "$CORES_OK" \
+	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and (.stats.hs | map(type) | unique) == ["number"]'
+stats_case "stale cores reply -> FRESHKHS" "$SUM_OK" "${CORES_OK/AGE=1.2/AGE=9.5}" '.khs == "11900.00" and .stats.hs == [11900]'
+stats_case "truncated reply -> FRESHKHS" "$SUM_OK" "${CORES_OK%ROW=1*}" '.stats.hs == [11900]'
+stats_case "threads not all covered -> FRESHKHS" "$SUM_OK" "${CORES_OK/THREADS=4\/4/THREADS=3\/4}" '.stats.hs == [11900]'
+stats_case "duplicate core rows -> FRESHKHS" "$SUM_OK" "${CORES_OK/PKG=0;CORE=1;/PKG=0;CORE=0;}" '.stats.hs == [11900]'
+stats_case "no sample yet (GEN=0) -> FRESHKHS" "$SUM_OK" 'GEN=0;ROWS=0|' '.stats.hs == [11900]'
+stats_case "stalled miner -> 0" "${SUM_OK/STALL=0/STALL=1}" "$CORES_OK" '.khs == "0" and .stats.hs == [0]'
+stats_case "per-thread rows (PERCORE=0) accepted" "$SUM_OK" 'GEN=3;AGE=0.5;ROWS=4;THREADS=4/4;PERCORE=0;STALL=0|ROW=0;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|ROW=1;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|ROW=2;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|ROW=3;PKG=-1;CORE=-1;CPUS=-1;KHS=2900;TEMP=;SRC=pkg|' \
+	'.stats.hs == [3000, 3000, 3000, 2900] and .khs == "11900.00"'
+stats_case "no power -> no cpu_power key" "${SUM_OK/POWER=136/POWER=}" "$CORES_OK" '(.stats | has("cpu_power")) == false'
+stats_case "no temps at all -> null temps" "${SUM_OK/TEMP=64/TEMP=}" "${CORES_OK/TEMP=61/TEMP=}" '.stats.temp == [null, null]'
+stats_case "non-numeric KHS in a row -> FRESHKHS" "$SUM_OK" "${CORES_OK/KHS=6000.00/KHS=abc}" '.stats.hs == [11900]'
+stats_case "no API answer -> khs 0, empty stats" "" "" '.khs == "0" and .stats == null'
+PT='GEN=3;AGE=0.5;ROWS=4;THREADS=4/4;PERCORE=0;STALL=0|'
+R0='ROW=0;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|'; R1='ROW=1;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|'
+R2='ROW=2;PKG=-1;CORE=-1;CPUS=-1;KHS=3000;TEMP=;SRC=pkg|'; R3='ROW=3;PKG=-1;CORE=-1;CPUS=-1;KHS=2900;TEMP=;SRC=pkg|'
+stats_case "per-thread: duplicate ROW -> FRESHKHS" "$SUM_OK" "$PT$R0$R1$R1$R3" '.stats.hs == [11900]'
+stats_case "per-thread: 3 rows for 4 threads -> FRESHKHS" "$SUM_OK" "${PT/ROWS=4/ROWS=3}$R0$R1$R2" '.stats.hs == [11900]'
+stats_case "PERCORE=7 -> FRESHKHS" "$SUM_OK" "${CORES_OK/PERCORE=1/PERCORE=7}" '.stats.hs == [11900]'
+stats_case "per-core CPUS cover 3 of 4 threads -> FRESHKHS" "$SUM_OK" "${CORES_OK/CPUS=1,3/CPUS=1}" '.stats.hs == [11900]'
+stats_case "per-core duplicate CPU ids -> FRESHKHS" "$SUM_OK" "${CORES_OK/CPUS=0,2/CPUS=0,0}" '.stats.hs == [11900]'
+stats_case "per-core bad PKG -> FRESHKHS" "$SUM_OK" "${CORES_OK/PKG=0;CORE=1;/PKG=x;CORE=1;}" '.stats.hs == [11900]'
+stats_case "stall only in cores reply -> 0" "$SUM_OK" "${CORES_OK/STALL=0/STALL=1}" '.khs == "0" and .stats.hs == [0]'
+stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" "" '.stats.hs == [11900] and (.stats | has("cpu_power")) == false'
+
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]

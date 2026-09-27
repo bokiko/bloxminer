@@ -1,7 +1,17 @@
-diff -ru a/Makefile.am b/Makefile.am
+diff -ruN a/Makefile.am b/Makefile.am
 --- a/Makefile.am	2026-09-26 09:25:09
-+++ b/Makefile.am	2026-09-26 09:42:04
-@@ -33,7 +33,11 @@
++++ b/Makefile.am	2026-09-27 13:17:49
+@@ -22,7 +22,8 @@
+ 			  ccminer.cpp pools.cpp util.cpp bench.cpp \
+ 			  api.cpp hashlog.cpp stats.cpp sysinfos.cpp \
+ 			  equi/equi-stratum.cpp verus/verusscan.cpp \
+-			  verus/haraka.c verus/verus_clhash.cpp
++			  verus/haraka.c verus/verus_clhash.cpp \
++			  blox_sys.cpp blox_stats.cpp blox_ui.cpp
+ 
+ 
+ 
+@@ -33,7 +34,11 @@
  ccminer_LDFLAGS  = $(PTHREAD_FLAGS)
  
  ccminer_LDADD    = -lcurl @JANSSON_LIBS@ @PTHREAD_LIBS@ @WS2_LIBS@ @OPENMP_CFLAGS@ @LIBS@
@@ -14,10 +24,18 @@ diff -ru a/Makefile.am b/Makefile.am
  
  
  if HAVE_OSX
-diff -ru a/api.cpp b/api.cpp
+diff -ruN a/api.cpp b/api.cpp
 --- a/api.cpp	2026-09-26 09:25:09
-+++ b/api.cpp	2026-09-27 03:07:58
-@@ -111,6 +111,24 @@
++++ b/api.cpp	2026-09-27 14:22:07
+@@ -32,6 +32,7 @@
+ #include <sys/types.h>
+ 
+ #include "miner.h"
++#include "blox.h"
+ 
+ #include "algos.h"
+ 
+@@ -111,6 +112,19 @@
  
  char driver_version[32] = { 0 };
  
@@ -32,17 +50,12 @@ diff -ru a/api.cpp b/api.cpp
 +extern pthread_mutex_t stats_lock;
 +/* a thread is overdue when its current batch has run longer than twice its longest batch so far + 30 s
 + * (full batches last ~60-180 s; batches cut short by a new pool job can be ~1 s and must not shrink the limit) */
-+static inline long thr_stale_limit(int i) {
-+	long l = (long) (2.0 * thr_maxdur[i]) + 30;
-+	if (l < 300) l = 300;          /* floor: a short first batch must not make a healthy long batch look overdue */
-+	if (l > 600) l = 600;          /* cap: a stall is always reported within 10 min of the last work */
-+	return l;
-+}
++static inline long thr_stale_limit(int i) { return blox_stale_limit(thr_maxdur[i]); }   /* bloxminer: shared rule (blox.h) */
 +
  /***************************************************************/
  
  static void gpustatus(int thr_id)
-@@ -153,9 +171,22 @@
+@@ -153,9 +167,22 @@
  */
  static char *getthreads(char *params)
  {
@@ -67,7 +80,7 @@ diff -ru a/api.cpp b/api.cpp
  	return buffer;
  }
  
-@@ -181,16 +212,29 @@
+@@ -181,20 +208,78 @@
  
  	get_currentalgo(algo, sizeof(algo));
  
@@ -84,25 +97,1307 @@ diff -ru a/api.cpp b/api.cpp
 +	long lastwork = newest ? (long) difftime(mono, newest) : -1;
 +	int stall = opt_n_threads > 0 && overdue == opt_n_threads;
 +
++	/* bloxminer: appended fields (2.0.0 fields and meaning unchanged). Empty value = unavailable. */
++	struct blox_snap *bs = (struct blox_snap *) malloc(sizeof(struct blox_snap));
++	char pw[16] = "", tp[16] = "", cores[16] = "";
++	if (bs && blox_snapshot(bs) && blox_mono() - bs->mono <= 6.0) {   /* stale sample: fields stay empty */
++		if (bs->power_w >= 0) snprintf(pw, sizeof(pw), "%.0f", bs->power_w);
++		if (bs->pkg_temp >= 0) snprintf(tp, sizeof(tp), "%d", bs->pkg_temp);
++		if (bs->percore) snprintf(cores, sizeof(cores), "%d", bs->rows);
++	}
++	free(bs);
++
  	*buffer = '\0';
- 	sprintf(buffer, "NAME=%s;VER=%s;API=%s;"
+-	sprintf(buffer, "NAME=%s;VER=%s;API=%s;"
++	snprintf(buffer, MYBUFSIZ, "NAME=%s;VER=%s;API=%s;"
  		"ALGO=%s;GPUS=%d;KHS=%.2f;SOLV=%d;ACC=%d;REJ=%d;"
  		"ACCMN=%.3f;DIFF=%.6f;NETKHS=%.0f;"
 -		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u|",
-+		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u;LASTWORK=%ld;STALL=%d;FRESHKHS=%.2f|",
++		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u;LASTWORK=%ld;STALL=%d;FRESHKHS=%.2f;"
++		"POWER=%s;TEMP=%s;CORES=%s;ENGINE=ccminer-3.8.3|",
  		PACKAGE_NAME, PACKAGE_VERSION, APIVERSION,
  		algo, active_gpus, (double)global_hashrate / 1000.,
  		solved_count, accepted_count, rejected_count,
  		accps, net_diff > 1e-6 ? net_diff : stratum_diff, (double)net_hashrate / 1000.,
 -		num_pools, wait_time, uptime, (uint32_t) ts);
-+		num_pools, wait_time, uptime, (uint32_t) ts, lastwork, stall, freshk);
++		num_pools, wait_time, uptime, (uint32_t) ts, lastwork, stall, freshk,
++		pw, tp, cores);
  	return buffer;
  }
  
-diff -ru a/ccminer.cpp b/ccminer.cpp
+ /**
++ * bloxminer: per-core rows from the service thread's latest sample.
++ * Header GEN;AGE;ROWS;THREADS=<covered>/<configured>;PERCORE;STALL, then one row per physical core
++ * (or per thread when binding/topology did not resolve). Empty TEMP = no sensor.
++ */
++static char *getcores(char *params)
++{
++	struct blox_snap *s = (struct blox_snap *) malloc(sizeof(struct blox_snap));
++	size_t len = 0;
++	*buffer = '\0';
++	if (!s) return buffer;
++	if (!blox_snapshot(s)) { free(s); snprintf(buffer, MYBUFSIZ, "GEN=0;ROWS=0|"); return buffer; }
++	int n = snprintf(buffer, MYBUFSIZ, "GEN=%llu;AGE=%.1f;ROWS=%d;THREADS=%d/%d;PERCORE=%d;STALL=%d|",
++		(unsigned long long) s->gen, blox_mono() - s->mono, s->rows, s->threads_covered, s->threads_cfg,
++		s->percore ? 1 : 0, s->stall ? 1 : 0);
++	if (n < 0 || n >= MYBUFSIZ) { buffer[0] = '\0'; free(s); return buffer; }
++	len = n;
++	for (int k = 0; k < s->rows; k++) {
++		const struct blox_row *r = &s->row[k];
++		char cpus[64] = "", temp[8] = "";
++		size_t c = 0;
++		for (int j = 0; j < r->ncpu; j++) c += snprintf(cpus + c, sizeof(cpus) - c, "%s%d", j ? "," : "", r->cpus[j]);
++		if (r->temp >= 0) snprintf(temp, sizeof(temp), "%d", r->temp);
++		const char *src = r->temp_src == BLOX_T_CCD ? "ccd" : r->temp_src == BLOX_T_CORE ? "core" : r->temp_src == BLOX_T_PKG ? "pkg" : "none";
++		n = snprintf(buffer + len, MYBUFSIZ - len, "ROW=%d;PKG=%d;CORE=%d;CPUS=%s;KHS=%.2f;TEMP=%s;SRC=%s|",
++			k, r->pkg, r->core, cpus, r->khs, temp, src);
++		if (n < 0 || (size_t) n >= MYBUFSIZ - len) { buffer[len] = '\0'; break; }   /* truncated: ROWS tells the reader */
++		len += n;
++	}
++	free(s);
++	return buffer;
++}
++
++/**
+  * Returns some infos about current pool
+  */
+ static char *getpoolnfo(char *params)
+@@ -211,7 +296,7 @@
+ 	*s = '\0';
+ 
+ 	if (stratum.job.job_id)
+-		strncpy(jobid, stratum.job.job_id, sizeof(stratum.job.job_id));
++		strncpy(jobid, stratum.job.job_id, sizeof(jobid) - 1);   /* bloxminer: was sizeof(pointer) = 8 bytes */
+ 	if (stratum.job.xnonce2) {
+ 		/* used temporary to be sure all is ok */
+ 		sprintf(extra, "0x");
+@@ -443,6 +528,7 @@
+ } cmds[] = {
+ 	{ "summary", getsummary, false },
+ 	{ "threads", getthreads, false },
++	{ "cores",   getcores,   false },   /* bloxminer, read-only */
+ 	{ "pool",    getpoolnfo, false },
+ 	{ "histo",   gethistory, false },
+ 	{ "hwinfo",  gethwinfos, false },
+diff -ruN a/blox.h b/blox.h
+--- a/blox.h	1970-01-01 03:00:00
++++ b/blox.h	2026-09-27 14:26:19
+@@ -0,0 +1,113 @@
++/* BloxMiner additions: CPU topology, sensors, per-core stats snapshot, terminal dashboard, log file.
++ * GPL-3.0 (part of a ccminer derivative). Nothing here touches hashing. */
++#pragma once
++
++#include <stdio.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <signal.h>
++
++#define BLOX_MAX_CPUS 1024
++#define BLOX_MAX_PKGS 8
++#define BLOX_MAX_ROWS 140          /* = MAX_GPUS: one row per thread at most */
++#define BLOX_ROW_CPUS 8
++#define BLOX_RAPL_MAX_W 2000.0      /* plausibility bound for one CPU package (W) */
++
++/* ---- topology and sensors (blox_sys.cpp) ---- */
++enum blox_tsrc { BLOX_T_NONE = 0, BLOX_T_PKG, BLOX_T_CCD, BLOX_T_CORE };
++
++struct blox_cpu {
++	bool present;
++	int pkg, core, l3;             /* -1 when unknown */
++	char temp_path[160];           /* per-CPU temperature input (CCD or core), empty = use package temp */
++	int  temp_src;                 /* BLOX_T_CCD / BLOX_T_CORE / BLOX_T_NONE */
++};
++
++struct blox_topo {
++	int ncpu;                      /* highest present cpu index + 1 */
++	struct blox_cpu cpu[BLOX_MAX_CPUS];
++	int npkg, pkg_id[BLOX_MAX_PKGS];
++	char pkg_temp_path[BLOX_MAX_PKGS][160];
++	char vendor[16], model_name[80];
++	int family, model;
++	int cores, threads;            /* physical cores / logical cpus present */
++	int nl3, ntccd;
++	int ccd_mode;                  /* 1 = per-CCD temps in use */
++	char ccd_reason[128];          /* why per-CCD temps are on/off (shown by --sensors) */
++};
++
++struct blox_rapl {
++	int n;
++	char path[BLOX_MAX_PKGS][160];
++	int pkg[BLOX_MAX_PKGS];
++	uint64_t range[BLOX_MAX_PKGS], last_e[BLOX_MAX_PKGS];
++	double last_t[BLOX_MAX_PKGS];
++	bool have_last[BLOX_MAX_PKGS];
++	bool usable;                   /* every topology package has exactly one readable package domain */
++	char reason[128];
++};
++
++const char *blox_sysfs(const char *path, char *out, size_t outsz);   /* prefixes $BLOX_SYSFS_ROOT (tests) */
++void blox_topo_init(struct blox_topo *t, int ccd_opt);              /* ccd_opt: -1 auto, 0 off, 1 forced */
++int  blox_read_temp(const char *path);                              /* degrees C, -1 when unreadable */
++int  blox_pkg_temp(const struct blox_topo *t);                      /* hottest package, -1 when none */
++int  blox_cpu_temp(const struct blox_topo *t, int cpu, int *src);   /* falls back to package temp */
++void blox_rapl_init(struct blox_rapl *r, const struct blox_topo *t);
++double blox_rapl_watts(struct blox_rapl *r, double now);            /* total W, -1 when not valid */
++void blox_sensors_dump(FILE *f, int ccd_opt);                       /* --sensors */
++
++/* A thread is overdue when its current batch has run longer than twice its longest batch so far + 30 s,
++ * clamped to 300..600 s (2.0.0 rule, shared by the API and the sampler). */
++static inline long blox_stale_limit(double maxdur)
++{
++	long l = (long) (2.0 * maxdur) + 30;
++	if (l < 300) l = 300;
++	if (l > 600) l = 600;
++	return l;
++}
++
++/* ---- per-core snapshot + service thread (blox_stats.cpp) ---- */
++struct blox_row {
++	int pkg, core;                 /* -1/-1 for a per-thread row */
++	int ncpu, cpus[BLOX_ROW_CPUS];
++	double khs;                    /* sum of fresh thread rates in kH/s */
++	int temp, temp_src;            /* -1 when none */
++	bool pending;                  /* no thread of this row has finished a batch yet (startup) */
++};
++
++struct blox_snap {
++	uint64_t gen;
++	double mono;                   /* monotonic time of the sample */
++	int rows;
++	bool percore;                  /* rows are physical cores (else one row per thread) */
++	int threads_cfg, threads_covered;
++	bool stall;
++	double fresh_khs;
++	double power_w;                /* -1 when unavailable */
++	int pkg_temp;                  /* -1 when unavailable */
++	struct blox_row row[BLOX_MAX_ROWS];
++};
++
++extern int blox_ccd_opt;               /* --ccd-temp-map auto|0|1 */
++extern int blox_stats_interval;        /* --stats-interval seconds (periodic table) */
++extern bool blox_no_dashboard;         /* --no-dashboard */
++extern bool blox_thread_log;           /* --thread-log */
++extern struct blox_topo blox_topology;
++
++void blox_prepare(void);               /* topology + RAPL discovery */
++bool blox_start(void);                 /* service thread: sampler, dashboard, signal watcher */
++bool blox_snapshot(struct blox_snap *out);
++double blox_mono(void);
++bool blox_algo_is_verus(void);         /* ccminer.cpp: opt_algo is the Verus slot */
++void blox_install_signals(bool background);
++
++/* ---- terminal + log (blox_ui.cpp) ---- */
++extern FILE *blox_log_fp;              /* plain-text log (--log-file), NULL when off */
++extern bool blox_dash_active;
++void blox_log_open(const char *path);
++void blox_log_line_locked(const char *line);   /* caller holds applog_lock */
++void blox_banner(void);
++void blox_ui_init(void);
++void blox_ui_tick(const struct blox_snap *s, bool full_redraw, bool resized);
++void blox_ui_periodic(const struct blox_snap *s);
++void blox_ui_restore(void);            /* normal context only (proper_exit) */
+diff -ruN a/blox_stats.cpp b/blox_stats.cpp
+--- a/blox_stats.cpp	1970-01-01 03:00:00
++++ b/blox_stats.cpp	2026-09-27 14:18:57
+@@ -0,0 +1,232 @@
++/* BloxMiner service thread: per-core snapshot every 2 s, dashboard redraw, periodic table, signal watcher.
++ * Signal handlers only set flags and write one byte to a pipe; all real work happens in this thread. */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "miner.h"
++#include "blox.h"
++
++extern double thr_ratek[];
++extern time_t thr_lastwork[];
++extern double thr_maxdur[];
++extern int thr_cpu[];
++extern time_t hcv_mono_now(void);
++extern pthread_mutex_t stats_lock;
++
++int blox_ccd_opt = -1;
++int blox_stats_interval = 60;
++bool blox_no_dashboard = false;
++bool blox_thread_log = false;
++struct blox_topo blox_topology;
++
++static struct blox_rapl rapl;
++static struct blox_snap snap;
++static pthread_mutex_t snap_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t blox_pth;
++static time_t blox_started;
++static int wake_pipe[2] = { -1, -1 };
++static volatile sig_atomic_t sig_term = 0, sig_winch = 0;
++
++double blox_mono(void)
++{
++	struct timespec t;
++	clock_gettime(CLOCK_MONOTONIC, &t);
++	return t.tv_sec + t.tv_nsec / 1e9;
++}
++
++static void on_signal(int sig)
++{
++	int saved = errno;
++	if (sig == SIGWINCH) sig_winch = 1;
++	else if (sig == SIGINT || sig == SIGTERM) {
++		if (sig_term) _exit(EXIT_CODE_KILLED);   /* second signal: leave now, no output (it could block) */
++		sig_term = sig;
++	}
++	/* SIGHUP (background mode only): keep running, as upstream did */
++	if (wake_pipe[1] >= 0) { char c = 1; ssize_t w = write(wake_pipe[1], &c, 1); (void) w; }
++	errno = saved;
++}
++
++void blox_install_signals(bool background)
++{
++	struct sigaction sa;
++	memset(&sa, 0, sizeof(sa));
++	sa.sa_handler = on_signal;
++	sigemptyset(&sa.sa_mask);
++	sa.sa_flags = SA_RESTART;
++	sigaction(SIGINT, &sa, NULL);
++	sigaction(SIGTERM, &sa, NULL);
++	sigaction(SIGWINCH, &sa, NULL);
++	/* Foreground: SIGHUP keeps its default action. HiveOS stops a miner by closing its screen window,
++	 * which sends SIGHUP; handling it would leave an orphan miner running. */
++	if (background) sigaction(SIGHUP, &sa, NULL);
++}
++
++static int cmp_row(const void *a, const void *b)
++{
++	const struct blox_row *x = (const struct blox_row *) a, *y = (const struct blox_row *) b;
++	if (x->pkg != y->pkg) return x->pkg < y->pkg ? -1 : 1;
++	if (x->core != y->core) return x->core < y->core ? -1 : 1;
++	return 0;
++}
++
++static void sample(void)
++{
++	static struct blox_snap s;            /* only this thread writes it */
++	double ratek[BLOX_MAX_ROWS], maxdur[BLOX_MAX_ROWS];
++	time_t lastwork[BLOX_MAX_ROWS];
++	int cpu[BLOX_MAX_ROWS];
++	int n = opt_n_threads;
++	if (n > BLOX_MAX_ROWS) n = BLOX_MAX_ROWS;
++
++	pthread_mutex_lock(&stats_lock);      /* copy, then release before any I/O */
++	for (int i = 0; i < n; i++) { ratek[i] = thr_ratek[i]; maxdur[i] = thr_maxdur[i]; lastwork[i] = thr_lastwork[i]; cpu[i] = thr_cpu[i]; }
++	pthread_mutex_unlock(&stats_lock);
++
++	uint64_t gen = s.gen;
++	memset(&s, 0, sizeof(s));
++	s.gen = gen + 1;
++	s.threads_cfg = n;
++	time_t mono = hcv_mono_now();
++	double uptime = difftime(time(NULL), blox_started);
++	double khs[BLOX_MAX_ROWS];
++	bool started[BLOX_MAX_ROWS];
++	int overdue = 0;
++	for (int i = 0; i < n; i++) {         /* same freshness rule as the API `threads`/`summary` */
++		long age = lastwork[i] ? (long) difftime(mono, lastwork[i]) : -1;
++		bool late = age < 0 ? uptime > 600 : age > blox_stale_limit(maxdur[i]);
++		if (late) overdue++;
++		started[i] = lastwork[i] != 0 || late;
++		khs[i] = !late && age >= 0 ? ratek[i] / 1000.0 : 0.0;
++		s.fresh_khs += khs[i];
++	}
++	s.stall = n > 0 && overdue == n;
++
++	const struct blox_topo *t = &blox_topology;
++	bool percore = n > 0;
++	for (int i = 0; i < n && percore; i++)
++		percore = cpu[i] >= 0 && cpu[i] < t->ncpu && t->cpu[cpu[i]].present;
++	s.percore = percore;
++	for (int i = 0; i < n; i++) {
++		struct blox_row *r = NULL;
++		if (percore) {
++			int pk = t->cpu[cpu[i]].pkg, co = t->cpu[cpu[i]].core;
++			for (int k = 0; k < s.rows && !r; k++) if (s.row[k].pkg == pk && s.row[k].core == co) r = &s.row[k];
++			if (!r) { r = &s.row[s.rows++]; r->pkg = pk; r->core = co; r->pending = true; }
++		} else {
++			r = &s.row[s.rows++]; r->pkg = r->core = -1; r->pending = true;
++		}
++		if (started[i]) r->pending = false;
++		if (r->ncpu < BLOX_ROW_CPUS) r->cpus[r->ncpu++] = percore ? cpu[i] : (cpu[i] >= 0 ? cpu[i] : -1);
++		r->khs += khs[i];
++		s.threads_covered++;
++	}
++	if (percore) qsort(s.row, s.rows, sizeof(s.row[0]), cmp_row);
++	for (int k = 0; k < s.rows; k++) {
++		int src = BLOX_T_NONE;
++		s.row[k].temp = s.row[k].ncpu && s.row[k].cpus[0] >= 0 ? blox_cpu_temp(t, s.row[k].cpus[0], &src) : blox_pkg_temp(t);
++		if (!(s.row[k].ncpu && s.row[k].cpus[0] >= 0) && s.row[k].temp >= 0) src = BLOX_T_PKG;
++		s.row[k].temp_src = src;
++	}
++	s.pkg_temp = blox_pkg_temp(t);
++	s.power_w = blox_rapl_watts(&rapl, blox_mono());
++	s.mono = blox_mono();
++
++	pthread_mutex_lock(&snap_lock);
++	snap = s;
++	pthread_mutex_unlock(&snap_lock);
++}
++
++bool blox_snapshot(struct blox_snap *out)
++{
++	pthread_mutex_lock(&snap_lock);
++	*out = snap;
++	pthread_mutex_unlock(&snap_lock);
++	return out->gen > 0;
++}
++
++static void *exit_thread(void *arg)
++{
++	(void) arg;
++	applog(LOG_INFO, "%s received, exiting", sig_term == SIGINT ? "SIGINT" : "SIGTERM");
++	proper_exit(EXIT_CODE_KILLED);           /* restores the terminal (best effort), then exit() */
++	return NULL;
++}
++
++/* Watches only for SIGINT/SIGTERM, so a blocked terminal, pipe or log write elsewhere can never stop the
++ * miner from exiting: the exit runs in its own thread and is forced after 5 s if it has not finished. */
++static void *sigwatch_thread(void *arg)
++{
++	(void) arg;
++	while (!sig_term) usleep(100 * 1000);
++	pthread_t t;
++	if (pthread_create(&t, NULL, exit_thread, NULL) == 0) pthread_detach(t);
++	sleep(5);
++	_exit(EXIT_CODE_KILLED);
++	return NULL;
++}
++
++static void *blox_thread(void *arg)
++{
++	(void) arg;
++	static struct blox_snap s;
++	double next_sample = 0, next_full = 0, next_table = blox_mono() + blox_stats_interval;
++	while (!abort_flag) {
++		struct pollfd pfd;
++		pfd.fd = wake_pipe[0]; pfd.events = POLLIN; pfd.revents = 0;
++		poll(&pfd, 1, 250);
++		if (pfd.revents & POLLIN) { char b[64]; while (read(wake_pipe[0], b, sizeof(b)) > 0) {} }
++		if (sig_term) break;                    /* the signal watcher owns the exit */
++		bool resized = sig_winch != 0;
++		sig_winch = 0;
++		double now = blox_mono();
++		if (now >= next_sample) { sample(); next_sample = now + 2.0; }
++		/* the UI redraws after each new sample, on resize, and fully every 10 s (screen detach/reattach) */
++		bool full = resized || now >= next_full;
++		if (full) next_full = now + 10.0;
++		blox_snapshot(&s);
++		blox_ui_tick(&s, full, resized);
++		if (blox_stats_interval > 0 && now >= next_table) {
++			blox_ui_periodic(&s);
++			next_table = now + blox_stats_interval;
++		}
++	}
++	return NULL;
++}
++
++void blox_prepare(void)                 /* topology + power sources, before the UI is set up */
++{
++	blox_started = time(NULL);
++	blox_topo_init(&blox_topology, blox_ccd_opt);
++	blox_rapl_init(&rapl, &blox_topology);
++}
++
++bool blox_start(void)
++{
++	if (pipe(wake_pipe) == 0) {
++		for (int i = 0; i < 2; i++) {
++			fcntl(wake_pipe[i], F_SETFL, fcntl(wake_pipe[i], F_GETFL) | O_NONBLOCK);
++			fcntl(wake_pipe[i], F_SETFD, FD_CLOEXEC);
++		}
++	} else wake_pipe[0] = wake_pipe[1] = -1;
++	pthread_t w;
++	if (pthread_create(&w, NULL, sigwatch_thread, NULL)) {
++		applog(LOG_ERR, "signal watch thread create failed");
++		return false;
++	}
++	pthread_detach(w);
++	if (pthread_create(&blox_pth, NULL, blox_thread, NULL)) {
++		applog(LOG_ERR, "stats thread create failed");
++		return false;
++	}
++	pthread_detach(blox_pth);
++	return true;
++}
+diff -ruN a/blox_sys.cpp b/blox_sys.cpp
+--- a/blox_sys.cpp	1970-01-01 03:00:00
++++ b/blox_sys.cpp	2026-09-27 14:48:46
+@@ -0,0 +1,357 @@
++/* BloxMiner: CPU topology, temperature sources and RAPL package power from sysfs.
++ * Everything is read-only sysfs/procfs; $BLOX_SYSFS_ROOT prefixes every path (unit tests use fake trees). */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <limits.h>
++#include <unistd.h>
++#include <time.h>
++
++#include "blox.h"
++
++const char *blox_sysfs(const char *path, char *out, size_t outsz)
++{
++	const char *root = getenv("BLOX_SYSFS_ROOT");
++	snprintf(out, outsz, "%s%s", root ? root : "", path);
++	return out;
++}
++
++static bool read_str(const char *abs, char *buf, size_t sz)
++{
++	FILE *f = fopen(abs, "r");
++	if (!f) return false;
++	bool ok = fgets(buf, (int) sz, f) != NULL;
++	fclose(f);
++	if (!ok) return false;
++	buf[strcspn(buf, "\r\n")] = '\0';
++	return true;
++}
++
++static bool read_ll(const char *abs, long long *v)
++{
++	char b[64], *end;
++	if (!read_str(abs, b, sizeof(b))) return false;
++	*v = strtoll(b, &end, 10);
++	return end != b;
++}
++
++static bool sys_ll(const char *rel, long long *v)
++{
++	char p[PATH_MAX];
++	return read_ll(blox_sysfs(rel, p, sizeof(p)), v);
++}
++
++int blox_read_temp(const char *path)
++{
++	long long v;
++	if (!path || !*path || !read_ll(path, &v)) return -1;
++	if (v < -40000 || v > 150000) return -1;          /* millidegrees; implausible => unavailable */
++	return (int) ((v + (v >= 0 ? 500 : -500)) / 1000);
++}
++
++static int pkg_index(const struct blox_topo *t, int pkg)
++{
++	for (int i = 0; i < t->npkg; i++) if (t->pkg_id[i] == pkg) return i;
++	return -1;
++}
++
++/* Validated per-CCD temperature profiles: (family, model, #L3, #Tccd). Each entry was confirmed with a
++ * controlled load pinned to one CCD at a time (only that CCD's Tccd rose). Add entries only that way. */
++static const struct { int family, model, nl3, ntccd; const char *what; } ccd_profiles[] = {
++	{ 25, 33, 1, 1, "Ryzen 5000 (Vermeer), 1 CCD" },
++	{ 25, 33, 2, 2, "Ryzen 5000 (Vermeer), 2 CCD" },   /* 5950X load test 2026-09-26 */
++};
++
++static void cpuinfo(struct blox_topo *t)
++{
++	char p[PATH_MAX], line[256];
++	FILE *f = fopen(blox_sysfs("/proc/cpuinfo", p, sizeof(p)), "r");
++	t->family = t->model = -1;
++	if (!f) return;
++	while (fgets(line, sizeof(line), f)) {
++		char *v = strchr(line, ':');
++		if (!v) continue;
++		v++; while (*v == ' ' || *v == '\t') v++;
++		v[strcspn(v, "\r\n")] = '\0';
++		if (!strncmp(line, "vendor_id", 9) && !t->vendor[0]) snprintf(t->vendor, sizeof(t->vendor), "%s", v);
++		else if (!strncmp(line, "cpu family", 10) && t->family < 0) t->family = atoi(v);
++		else if (!strncmp(line, "model name", 10) && !t->model_name[0]) snprintf(t->model_name, sizeof(t->model_name), "%s", v);
++		else if (!strncmp(line, "model", 5) && (line[5] == '\t' || line[5] == ' ' || line[5] == ':') && t->model < 0) t->model = atoi(v);
++	}
++	fclose(f);
++}
++
++/* L3 cache id of a cpu: the cache index whose level is 3 */
++static int l3_id(int cpu)
++{
++	char rel[128]; long long lvl, id;
++	for (int i = 0; i < 10; i++) {
++		snprintf(rel, sizeof(rel), "/sys/devices/system/cpu/cpu%d/cache/index%d/level", cpu, i);
++		if (!sys_ll(rel, &lvl)) continue;
++		if (lvl != 3) continue;
++		snprintf(rel, sizeof(rel), "/sys/devices/system/cpu/cpu%d/cache/index%d/id", cpu, i);
++		if (sys_ll(rel, &id)) return (int) id;
++	}
++	return -1;
++}
++
++/* Package of an AMD k10temp sensor: every CPU in its PCI device's local_cpulist ("0-3,8-11") must belong to
++ * one and the same package. -1 when that cannot be established: the temperature is then unavailable. */
++static int k10temp_pkg(const char *hwmon)
++{
++	char p[PATH_MAX], list[1024], rel[128];
++	snprintf(p, sizeof(p), "%s/device/local_cpulist", hwmon);
++	if (!read_str(p, list, sizeof(list))) return -1;
++	int pkg = -1, n = 0;
++	for (char *tok = list; *tok; ) {
++		char *end; long a = strtol(tok, &end, 10), b = a;
++		if (end == tok || a < 0) return -1;
++		if (*end == '-') { tok = end + 1; b = strtol(tok, &end, 10); if (end == tok || b < a) return -1; }
++		if (b >= BLOX_MAX_CPUS) return -1;
++		for (long c = a; c <= b; c++) {
++			long long pk;
++			snprintf(rel, sizeof(rel), "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", c);
++			if (!sys_ll(rel, &pk)) continue;                       /* offline CPU */
++			if (pkg >= 0 && pk != pkg) return -1;                 /* spans packages: ambiguous */
++			pkg = (int) pk; n++;
++		}
++		if (*end == ',') tok = end + 1;
++		else if (*end == '\0') break;
++		else return -1;
++	}
++	return n ? pkg : -1;
++}
++
++static bool find_label(const char *hwmon, const char *want, char *input, size_t sz)
++{
++	char p[PATH_MAX], lab[64];
++	for (int i = 1; i < 64; i++) {
++		snprintf(p, sizeof(p), "%s/temp%d_label", hwmon, i);
++		if (!read_str(p, lab, sizeof(lab))) continue;
++		if (!strcmp(lab, want)) { snprintf(input, sz, "%s/temp%d_input", hwmon, i); return true; }
++	}
++	return false;
++}
++
++static int count_tccd(const char *hwmon)
++{
++	char p[PATH_MAX], lab[64]; int n = 0;
++	for (int i = 1; i < 64; i++) {
++		snprintf(p, sizeof(p), "%s/temp%d_label", hwmon, i);
++		if (read_str(p, lab, sizeof(lab)) && !strncmp(lab, "Tccd", 4)) n++;
++	}
++	return n;
++}
++
++void blox_topo_init(struct blox_topo *t, int ccd_opt)
++{
++	char p[PATH_MAX], rel[160], name[64];
++	memset(t, 0, sizeof(*t));
++	cpuinfo(t);
++
++	/* ---- cpus */
++	for (int c = 0; c < BLOX_MAX_CPUS; c++) {
++		long long pkg, core;
++		struct blox_cpu *u = &t->cpu[c];
++		u->pkg = u->core = u->l3 = -1;
++		snprintf(rel, sizeof(rel), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
++		if (!sys_ll(rel, &pkg)) continue;
++		snprintf(rel, sizeof(rel), "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
++		if (!sys_ll(rel, &core)) continue;
++		u->present = true; u->pkg = (int) pkg; u->core = (int) core; u->l3 = l3_id(c);
++		t->ncpu = c + 1; t->threads++;
++		if (pkg_index(t, u->pkg) < 0 && t->npkg < BLOX_MAX_PKGS) t->pkg_id[t->npkg++] = u->pkg;
++	}
++	for (int c = 0; c < t->ncpu; c++) {       /* physical cores = unique (pkg, core) */
++		if (!t->cpu[c].present) continue;
++		bool seen = false;
++		for (int d = 0; d < c && !seen; d++)
++			seen = t->cpu[d].present && t->cpu[d].pkg == t->cpu[c].pkg && t->cpu[d].core == t->cpu[c].core;
++		if (!seen) t->cores++;
++	}
++	int l3s[BLOX_MAX_CPUS], nl3 = 0;          /* sorted unique L3 ids */
++	for (int c = 0; c < t->ncpu; c++) {
++		int id = t->cpu[c].l3; bool dup = false;
++		if (!t->cpu[c].present || id < 0) continue;
++		for (int i = 0; i < nl3 && !dup; i++) dup = l3s[i] == id;
++		if (!dup) l3s[nl3++] = id;
++	}
++	for (int i = 1; i < nl3; i++) for (int j = i; j > 0 && l3s[j - 1] > l3s[j]; j--) { int x = l3s[j]; l3s[j] = l3s[j - 1]; l3s[j - 1] = x; }
++	t->nl3 = nl3;
++
++	/* ---- hwmon: package temps, Intel per-core, AMD per-CCD */
++	char k10[BLOX_MAX_PKGS][PATH_MAX]; int nk10 = 0;
++	for (int h = 0; h < 64; h++) {
++		char hw[PATH_MAX];
++		snprintf(rel, sizeof(rel), "/sys/class/hwmon/hwmon%d", h);
++		blox_sysfs(rel, hw, sizeof(hw));
++		snprintf(p, sizeof(p), "%s/name", hw);
++		if (!read_str(p, name, sizeof(name))) continue;
++		if (!strcmp(name, "k10temp") && nk10 < BLOX_MAX_PKGS) {
++			snprintf(k10[nk10++], PATH_MAX, "%s", hw);
++		} else if (!strcmp(name, "coretemp")) {
++			char lab[64]; long long pk;
++			snprintf(p, sizeof(p), "%s/temp1_label", hw);
++			if (!read_str(p, lab, sizeof(lab)) || sscanf(lab, "Package id %lld", &pk) != 1) continue;
++			int pi = pkg_index(t, (int) pk);
++			if (pi < 0) continue;
++			snprintf(t->pkg_temp_path[pi], sizeof(t->pkg_temp_path[pi]), "%s/temp1_input", hw);
++			for (int c = 0; c < t->ncpu; c++) {
++				struct blox_cpu *u = &t->cpu[c];
++				char want[32], in[160];
++				if (!u->present || u->pkg != (int) pk) continue;
++				snprintf(want, sizeof(want), "Core %d", u->core);
++				if (find_label(hw, want, in, sizeof(in))) { snprintf(u->temp_path, sizeof(u->temp_path), "%s", in); u->temp_src = BLOX_T_CORE; }
++			}
++		}
++	}
++	for (int k = 0; k < nk10; k++) {            /* AMD package temp per socket: Tctl, else Tdie */
++		int pkg = nk10 == 1 && t->npkg == 1 ? t->pkg_id[0] : k10temp_pkg(k10[k]);
++		int pi = pkg >= 0 ? pkg_index(t, pkg) : -1;
++		if (pi < 0) continue;
++		if (!find_label(k10[k], "Tctl", t->pkg_temp_path[pi], sizeof(t->pkg_temp_path[pi])))
++			find_label(k10[k], "Tdie", t->pkg_temp_path[pi], sizeof(t->pkg_temp_path[pi]));
++	}
++
++	/* ---- per-CCD decision (AMD) */
++	t->ntccd = nk10 == 1 ? count_tccd(k10[0]) : 0;
++	const char *why = NULL; char buf[128];
++	if (nk10 == 0)                      why = "no AMD k10temp sensor";
++	else if (ccd_opt == 0)              why = "off (ccd-temp-map=0)";
++	else if (t->npkg > 1 || nk10 > 1)   why = "multi-socket: package temperature per socket";
++	else if (t->ntccd == 0)             why = "no Tccd sensors (Tctl only)";
++	else if (t->nl3 == 0)               why = "no L3 topology in sysfs";
++	else if (t->nl3 % t->ntccd)         why = "L3 count is not a multiple of the Tccd count";
++	if (!why && ccd_opt < 0) {
++		const char *prof = NULL;
++		for (size_t i = 0; i < sizeof(ccd_profiles) / sizeof(ccd_profiles[0]); i++)
++			if (ccd_profiles[i].family == t->family && ccd_profiles[i].model == t->model &&
++			    ccd_profiles[i].nl3 == t->nl3 && ccd_profiles[i].ntccd == t->ntccd) prof = ccd_profiles[i].what;
++		if (prof) { snprintf(buf, sizeof(buf), "validated profile: %s", prof); t->ccd_mode = 1; }
++		else {
++			snprintf(buf, sizeof(buf), "no validated profile for family %d model %d (L3 %d, Tccd %d); ccd-temp-map=1 forces it",
++				t->family, t->model, t->nl3, t->ntccd);
++			why = buf;
++		}
++	} else if (!why) {
++		snprintf(buf, sizeof(buf), "forced (ccd-temp-map=1): heuristic L3 order -> Tccd order, %d L3 per CCD", t->nl3 / t->ntccd);
++		t->ccd_mode = 1;
++	}
++	snprintf(t->ccd_reason, sizeof(t->ccd_reason), "%s", why ? why : buf);
++	if (t->ccd_mode) {
++		int ratio = t->nl3 / t->ntccd;
++		for (int c = 0; c < t->ncpu; c++) {
++			struct blox_cpu *u = &t->cpu[c]; int r = -1; char want[16], in[160];
++			if (!u->present || u->l3 < 0) continue;
++			for (int i = 0; i < nl3; i++) if (l3s[i] == u->l3) r = i;
++			if (r < 0) continue;
++			snprintf(want, sizeof(want), "Tccd%d", r / ratio + 1);
++			if (find_label(k10[0], want, in, sizeof(in))) { snprintf(u->temp_path, sizeof(u->temp_path), "%s", in); u->temp_src = BLOX_T_CCD; }
++		}
++	}
++}
++
++int blox_pkg_temp(const struct blox_topo *t)
++{
++	int best = -1;
++	for (int i = 0; i < t->npkg; i++) { int v = blox_read_temp(t->pkg_temp_path[i]); if (v > best) best = v; }
++	return best;
++}
++
++int blox_cpu_temp(const struct blox_topo *t, int cpu, int *src)
++{
++	int v = -1;
++	*src = BLOX_T_NONE;
++	if (cpu < 0 || cpu >= t->ncpu || !t->cpu[cpu].present) return -1;
++	if (t->cpu[cpu].temp_path[0] && (v = blox_read_temp(t->cpu[cpu].temp_path)) >= 0) { *src = t->cpu[cpu].temp_src; return v; }
++	int pi = pkg_index(t, t->cpu[cpu].pkg);
++	if (pi >= 0 && (v = blox_read_temp(t->pkg_temp_path[pi])) >= 0) { *src = BLOX_T_PKG; return v; }
++	return -1;
++}
++
++/* ---- RAPL: only top-level "package-N" domains (Intel "psys" would double count), one per topology package */
++void blox_rapl_init(struct blox_rapl *r, const struct blox_topo *t)
++{
++	char rel[64], dir[PATH_MAX], p[PATH_MAX], name[64];
++	int found[BLOX_MAX_PKGS] = { 0 };
++	memset(r, 0, sizeof(*r));
++	for (int d = 0; d < 32; d++) {
++		long long e, range; int pk;
++		snprintf(rel, sizeof(rel), "/sys/class/powercap/intel-rapl:%d", d);
++		blox_sysfs(rel, dir, sizeof(dir));
++		snprintf(p, sizeof(p), "%s/name", dir);
++		if (!read_str(p, name, sizeof(name)) || sscanf(name, "package-%d", &pk) != 1) continue;
++		int pi = pkg_index(t, pk);
++		if (pi < 0) { snprintf(r->reason, sizeof(r->reason), "RAPL %s has no matching CPU package", name); return; }
++		found[pi]++;
++		snprintf(p, sizeof(p), "%s/energy_uj", dir);
++		if (!read_ll(p, &e)) { snprintf(r->reason, sizeof(r->reason), "RAPL energy_uj not readable (needs root)"); return; }
++		snprintf(p, sizeof(p), "%s/max_energy_range_uj", dir);
++		if (!read_ll(p, &range) || range <= 0) { snprintf(r->reason, sizeof(r->reason), "RAPL max_energy_range_uj not readable"); return; }
++		if (r->n >= BLOX_MAX_PKGS) break;
++		snprintf(r->path[r->n], sizeof(r->path[r->n]), "%s/energy_uj", dir);
++		r->pkg[r->n] = pk; r->range[r->n] = (uint64_t) range; r->n++;
++	}
++	if (t->npkg == 0) { snprintf(r->reason, sizeof(r->reason), "no CPU topology"); return; }
++	for (int i = 0; i < t->npkg; i++)
++		if (found[i] != 1) {
++			snprintf(r->reason, sizeof(r->reason), found[i] ? "duplicate RAPL domain for package %d" : "no RAPL package domain for package %d", t->pkg_id[i]);
++			return;
++		}
++	r->usable = true;
++	snprintf(r->reason, sizeof(r->reason), "%d package domain%s", r->n, r->n > 1 ? "s" : "");
++}
++
++double blox_rapl_watts(struct blox_rapl *r, double now)
++{
++	if (!r->usable) return -1;
++	double total = 0; bool ok = true;
++	for (int i = 0; i < r->n; i++) {
++		long long e;
++		if (!read_ll(r->path[i], &e) || e < 0 || (uint64_t) e > r->range[i]) { r->have_last[i] = false; ok = false; continue; }
++		if (r->have_last[i]) {
++			/* one bound for both checks: at BLOX_RAPL_MAX_W the counter wraps once per maxdt seconds, so a
++			 * longer gap could hide a wrap, and a higher reading is not a CPU package */
++			double dt = now - r->last_t[i];
++			double maxdt = (double) r->range[i] / 1e6 / BLOX_RAPL_MAX_W;
++			double de = (double) e - (double) r->last_e[i];
++			if (de < 0) de += (double) r->range[i];
++			double w = dt > 0 ? de / 1e6 / dt : -1;
++			if (dt <= 0.5 || dt > maxdt || w <= 0 || w > BLOX_RAPL_MAX_W) ok = false;
++			else total += w;
++		} else ok = false;
++		r->last_e[i] = (uint64_t) e; r->last_t[i] = now; r->have_last[i] = true;
++	}
++	return ok ? total : -1;
++}
++
++void blox_sensors_dump(FILE *f, int ccd_opt)
++{
++	static struct blox_topo t;
++	struct blox_rapl r;
++	blox_topo_init(&t, ccd_opt);
++	fprintf(f, "CPU        %s | vendor %s family %d model %d\n", t.model_name[0] ? t.model_name : "?", t.vendor, t.family, t.model);
++	fprintf(f, "Topology   %d package(s), %d cores, %d threads, %d L3 group(s), %d Tccd sensor(s)\n",
++		t.npkg, t.cores, t.threads, t.nl3, t.ntccd);
++	fprintf(f, "Per-CCD    %s\n", t.ccd_reason);
++	for (int i = 0; i < t.npkg; i++)
++		fprintf(f, "Package %d  temp %d C  (%s)\n", t.pkg_id[i], blox_read_temp(t.pkg_temp_path[i]),
++			t.pkg_temp_path[i][0] ? t.pkg_temp_path[i] : "no sensor");
++	fprintf(f, "cpu pkg core  l3  src   temp  path\n");
++	for (int c = 0; c < t.ncpu; c++) {
++		const struct blox_cpu *u = &t.cpu[c]; int src;
++		if (!u->present) continue;
++		int v = blox_cpu_temp(&t, c, &src);
++		const char *s = src == BLOX_T_CCD ? "ccd" : src == BLOX_T_CORE ? "core" : src == BLOX_T_PKG ? "pkg" : "none";
++		fprintf(f, "%3d %3d %4d %3d  %-4s %4d  %s\n", c, u->pkg, u->core, u->l3, s, v, u->temp_path[0] ? u->temp_path : "-");
++	}
++	blox_rapl_init(&r, &t);
++	fprintf(f, "Power      %s\n", r.reason);
++	if (r.usable) {
++		struct timespec ts;
++		clock_gettime(CLOCK_MONOTONIC, &ts); blox_rapl_watts(&r, ts.tv_sec + ts.tv_nsec / 1e9);
++		sleep(1);
++		clock_gettime(CLOCK_MONOTONIC, &ts);
++		fprintf(f, "Power      %.0f W (1 s sample)\n", blox_rapl_watts(&r, ts.tv_sec + ts.tv_nsec / 1e9));
++	}
++}
+diff -ruN a/blox_ui.cpp b/blox_ui.cpp
+--- a/blox_ui.cpp	1970-01-01 03:00:00
++++ b/blox_ui.cpp	2026-09-27 14:21:47
+@@ -0,0 +1,470 @@
++/* BloxMiner terminal output: banner with logo, sticky stats header (scroll region) on a TTY,
++ * periodic plain table otherwise, and a plain-text log file with size-based self-rotation.
++ * All terminal and log writes happen under applog_lock, from normal thread context. */
++#include <ccminer-config.h>
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++#include <string.h>
++#include <errno.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++#include "miner.h"
++#include "blox.h"
++
++extern double stratum_diff;
++
++FILE *blox_log_fp = NULL;
++bool blox_dash_active = false;
++
++static char log_path[512];
++static long log_bytes;
++static const long LOG_MAX_BYTES = 10L * 1024 * 1024;   /* rotate to <file>.1 at 10 MB (no signals involved) */
++
++static bool tty, color, c256, dash_capable;   /* dash_capable: TTY, not dumb, dashboard allowed */
++static int term_rows, term_cols, hdr_h;
++static time_t ui_started;
++static uint64_t last_gen;
++static bool selftest_plain;   /* BLOX_UI_SELFTEST: print header rows as plain lines */
++
++/* palette */
++static const char *C_RST = "\033[0m";
++static const char *c_cell, *c_hot, *c_acc, *c_dim, *c_ok, *c_bad, *c_bold;
++
++static void pick_palette(void)
++{
++	if (c256) { c_cell = "\033[48;5;245m"; c_hot = "\033[48;5;214m"; c_acc = "\033[38;5;214m"; c_dim = "\033[38;5;245m"; c_ok = "\033[38;5;114m"; c_bad = "\033[38;5;203m"; }
++	else      { c_cell = "\033[100m";      c_hot = "\033[43m";       c_acc = "\033[33m";       c_dim = "\033[90m";       c_ok = "\033[32m";       c_bad = "\033[31m"; }
++	c_bold = "\033[1m";
++}
++
++/* ---------------------------------------------------------------- log file */
++
++static void strip_ansi(const char *in, char *out, size_t sz)
++{
++	size_t o = 0;
++	for (size_t i = 0; in[i] && o + 1 < sz; i++) {
++		if (in[i] == '\033' && in[i + 1] == '[') {
++			i += 2;
++			while (in[i] && !((in[i] >= '@' && in[i] <= '~'))) i++;
++			if (!in[i]) break;
++			continue;
++		}
++		out[o++] = in[i];
++	}
++	out[o] = '\0';
++}
++
++void blox_log_open(const char *path)
++{
++	if (!path || !*path) return;
++	snprintf(log_path, sizeof(log_path), "%s", path);
++	blox_log_fp = fopen(log_path, "a");
++	if (!blox_log_fp) {                     /* fail open: keep mining, keep the terminal output */
++		applog(LOG_WARNING, "log file %s: %s (continuing without a log file)", log_path, strerror(errno));
++		return;
++	}
++	setvbuf(blox_log_fp, NULL, _IOLBF, 0);
++	fseek(blox_log_fp, 0, SEEK_END);
++	log_bytes = ftell(blox_log_fp);
++}
++
++void blox_log_line_locked(const char *line)
++{
++	char plain[2048];
++	if (!blox_log_fp) return;
++	strip_ansi(line, plain, sizeof(plain));
++	size_t n = strlen(plain);
++	while (n && (plain[n - 1] == '\n' || plain[n - 1] == '\r')) plain[--n] = '\0';
++	fprintf(blox_log_fp, "%s\n", plain);
++	log_bytes += (long) n + 1;
++	if (log_bytes > LOG_MAX_BYTES) {
++		char old[600];
++		fclose(blox_log_fp);
++		snprintf(old, sizeof(old), "%s.1", log_path);
++		rename(log_path, old);
++		blox_log_fp = fopen(log_path, "a");
++		if (blox_log_fp) setvbuf(blox_log_fp, NULL, _IOLBF, 0);
++		log_bytes = 0;
++	}
++}
++
++/* ---------------------------------------------------------------- formatting helpers */
++
++struct line { char buf[2048]; size_t len; int vis; int max; };   /* max = visible-column budget */
++
++static void l_reset(struct line *l) { l->buf[0] = '\0'; l->len = 0; l->vis = 0; l->max = 1 << 20; }
++
++static int vis_len(const char *s)       /* printable columns of a UTF-8 string without escapes */
++{
++	int n = 0;
++	for (; *s; s++) {
++		if (*s == '\033') { while (*s && !(*s >= '@' && *s <= '~' && *s != '[')) s++; if (!*s) break; continue; }
++		if (((unsigned char) *s & 0xC0) != 0x80) n++;
++	}
++	return n;
++}
++
++static void l_add(struct line *l, const char *col, const char *fmt, ...)
++{
++	char tmp[512];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(tmp, sizeof(tmp), fmt, ap);
++	va_end(ap);
++	int room = l->max - l->vis;                 /* clip to the budget: a row never wraps (text is ASCII) */
++	if (room <= 0) return;
++	if (vis_len(tmp) > room) tmp[room] = '\0';
++	int w = snprintf(l->buf + l->len, sizeof(l->buf) - l->len, "%s%s%s", color && col ? col : "", tmp, color && col ? C_RST : "");
++	if (w > 0 && (size_t) w < sizeof(l->buf) - l->len) { l->len += w; l->vis += vis_len(tmp); }
++}
++
++static void l_pad(struct line *l, int to) { while (l->vis < to) l_add(l, NULL, " "); }
++
++/* Degrees as a plain "C": GNU screen without UTF-8 mode counts a multi-byte degree sign as two
++ * columns, which breaks every row's width (seen in HiveOS-style screen sessions). */
++static const char *deg(void) { return "C"; }
++
++/* "AMD Ryzen 9 5900X 12-Core Processor" -> "Ryzen 9 5900X"; "Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz" -> "i9-10900K" */
++static void short_model(const char *in, char *out, size_t sz)
++{
++	char buf[128], *tok, *save = NULL; size_t o = 0;
++	snprintf(buf, sizeof(buf), "%s", in);
++	char *at = strstr(buf, " @ "); if (at) *at = '\0';
++	out[0] = '\0';
++	for (tok = strtok_r(buf, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
++		size_t n = strlen(tok);
++		if (!strcmp(tok, "AMD") || !strcmp(tok, "Intel(R)") || !strcmp(tok, "Core(TM)") || !strcmp(tok, "Processor") ||
++		    !strcmp(tok, "CPU") || (n > 5 && !strcmp(tok + n - 5, "-Core"))) continue;
++		o += snprintf(out + o, o < sz ? sz - o : 0, "%s%s", o ? " " : "", tok);
++		if (o >= sz) break;
++	}
++	if (!out[0]) snprintf(out, sz, "%s", in);
++}
++
++static void fmt_rate(char *o, size_t sz, double khs)
++{
++	if (khs >= 1e6)       snprintf(o, sz, "%.2f GH/s", khs / 1e6);
++	else if (khs >= 1e3)  snprintf(o, sz, "%.2f MH/s", khs / 1e3);
++	else                  snprintf(o, sz, "%.1f kH/s", khs);
++}
++
++static void fmt_cell_rate(char *o, size_t sz, double khs)
++{
++	if (khs >= 1e3) snprintf(o, sz, "%.2fM", khs / 1e3);
++	else            snprintf(o, sz, "%.0fK", khs);
++}
++
++static void fmt_up(char *o, size_t sz, long s)
++{
++	if (s >= 86400) snprintf(o, sz, "%ldd%02ldh", s / 86400, (s % 86400) / 3600);
++	else            snprintf(o, sz, "%ldh%02ldm", s / 3600, (s % 3600) / 60);
++}
++
++static void totals(unsigned *acc, unsigned *rej)
++{
++	*acc = *rej = 0;
++	for (int p = 0; p < num_pools; p++) { *acc += pools[p].accepted_count; *rej += pools[p].rejected_count; }
++}
++
++/* ---------------------------------------------------------------- banner */
++
++static const char *LOGO[5] = { "XXX.", "X..X", "XXA.", "X..X", "XXX." };   /* the "B" core grid, A = hot core */
++
++void blox_banner(void)
++{
++	const char *side[5] = { NULL, "VerusHash v2.2 CPU miner - GPL-3.0",
++		"based on ccminer (Christian Buchner, Christian H.) - Verus port by monkins1010",
++		"https://github.com/bokiko/bloxminer", "" };
++	char row[1024], plain[512];
++	pthread_mutex_lock(&applog_lock);
++	for (int r = 0; r < 5; r++) {
++		size_t o = 0, p = 0;
++		o += snprintf(row + o, sizeof(row) - o, " ");
++		p += snprintf(plain + p, sizeof(plain) - p, " ");
++		for (int c = 0; c < 4; c++) {
++			char ch = LOGO[r][c];
++			if (color) o += snprintf(row + o, sizeof(row) - o, "%s  %s", ch == '.' ? "" : ch == 'A' ? c_hot : c_cell, ch == '.' ? "" : C_RST);
++			else       o += snprintf(row + o, sizeof(row) - o, "%s", ch == '.' ? "  " : "##");
++			p += snprintf(plain + p, sizeof(plain) - p, "%s", ch == '.' ? "  " : "##");
++		}
++		if (r == 0) {
++			o += snprintf(row + o, sizeof(row) - o, "    %sBlox%s%sMiner%s %s", color ? c_bold : "", color ? C_RST : "",
++				color ? c_dim : "", color ? C_RST : "", PACKAGE_VERSION);
++			p += snprintf(plain + p, sizeof(plain) - p, "    BloxMiner %s", PACKAGE_VERSION);
++		} else {
++			o += snprintf(row + o, sizeof(row) - o, "    %s%s%s", color && r > 1 ? c_dim : "", side[r], color && r > 1 ? C_RST : "");
++			p += snprintf(plain + p, sizeof(plain) - p, "    %s", side[r]);
++		}
++		fprintf(stdout, "%s\n", row);
++		blox_log_line_locked(plain);
++	}
++	fprintf(stdout, "\n");
++	fflush(stdout);
++	pthread_mutex_unlock(&applog_lock);
++}
++
++/* ---------------------------------------------------------------- sticky header */
++
++static int grid_cols(int width) { int c = (width - 4) / 15; return c < 1 ? 1 : c; }
++
++static int expected_rows(void)          /* before the first sample: pinned threads ~ distinct cores */
++{
++	const struct blox_topo *t = &blox_topology;
++	int n = opt_n_threads, seen = 0;
++	if (!t->threads || n <= 0) return n > 0 ? n : 0;
++	int pk[BLOX_MAX_ROWS], co[BLOX_MAX_ROWS], used = 0;
++	for (int c = 0; c < t->ncpu && used < n; c++) {
++		if (!t->cpu[c].present) continue;
++		used++;
++		bool dup = false;
++		for (int i = 0; i < seen && !dup; i++) dup = pk[i] == t->cpu[c].pkg && co[i] == t->cpu[c].core;
++		if (!dup && seen < BLOX_MAX_ROWS) { pk[seen] = t->cpu[c].pkg; co[seen] = t->cpu[c].core; seen++; }
++	}
++	return used < n ? n : seen;
++}
++
++static int snap_rows(const struct blox_snap *s) { return s && s->gen ? s->rows : expected_rows(); }
++
++static int layout_height(int rows, int width, bool with_grid)
++{
++	int gl = with_grid && rows ? (rows + grid_cols(width) - 1) / grid_cols(width) : 0;
++	return 4 + (gl ? gl + 1 : 0) + 1;        /* border, title, stats x2, [sep + grid], border */
++}
++
++static int box_width(void) { int w = term_cols < 120 ? term_cols : 120; return w; }
++
++static void term_size(void)
++{
++	struct winsize ws;
++	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row && ws.ws_col) { term_rows = ws.ws_row; term_cols = ws.ws_col; }
++	else { term_rows = 24; term_cols = 80; }
++}
++
++static void hline(struct line *l, int w, char edge)
++{
++	l_reset(l);
++	char b[256]; int n = w - 2 < (int) sizeof(b) - 1 ? w - 2 : (int) sizeof(b) - 1;
++	memset(b, '-', n); b[n] = '\0';
++	l_add(l, c_dim, "%c%s%c", edge, b, edge);
++}
++
++static void close_row(struct line *l, int w) { l_pad(l, w - 1); l->max = w; l_add(l, c_dim, "|"); }
++
++static void draw_header_locked(const struct blox_snap *s)
++{
++	struct line l;
++	int w = box_width(), row = 1;
++	unsigned acc, rej;
++	char a[64], b[64], up[32];
++	totals(&acc, &rej);
++	fmt_up(up, sizeof(up), (long) difftime(time(NULL), ui_started));
++	bool with_grid = hdr_h > 5;   /* 5 = compact header */
++
++	if (!selftest_plain) fputs("\0337", stdout);   /* save cursor (it stays inside the scroll region) */
++#define EMIT() do { if (selftest_plain) fprintf(stdout, "%s\n", l.buf); \
++                    else fprintf(stdout, "\033[%d;1H\033[2K%s", row, l.buf); row++; } while (0)
++	hline(&l, w, '+'); EMIT();
++
++	l_reset(&l); l.max = w - 1; l_add(&l, c_dim, "| ");
++	l_add(&l, c_bold, "Blox"); l_add(&l, c_dim, "Miner"); l_add(&l, NULL, " %s", PACKAGE_VERSION);
++	char model[64];
++	short_model(blox_topology.model_name, model, sizeof(model));
++	int room = w - 2 - l.vis - (int) strlen(up) - 3 - 12;          /* keep "  nnC/nnT" and "up ..." */
++	if (blox_topology.model_name[0] && room > 6) l_add(&l, c_dim, "  %.*s", room, model);
++	l_add(&l, c_dim, "  %dC/%dT", blox_topology.cores, blox_topology.threads);
++	if (l.vis + 3 + (int) strlen(up) + 3 <= w - 1) { l_pad(&l, w - 3 - (int) strlen(up) - 3); l_add(&l, c_dim, "up %s", up); }
++	close_row(&l, w); EMIT();
++
++	l_reset(&l); l.max = w - 1; l_add(&l, c_dim, "| ");
++	if (!s || !s->gen) l_add(&l, c_dim, "starting...");
++	else if (s->stall) l_add(&l, c_bad, "STALLED: no recent work, 0 H/s");
++	else {
++		fmt_rate(a, sizeof(a), s->fresh_khs);
++		l_add(&l, NULL, "Hashrate "); l_add(&l, c_ok, "%s", a);
++	}
++	l_add(&l, NULL, "   A "); l_add(&l, c_ok, "%u", acc);
++	l_add(&l, NULL, "  R "); l_add(&l, rej ? c_acc : NULL, "%u", rej);
++	if (stratum_diff > 0) l_add(&l, NULL, "   Diff %.3g", stratum_diff);
++	close_row(&l, w); EMIT();
++
++	l_reset(&l); l.max = w - 1; l_add(&l, c_dim, "| ");
++	if (s && s->power_w >= 0) { l_add(&l, NULL, "Power "); l_add(&l, c_acc, "%.0f W", s->power_w); }
++	else l_add(&l, c_dim, "Power n/a");
++	if (s && s->pkg_temp >= 0) l_add(&l, NULL, "   Temp %d%s", s->pkg_temp, deg());
++	if (s && s->power_w > 0 && s->fresh_khs > 0 && !s->stall) l_add(&l, NULL, "   Eff %.0f kH/W", s->fresh_khs / s->power_w);
++	int prem = w - 2 - l.vis - 8;                                  /* what fits before the right border */
++	if (num_pools > 0 && pools[cur_pooln].short_url[0] && prem >= 12) {
++		const char *u = pools[cur_pooln].short_url;
++		int ul = (int) strlen(u);
++		l_add(&l, NULL, "   Pool ");
++		if (ul <= prem) l_add(&l, c_dim, "%s", u);
++		else l_add(&l, c_dim, "%.*s~", prem - 1, u);
++	}
++	close_row(&l, w); EMIT();
++
++	if (with_grid && s && s->rows) {
++		hline(&l, w, '+'); EMIT();
++		int cols = grid_cols(w);
++		for (int k = 0; k < s->rows; k += cols) {
++			l_reset(&l); l.max = w - 1; l_add(&l, c_dim, "| ");
++			for (int j = k; j < k + cols && j < s->rows; j++) {
++				const struct blox_row *r = &s->row[j];
++				fmt_cell_rate(b, sizeof(b), r->khs);
++				l_add(&l, c_dim, "%s%02d ", s->percore ? "C" : "T", j);
++				if (r->pending) l_add(&l, c_dim, "%-6s", "...");
++				else l_add(&l, r->khs > 0 ? NULL : c_bad, "%-6s", b);
++				if (r->temp >= 0) l_add(&l, r->temp >= 90 ? c_bad : NULL, "%3d%s ", r->temp, deg());
++				else l_add(&l, c_dim, "  -- ");
++				l_pad(&l, 2 + (j - k + 1) * 15);
++			}
++			close_row(&l, w); EMIT();
++		}
++	}
++	hline(&l, w, '+'); EMIT();
++#undef EMIT
++	if (!selftest_plain) fputs("\0338", stdout);   /* restore cursor */
++	fflush(stdout);
++}
++
++/* clear: wipe the screen first (first setup and resize); otherwise keep the log lines on screen */
++static void setup_region_locked(const struct blox_snap *s, bool clear)
++{
++	term_size();
++	int w = box_width(), rows = snap_rows(s);
++	hdr_h = layout_height(rows, w, true);
++	if (term_rows < hdr_h + 5) hdr_h = layout_height(rows, w, false);  /* compact: no core grid */
++	if (term_rows < hdr_h + 5 || w < 60) {                               /* too small: plain scrolling output */
++		if (blox_dash_active) fprintf(stdout, "\033[r\033[%d;1H", term_rows);
++		blox_dash_active = false;
++		fflush(stdout);
++		return;
++	}
++	fprintf(stdout, "\033[r");                                  /* reset any stale region */
++	if (clear) fprintf(stdout, "\033[2J");
++	fprintf(stdout, "\033[%d;%dr", hdr_h + 1, term_rows);      /* logs scroll below the header */
++	fprintf(stdout, "\033[%d;1H", term_rows);                  /* cursor at the bottom of the region */
++	blox_dash_active = true;
++	draw_header_locked(s);
++}
++
++/* Test hook: BLOX_UI_SELFTEST=<columns> renders the header for worst-case states as plain lines and exits,
++ * so tests can check that no row is wider than the terminal. */
++static void ui_selftest(int cols)
++{
++	static struct blox_snap st;
++	selftest_plain = true; color = false; tty = true;
++	term_cols = cols; term_rows = 200;
++	snprintf(blox_topology.model_name, sizeof(blox_topology.model_name), "%s",
++		"AMD Ryzen Threadripper PRO 7995WX 96-Cores Engineering Sample With A Very Long Name");
++	blox_topology.cores = 96; blox_topology.threads = 192;
++	num_pools = 1; cur_pooln = 0;
++	snprintf(pools[0].short_url, sizeof(pools[0].short_url), "%s", "stratum+tcp://an-extremely-long-pool-host-name.example.com:65535");
++	pools[0].accepted_count = 4294967295U; pools[0].rejected_count = 4294967295U;
++	stratum_diff = 1.23456789e300;
++	ui_started = time(NULL) - 10 * 86400 - 3600;
++	for (int state = 0; state < 4; state++) {
++		memset(&st, 0, sizeof(st));
++		st.gen = state == 3 ? 0 : 1; st.percore = true; st.rows = 64; st.threads_cfg = st.threads_covered = 128;
++		st.stall = state == 1; st.fresh_khs = 9.9e9; st.power_w = state == 2 ? -1 : 1234.5; st.pkg_temp = state == 2 ? -1 : 105;
++		for (int k = 0; k < st.rows; k++) {
++			st.row[k].khs = 99999.99; st.row[k].temp = state == 2 ? -1 : 105; st.row[k].pending = state == 2;
++		}
++		const char *name[] = { "huge counters", "stalled", "pending, no sensors", "starting" };
++		printf("## %s\n", name[state]);
++		hdr_h = layout_height(st.rows, box_width(), true);
++		draw_header_locked(&st);
++	}
++	exit(0);
++}
++
++void blox_ui_init(void)
++{
++	const char *self = getenv("BLOX_UI_SELFTEST");
++	if (self && atoi(self) > 0) ui_selftest(atoi(self));
++	const char *term = getenv("TERM");
++	tty = isatty(STDOUT_FILENO);
++	bool dumb = !term || !*term || !strcmp(term, "dumb");
++	color = tty && !dumb && use_colors && !getenv("NO_COLOR");
++	if (!color) use_colors = false;                             /* applog too: no escapes into pipes, TERM=dumb, NO_COLOR */
++	dash_capable = tty && !dumb && !blox_no_dashboard;
++	c256 = color && strstr(term, "256color");
++	pick_palette();
++	ui_started = time(NULL);
++	if (dash_capable) {
++		pthread_mutex_lock(&applog_lock);
++		setup_region_locked(NULL, true);
++		pthread_mutex_unlock(&applog_lock);
++	}
++	blox_banner();
++}
++
++void blox_ui_tick(const struct blox_snap *s, bool full, bool resized)
++{
++	if (!dash_capable) return;
++	pthread_mutex_lock(&applog_lock);
++	int want = layout_height(snap_rows(s), box_width(), true);
++	if (term_rows < want + 5) want = layout_height(snap_rows(s), box_width(), false);
++	if (resized) {
++		setup_region_locked(s, true);                           /* terminal size changed (or re-attached) */
++	} else if (blox_dash_active && want != hdr_h) {
++		setup_region_locked(s, false);                          /* grid size changed: keep the log lines */
++	} else if (blox_dash_active && (full || s->gen != last_gen)) {
++		draw_header_locked(s);
++	}
++	last_gen = s->gen;
++	pthread_mutex_unlock(&applog_lock);
++}
++
++void blox_ui_periodic(const struct blox_snap *s)
++{
++	char line[1024], a[64], b[64], up[32];
++	unsigned acc, rej;
++	if (!s->gen) return;
++	totals(&acc, &rej);
++	fmt_rate(a, sizeof(a), s->stall ? 0 : s->fresh_khs);
++	fmt_up(up, sizeof(up), (long) difftime(time(NULL), ui_started));
++	size_t o = snprintf(line, sizeof(line), "== BloxMiner %s | %s | A %u R %u", PACKAGE_VERSION, a, acc, rej);
++	if (s->power_w >= 0) o += snprintf(line + o, sizeof(line) - o, " | %.0f W", s->power_w);
++	if (s->pkg_temp >= 0) o += snprintf(line + o, sizeof(line) - o, " | %d C", s->pkg_temp);
++	if (s->power_w > 0 && s->fresh_khs > 0 && !s->stall) o += snprintf(line + o, sizeof(line) - o, " | %.0f kH/W", s->fresh_khs / s->power_w);
++	snprintf(line + o, sizeof(line) - o, " | up %s%s ==", up, s->stall ? " | STALLED" : "");
++
++	pthread_mutex_lock(&applog_lock);
++	if (!blox_dash_active) fprintf(stdout, "%s\n", line);
++	blox_log_line_locked(line);
++	for (int k = 0; k < s->rows; k += 6) {
++		size_t p = 0;
++		for (int j = k; j < k + 6 && j < s->rows; j++) {
++			if (s->row[j].pending) snprintf(b, sizeof(b), "...");
++			else fmt_cell_rate(b, sizeof(b), s->row[j].khs);
++			if (s->row[j].temp >= 0) p += snprintf(line + p, sizeof(line) - p, " %s%02d %-6s %3dC ", s->percore ? "C" : "T", j, b, s->row[j].temp);
++			else                     p += snprintf(line + p, sizeof(line) - p, " %s%02d %-6s  --  ", s->percore ? "C" : "T", j, b);
++		}
++		if (!blox_dash_active) fprintf(stdout, "%s\n", line);
++		blox_log_line_locked(line);
++	}
++	fflush(stdout);
++	pthread_mutex_unlock(&applog_lock);
++}
++
++void blox_ui_restore(void)
++{
++	/* best effort: never wait long for a log lock held by a writer that may be blocked */
++	int tries = 0;
++	while (pthread_mutex_trylock(&applog_lock) != 0) {
++		if (++tries > 20) return;                 /* ~1 s */
++		usleep(50 * 1000);
++	}
++	if (blox_dash_active) {
++		fprintf(stdout, "\033[r\033[%d;1H\033[0m\n", term_rows);
++		fflush(stdout);
++		blox_dash_active = false;
++	}
++	if (blox_log_fp) fflush(blox_log_fp);
++	pthread_mutex_unlock(&applog_lock);
++}
+diff -ruN a/ccminer.cpp b/ccminer.cpp
 --- a/ccminer.cpp	2026-09-26 09:25:09
-+++ b/ccminer.cpp	2026-09-27 03:07:58
-@@ -198,6 +198,18 @@
++++ b/ccminer.cpp	2026-09-27 14:26:19
+@@ -41,6 +41,7 @@
+ #endif
+ 
+ #include "miner.h"
++#include "blox.h"
+ #include "algos.h"
+ 
+ #include "equi/equihash.h"
+@@ -54,7 +55,7 @@
+ BOOL WINAPI ConsoleHandler(DWORD);
+ #endif
+ 
+-#define PROGRAM_NAME		"ccminer"
++#define PROGRAM_NAME		"bloxminer"
+ #define LP_SCANTIME		60
+ #define HEAVYCOIN_BLKHDR_SZ		84
+ #define MNR_BLKHDR_SZ 80
+@@ -192,12 +193,28 @@
+ int monitor_thr_id = -1;
+ bool stratum_need_reset = false;
+ volatile bool abort_flag = false;
++static char *blox_log_path = NULL;   /* bloxminer: --log-file */
++bool blox_algo_is_verus(void) { return opt_algo == ALGO_EQUIHASH; }
++static bool blox_sensors_only = false; /* bloxminer: --sensors */
++static volatile int blox_exit_owned = 0; /* bloxminer: 1 once a proper_exit() call owns the exit */
+ struct work_restart *work_restart = NULL;
+ static int app_exit_code = EXIT_CODE_OK;
+ 
  pthread_mutex_t applog_lock;
  pthread_mutex_t stats_lock;
  double thr_hashrates[MAX_GPUS] = { 0 };
@@ -121,7 +1416,191 @@ diff -ru a/ccminer.cpp b/ccminer.cpp
  uint64_t global_hashrate = 0;
  double   stratum_diff = 0.0;
  double   net_diff = 0;
-@@ -537,12 +549,29 @@
+@@ -235,148 +252,43 @@
+ 
+ static char const usage[] = "\
+ Usage: " PROGRAM_NAME " [OPTIONS]\n\
++BloxMiner mines VerusHash v2.2 (Verus) on x86-64-v3 CPUs with AES-NI.\n\
+ Options:\n\
+-  -a, --algo=ALGO       specify the hash algorithm to use\n\
+-			allium      Garlic double lyra2\n\
+-			bastion     Hefty bastion\n\
+-			bitcore     Timetravel-10\n\
+-			blake       Blake 256 (SFR)\n\
+-			blake2s     Blake2-S 256 (NEVA)\n\
+-			blakecoin   Fast Blake 256 (8 rounds)\n\
+-			bmw         BMW 256\n\
+-			cryptolight AEON cryptonight (MEM/2)\n\
+-			cryptonight XMR cryptonight v1 (old)\n\
+-			c11/flax    X11 variant\n\
+-			decred      Decred Blake256\n\
+-			deep        Deepcoin\n\
+-			verus       Veruscoin\n\
+-			dmd-gr      Diamond-Groestl\n\
+-			fresh       Freshcoin (shavite 80)\n\
+-			fugue256    Fuguecoin\n\
+-			graft       Cryptonight v8\n\
+-			groestl     Groestlcoin\n"
+-#ifdef WITH_HEAVY_ALGO
+-"			heavy       Heavycoin\n"
+-#endif
+-"			hmq1725     Doubloons / Espers\n\
+-			jackpot     JHA v8\n\
+-			keccak      Deprecated Keccak-256\n\
+-			keccakc     Keccak-256 (CreativeCoin)\n\
+-			lbry        LBRY Credits (Sha/Ripemd)\n\
+-			luffa       Joincoin\n\
+-			lyra2       CryptoCoin\n\
+-			lyra2v2     VertCoin\n\
+-			lyra2z      ZeroCoin (3rd impl)\n\
+-			myr-gr      Myriad-Groestl\n\
+-			monero      XMR cryptonight (v7)\n\
+-			neoscrypt   FeatherCoin, Phoenix, UFO...\n\
+-			nist5       NIST5 (TalkCoin)\n\
+-			penta       Pentablake hash (5x Blake 512)\n\
+-			phi1612     LUX initial algo, for Seraph\n\
+-			phi2        LUX v2 with lyra2\n\
+-			polytimos   Politimos\n\
+-			quark       Quark\n\
+-			qubit       Qubit\n\
+-			sha256d     SHA256d (bitcoin)\n\
+-			sha256t     SHA256 x3\n\
+-			sia         SIA (Blake2B)\n\
+-			sib         Sibcoin (X11+Streebog)\n\
+-			scrypt      Scrypt\n\
+-			scrypt-jane Scrypt-jane Chacha\n\
+-			skein       Skein SHA2 (Skeincoin)\n\
+-			skein2      Double Skein (Woodcoin)\n\
+-			skunk       Skein Cube Fugue Streebog\n\
+-			sonoa       97 hashes based on X17 ones (Sono)\n\
+-			stellite    Cryptonight v3\n\
+-			s3          S3 (1Coin)\n\
+-			timetravel  Machinecoin permuted x8\n\
+-			tribus      Denarius\n\
+-			vanilla     Blake256-8 (VNL)\n\
+-			veltor      Thorsriddle streebog\n\
+-			whirlcoin   Old Whirlcoin (Whirlpool algo)\n\
+-			whirlpool   Whirlpool algo\n\
+-			x11evo      Permuted x11 (Revolver)\n\
+-			x11         X11 (DarkCoin)\n\
+-			x12         X12 (GalaxyCash)\n\
+-			x13         X13 (MaruCoin)\n\
+-			x14         X14\n\
+-			x15         X15\n\
+-			x16r        X16R (Raven)\n\
+-			x16s        X16S\n\
+-			x17         X17\n\
+-			wildkeccak  Boolberry\n\
+-			zr5         ZR5 (ZiftrCoin)\n\
+-  -d, --devices         Comma separated list of CUDA devices to use.\n\
+-                        Device IDs start counting from 0! Alternatively takes\n\
+-                        string names of your cards like gtx780ti or gt640#2\n\
+-                        (matching 2nd gt640 in the PC)\n\
+-  -i  --intensity=N[,N] GPU intensity 8.0-25.0 (default: auto) \n\
+-                        Decimals are allowed for fine tuning \n\
+-      --cuda-schedule   Set device threads scheduling mode (default: auto)\n\
+-  -f, --diff-factor     Divide difficulty by this factor (default 1.0) \n\
+-  -m, --diff-multiplier Multiply difficulty by this value (default 1.0) \n\
+-  -o, --url=URL         URL of mining server\n\
+-  -O, --userpass=U:P    username:password pair for mining server\n\
+-  -u, --user=USERNAME   username for mining server\n\
+-  -p, --pass=PASSWORD   password for mining server\n\
+-      --cert=FILE       certificate for mining server using SSL\n\
++  -a, --algo=verus      hash algorithm (only verus; the default)\n\
++  -o, --url=URL         pool URL, e.g. stratum+tcp://pool.example.com:9999\n\
++  -O, --userpass=U:P    username:password pair for the pool\n\
++  -u, --user=USERNAME   pool username (wallet.worker)\n\
++  -p, --pass=PASSWORD   pool password\n\
++      --cert=FILE       certificate for a pool using SSL\n\
+   -x, --proxy=[PROTOCOL://]HOST[:PORT]  connect through a proxy\n\
+-  -t, --threads=N       number of miner threads (default: number of nVidia GPUs)\n\
++  -t, --threads=N       number of miner threads, 1-140\n\
+   -r, --retries=N       number of times to retry if a network call fails\n\
+                           (default: retry indefinitely)\n\
+   -R, --retry-pause=N   time to pause between retries, in seconds (default: 30)\n\
+-      --shares-limit    maximum shares [s] to mine before exiting the program.\n\
+-      --time-limit      maximum time [s] to mine before exiting the program.\n\
+   -T, --timeout=N       network timeout, in seconds (default: 300)\n\
+-  -s, --scantime=N      upper bound on time spent scanning current work when\n\
+-                          long polling is unavailable, in seconds (default: 10)\n\
+-      --submit-stale    ignore stale jobs checks, may create more rejected shares\n\
+-  -n, --ndevs           list cuda devices\n\
++  -f, --diff-factor     divide difficulty by this factor (default 1.0)\n\
++  -m, --diff-multiplier multiply difficulty by this value (default 1.0)\n\
++      --shares-limit    maximum shares to mine before exiting\n\
++      --time-limit      maximum time [s] to mine before exiting\n\
+   -N, --statsavg        number of samples used to compute hashrate (default: 30)\n\
+-      --no-gbt          disable getblocktemplate support (height check in solo)\n\
+-      --no-longpoll     disable X-Long-Polling support\n\
+-      --no-stratum      disable X-Stratum support\n\
+-      --no-extranonce   disable extranonce subscribe on stratum\n\
+-  -q, --quiet           disable per-thread hashmeter output\n\
++  -q, --quiet           less output\n\
+       --no-color        disable colored output\n\
+   -D, --debug           enable debug output\n\
+   -P, --protocol-dump   verbose dump of protocol-level activities\n\
+-      --cpu-affinity    set process affinity to cpu core(s), mask 0x3 for cores 0 and 1\n\
+       --cpu-priority    set process priority (default: 3) 0 idle, 2 normal to 5 highest\n\
+   -b, --api-bind=port   IP:port for the miner API (default: 127.0.0.1:4068), 0 disabled\n\
+-      --api-remote      Allow remote control, like pool switching, imply --api-allow=0/0\n\
+       --api-allow=...   IP/mask of the allowed api client(s), 0/0 for all\n\
+-      --max-temp=N      Only mine if gpu temp is less than specified value\n\
+-      --max-rate=N[KMG] Only mine if net hashrate is less than specified value\n\
+-      --max-diff=N      Only mine if net difficulty is less than specified value\n\
+-                        Can be tuned with --resume-diff=N to set a resume value\n\
+-      --max-log-rate    Interval to reduce per gpu hashrate logs (default: 3)\n"
+-#if defined(__linux) /* via nvml */
+-"\
+-      --mem-clock=3505  Set the gpu memory max clock (346.72+ driver)\n\
+-      --gpu-clock=1150  Set the gpu engine max clock (346.72+ driver)\n\
+-      --pstate=0[,2]    Set the gpu power state (352.21+ driver)\n\
+-      --plimit=100W     Set the gpu power limit (352.21+ driver)\n"
+-#else /* via nvapi.dll */
+-"\
+-      --mem-clock=3505  Set the gpu memory boost clock\n\
+-      --mem-clock=+500  Set the gpu memory offset\n\
+-      --gpu-clock=1150  Set the gpu engine boost clock\n\
+-      --plimit=100      Set the gpu power limit in percentage\n\
+-      --tlimit=80       Set the gpu thermal limit in degrees\n\
+-      --led=100         Set the logo led level (0=disable, 0xFF00FF for RVB)\n"
+-#endif
+-#ifdef HAVE_SYSLOG_H
+-"\
+-  -S, --syslog          use system log for output messages\n\
+-      --syslog-prefix=... allow to change syslog tool name\n"
+-#endif
+-"\
+-      --hide-diff       hide submitted block and net difficulty (old mode)\n\
++BloxMiner:\n\
++      --no-dashboard    no sticky stats header on a terminal (plain scrolling output)\n\
++      --stats-interval=N  print a stats table every N seconds when not on a terminal\n\
++                          and into the log file (default: 60, 0 = off)\n\
++      --log-file=FILE   also write a plain-text log (rotates to FILE.1 at 10 MB)\n\
++      --thread-log      print each thread's batch rate (upstream ccminer output)\n\
++      --ccd-temp-map=M  per-CCD temperatures on AMD: auto (validated CPUs), 1 (force), 0 (off)\n\
++      --sensors         show CPU topology, temperature sources and power, then exit\n\
+   -B, --background      run the miner in the background\n\
+       --benchmark       run in offline benchmark mode\n\
+-      --cputest         debug hashes from cpu algorithms\n\
+-  -c, --config=FILE     load a JSON-format configuration file\n\
++  -c, --config=FILE     load a JSON configuration file (keys = long option names)\n\
+   -V, --version         display version information and exit\n\
+   -h, --help            display this help text and exit\n\
+ ";
+@@ -411,6 +323,12 @@
+ 	{ "intensity", 1, NULL, 'i' },
+ 	{ "ndevs", 0, NULL, 'n' },
+ 	{ "no-color", 0, NULL, 1002 },
++	{ "no-dashboard", 0, NULL, 1200 },   /* bloxminer */
++	{ "log-file", 1, NULL, 1201 },
++	{ "stats-interval", 1, NULL, 1202 },
++	{ "thread-log", 0, NULL, 1203 },
++	{ "ccd-temp-map", 1, NULL, 1204 },
++	{ "sensors", 0, NULL, 1205 },
+ 	{ "no-extranonce", 0, NULL, 1012 },
+ 	{ "no-gbt", 0, NULL, 1011 },
+ 	{ "no-longpoll", 0, NULL, 1003 },
+@@ -537,12 +455,29 @@
  static void affine_to_cpu(int id) {
  	cpu_set_t set;
  	CPU_ZERO(&set);
@@ -155,7 +1634,32 @@ diff -ru a/ccminer.cpp b/ccminer.cpp
  #endif
  }
  #elif defined(__FreeBSD__) /* FreeBSD specific policy and affinity management */
-@@ -2198,6 +2227,7 @@
+@@ -593,10 +528,14 @@
+ void proper_exit(int reason)
+ {
+ 	restart_threads();
+-	if (abort_flag) /* already called */
++	/* bloxminer: exit ownership is separate from abort_flag (which main() and the time/shares limits set
++	 * to stop the threads). The first caller owns the exit and runs the cleanup with its reason; later
++	 * callers return and main() waits for the owner. */
++	if (!__sync_bool_compare_and_swap(&blox_exit_owned, 0, 1))
+ 		return;
+ 
+ 	abort_flag = true;
++	blox_ui_restore();   /* bloxminer: give the terminal back (scroll region), best effort */
+ 	usleep(200 * 1000);
+ 	
+ 
+@@ -1957,7 +1896,7 @@
+ 
+ 		if (opt_algo == ALGO_EQUIHASH) {
+ 		    //nonceptr[1] = (rand()*4);
+-			nonceptr[2] = rand() << 24 | rand() << 8 | thr_id;
++			nonceptr[2] = (uint32_t) rand() << 24 | (uint32_t) rand() << 8 | (uint32_t) thr_id;   /* bloxminer: unsigned shifts (signed overflow was UB), same bits */
+ 			//applog_hex(&work.data[27], 32);
+ 		} 
+ 
+@@ -2198,6 +2137,7 @@
  
  		hashes_done = 0;
  		gettimeofday(&tv_start, NULL);
@@ -163,7 +1667,7 @@ diff -ru a/ccminer.cpp b/ccminer.cpp
  
  		// check (and reset) previous errors
  	//	cudaError_t err = cudaGetLastError();
-@@ -2225,8 +2255,19 @@
+@@ -2225,8 +2165,19 @@
  		if (abort_flag)
  			break; // time to leave the mining loop...
  
@@ -184,7 +1688,7 @@ diff -ru a/ccminer.cpp b/ccminer.cpp
  
  		/* record scanhash elapsed time */
  		gettimeofday(&tv_end, NULL);
-@@ -2255,6 +2296,13 @@
+@@ -2255,6 +2206,13 @@
  				pthread_mutex_lock(&stats_lock);
  				thr_hashrates[thr_id] = hashes_done / dtime;
  				thr_hashrates[thr_id] *= rate_factor;
@@ -198,17 +1702,716 @@ diff -ru a/ccminer.cpp b/ccminer.cpp
  				if (loopcnt > 2) // ignore first (init time)
  					stats_remember_speed(thr_id, hashes_done, thr_hashrates[thr_id], (uint8_t) rc, work.height);
  				pthread_mutex_unlock(&stats_lock);
-@@ -3482,6 +3530,13 @@
+@@ -2281,7 +2239,7 @@
+ 			hashlog_remember_scan_range(&work);
+ 
+ 		/* output */
+-		if (!opt_quiet && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {
++		if (!opt_quiet && blox_thread_log && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {   /* bloxminer: --thread-log */
+ 			format_hashrate(thr_hashrates[thr_id], s);
+ 			if(thr_hashrates[thr_id]>0)
+ 			gpulog(LOG_INFO, thr_id, "%s", s);
+@@ -2688,7 +2646,7 @@
+ 
+ static void show_version_and_exit(void)
+ {
+-	printf("%s v%s\n"
++	printf("%s v%s (engine: ccminer 3.8.3, monkins1010/ccminer Verus2.2 @ e28e183)\n"
+ #ifdef WIN32
+ 		"pthreads static %s\n"
  #endif
+@@ -2720,6 +2678,31 @@
+ 	proper_exit(status);
+ }
+ 
++/* bloxminer: strict numeric option parsing (atoi/atof silently accepted garbage and overflowed) */
++static int blox_atoi(const char *arg)
++{
++	char *end; long v;
++	errno = 0;
++	v = arg ? strtol(arg, &end, 10) : 0;
++	if (!arg || end == arg || *end != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
++		applog(LOG_ERR, "invalid number '%s'", arg ? arg : "");
++		proper_exit(EXIT_CODE_USAGE);
++	}
++	return (int) v;
++}
++
++static double blox_atof(const char *arg)
++{
++	char *end; double v;
++	errno = 0;
++	v = arg ? strtod(arg, &end) : 0;
++	if (!arg || end == arg || *end != '\0' || errno == ERANGE || !isfinite(v)) {
++		applog(LOG_ERR, "invalid number '%s'", arg ? arg : "");
++		proper_exit(EXIT_CODE_USAGE);
++	}
++	return v;
++}
++
+ void parse_arg(int key, char *arg)
+ {
+ 	char *p = arg;
+@@ -2741,7 +2724,7 @@
+ 		}
+ 
+ 		if (p) {
+-			opt_nfactor = atoi(p + 1);
++			opt_nfactor = blox_atoi(p + 1);
+ 			if (opt_algo == ALGO_SCRYPT_JANE) {
+ 				free(jane_params);
+ 				jane_params = strdup(p+1);
+@@ -2783,7 +2766,7 @@
+ 				opt_api_bind = strdup(arg);
+ 				opt_api_bind[p - arg] = '\0';
+ 			}
+-			opt_api_port = atoi(p + 1);
++			opt_api_port = blox_atoi(p + 1);
+ 		}
+ 		else if (arg && strstr(arg, ".")) {
+ 			/* ip only */
+@@ -2792,7 +2775,7 @@
+ 		}
+ 		else if (arg) {
+ 			/* port or 0 to disable */
+-			opt_api_port = atoi(arg);
++			opt_api_port = blox_atoi(arg);
+ 		}
+ 		break;
+ 	case 1030: /* --api-remote */
+@@ -2825,7 +2808,7 @@
+ 		opt_api_mcast_des = strdup(arg);
+ 		break;
+ 	case 1037: /* --api-mcast-port */
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 1 || v > 65535) // sanity check
+ 			show_usage_and_exit(1);
+ 		opt_api_mcast_port = v;
+@@ -2858,7 +2841,7 @@
+ 		opt_debug = true;
+ 		break;
+ 	case 'N':
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 1)
+ 			opt_statsavg = INT_MAX;
+ 		opt_statsavg = v;
+@@ -2880,37 +2863,39 @@
+ 		opt_protocol = true;
+ 		break;
+ 	case 'r':
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < -1 || v > 9999)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_retries = v;
+ 		break;
+ 	case 'R':
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 1 || v > 9999)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_fail_pause = v;
+ 		break;
+ 	case 's':
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 1 || v > 9999)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_scantime = v;
+ 		break;
+ 	case 'T':
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 1 || v > 99999)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_timeout = v;
+ 		break;
+ 	case 't':
+-		v = atoi(arg);
+-		if (v < 0 || v > 9999)	/* sanity check */
+-			show_usage_and_exit(1);
++		v = blox_atoi(arg);
++		if (v < 1 || v > MAX_GPUS) {	/* bloxminer: per-thread arrays hold MAX_GPUS entries */
++			applog(LOG_ERR, "threads must be 1..%d (got %d)", MAX_GPUS, v);
++			proper_exit(EXIT_CODE_USAGE);
++		}
+ 		opt_n_threads = v;
+ 		break;
+ 	case 1022: // --vote
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 0 || v > 8192)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_vote = (uint16_t)v;
+@@ -3015,7 +3000,7 @@
+ 		{
+ 			char *last = NULL, *pch = strtok(arg,",");
+ 			int n = 0;
+-			while (pch != NULL) {
++			while (pch != NULL && n < MAX_GPUS) {   /* bloxminer: bounded */
+ 				device_config[n++] = last = strdup(pch);
+ 				pch = strtok(NULL, ",");
+ 			}
+@@ -3026,8 +3011,8 @@
+ 	case 'L': /* scrypt --lookup-gap */
+ 		{
+ 			char *pch = strtok(arg,",");
+-			int n = 0, last = atoi(arg);
+-			while (pch != NULL) {
++			int n = 0, last = blox_atoi(arg);
++			while (pch != NULL && n < MAX_GPUS) {   /* bloxminer: bounded */
+ 				device_lookup_gap[n++] = last = atoi(pch);
+ 				pch = strtok(NULL, ",");
+ 			}
+@@ -3038,8 +3023,8 @@
+ 	case 1050: /* scrypt --interactive */
+ 		{
+ 			char *pch = strtok(arg,",");
+-			int n = 0, last = atoi(arg);
+-			while (pch != NULL) {
++			int n = 0, last = blox_atoi(arg);
++			while (pch != NULL && n < MAX_GPUS) {   /* bloxminer: bounded */
+ 				device_interactive[n++] = last = atoi(pch);
+ 				pch = strtok(NULL, ",");
+ 			}
+@@ -3050,8 +3035,8 @@
+ 	case 1051: /* scrypt --texture-cache */
+ 		{
+ 			char *pch = strtok(arg,",");
+-			int n = 0, last = atoi(arg);
+-			while (pch != NULL) {
++			int n = 0, last = blox_atoi(arg);
++			while (pch != NULL && n < MAX_GPUS) {   /* bloxminer: bounded */
+ 				device_texturecache[n++] = last = atoi(pch);
+ 				pch = strtok(NULL, ",");
+ 			}
+@@ -3062,8 +3047,8 @@
+ 	case 1055: /* cryptonight --bfactor */
+ 		{
+ 			char *pch = strtok(arg, ",");
+-			int n = 0, last = atoi(arg);
+-			while (pch != NULL) {
++			int n = 0, last = blox_atoi(arg);
++			while (pch != NULL && n < MAX_GPUS) {   /* bloxminer: bounded */
+ 				last = atoi(pch);
+ 				if (last > 15) last = 15;
+ 				device_bfactor[n++] = last;
+@@ -3100,10 +3085,10 @@
+ 		opt_extranonce = false;
+ 		break;
+ 	case 1008:
+-		opt_time_limit = atoi(arg);
++		opt_time_limit = blox_atoi(arg);
+ 		break;
+ 	case 1009:
+-		opt_shares_limit = atoi(arg);
++		opt_shares_limit = blox_atoi(arg);
+ 		break;
+ 	case 1011:
+ 		allow_gbt = false;
+@@ -3130,7 +3115,7 @@
+ 		}
+ 		break;
+ 	case 1019: // max-log-rate
+-		opt_maxlograte = atoi(arg);
++		opt_maxlograte = blox_atoi(arg);
+ 		break;
+ 	case 1020:
+ 		p = strstr(arg, "0x");
+@@ -3140,24 +3125,24 @@
+ 		opt_affinity = ul;
+ 		break;
+ 	case 1021:
+-		v = atoi(arg);
++		v = blox_atoi(arg);
+ 		if (v < 0 || v > 5)	/* sanity check */
+ 			show_usage_and_exit(1);
+ 		opt_priority = v;
+ 		break;
+ 	case 1025: // cuda-schedule
+-		opt_cudaschedule = atoi(arg);
++		opt_cudaschedule = blox_atoi(arg);
+ 		break;
+ 	case 1060: // max-temp
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		opt_max_temp = d;
+ 		break;
+ 	case 1061: // max-diff
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		opt_max_diff = d;
+ 		break;
+ 	case 1062: // max-rate
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		p = strstr(arg, "K");
+ 		if (p) d *= 1e3;
+ 		p = strstr(arg, "M");
+@@ -3167,11 +3152,11 @@
+ 		opt_max_rate = d;
+ 		break;
+ 	case 1063: // resume-diff
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		opt_resume_diff = d;
+ 		break;
+ 	case 1064: // resume-rate
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		p = strstr(arg, "K");
+ 		if (p) d *= 1e3;
+ 		p = strstr(arg, "M");
+@@ -3181,7 +3166,7 @@
+ 		opt_resume_rate = d;
+ 		break;
+ 	case 1065: // resume-temp
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		opt_resume_temp = d;
+ 		break;
+ 	case 'd': // --device
+@@ -3222,13 +3207,13 @@
+ 		break;
+ 
+ 	case 'f': // --diff-factor
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		if (d <= 0.)
+ 			show_usage_and_exit(1);
+ 		opt_difficulty = d;
+ 		break;
+ 	case 'm': // --diff-multiplier
+-		d = atof(arg);
++		d = blox_atof(arg);
+ 		if (d <= 0.)
+ 			show_usage_and_exit(1);
+ 		opt_difficulty = 1.0/d;
+@@ -3236,6 +3221,36 @@
+ 
+ 	/* PER POOL CONFIG OPTIONS */
+ 
++	case 1200: /* --no-dashboard */
++		blox_no_dashboard = true;
++		break;
++	case 1201: /* --log-file */
++		free(blox_log_path);
++		blox_log_path = strdup(arg);
++		break;
++	case 1202: /* --stats-interval */
++		v = blox_atoi(arg);
++		if (v < 0 || v > 86400) {
++			applog(LOG_ERR, "stats-interval must be 0..86400 seconds");
++			proper_exit(EXIT_CODE_USAGE);
++		}
++		blox_stats_interval = v;
++		break;
++	case 1203: /* --thread-log */
++		blox_thread_log = true;
++		break;
++	case 1204: /* --ccd-temp-map auto|0|1 */
++		if (!strcmp(arg, "auto")) blox_ccd_opt = -1;
++		else if (!strcmp(arg, "0")) blox_ccd_opt = 0;
++		else if (!strcmp(arg, "1")) blox_ccd_opt = 1;
++		else {
++			applog(LOG_ERR, "ccd-temp-map must be auto, 0 or 1");
++			proper_exit(EXIT_CODE_USAGE);
++		}
++		break;
++	case 1205: /* --sensors */
++		blox_sensors_only = true;
++		break;
+ 	case 1100: /* pool name */
+ 		pool_set_attr(cur_pooln, "name", arg);
+ 		break;
+@@ -3301,22 +3316,26 @@
+ 			free(s);
+ 		}
+ 		else if (options[i].has_arg && json_is_integer(val)) {
+-			char buf[16];
+-			sprintf(buf, "%d", (int) json_integer_value(val));
++			/* bloxminer: no narrowing to int; the strict option parser range-checks the text */
++			char buf[32];
++			snprintf(buf, sizeof(buf), "%" JSON_INTEGER_FORMAT, json_integer_value(val));
+ 			parse_arg(options[i].val, buf);
+ 		}
+ 		else if (options[i].has_arg && json_is_real(val)) {
+-			char buf[16];
+-			sprintf(buf, "%f", json_real_value(val));
++			/* bloxminer: was sprintf("%f") into char[16] -> stack overflow on large values */
++			char buf[64];
++			snprintf(buf, sizeof(buf), "%.17g", json_real_value(val));
+ 			parse_arg(options[i].val, buf);
+ 		}
+ 		else if (!options[i].has_arg) {
+ 			if (json_is_true(val))
+ 				parse_arg(options[i].val, (char*) "");
+ 		}
+-		else
+-			applog(LOG_ERR, "JSON option %s invalid",
+-				options[i].name);
++		else {
++			/* bloxminer: a wrong JSON type (e.g. "threads": false) is an error, not a silent default */
++			applog(LOG_ERR, "config: option \"%s\" has an invalid value type", options[i].name);
++			proper_exit(EXIT_CODE_USAGE);
++		}
+ 	}
+ 
+ 	val = json_object_get(json_obj, "pools");
+@@ -3379,23 +3398,8 @@
+ }
+ 
+ #ifndef WIN32
+-static void signal_handler(int sig)
+-{
+-	switch (sig) {
+-	case SIGHUP:
+-		applog(LOG_INFO, "SIGHUP received");
+-		break;
+-	case SIGINT:
+-		signal(sig, SIG_IGN);
+-		applog(LOG_INFO, "SIGINT received, exiting");
+-		proper_exit(EXIT_CODE_KILLED);
+-		break;
+-	case SIGTERM:
+-		applog(LOG_INFO, "SIGTERM received, exiting");
+-		proper_exit(EXIT_CODE_KILLED);
+-		break;
+-	}
+-}
++/* bloxminer: the upstream signal_handler called applog()/proper_exit() (locks) from signal context;
++ * replaced by flag-only handlers in blox_stats.cpp, acted on by the service thread. */
+ #else
+ BOOL WINAPI ConsoleHandler(DWORD dwType)
+ {
+@@ -3444,15 +3448,7 @@
+ 	// get opt_quiet early
+ 	parse_single_opt('q', argc, argv);
+ 	
+-	Clear();
+-	printf("*************************************************************\n");	
+-	printf("*  ccminer CPU: " PACKAGE_VERSION " for Verushash v2.2.2 based on ccminer *\n");
+-	printf("*************************************************************\n");	
+-
+-		printf("Originally based on Christian Buchner and Christian H. project\n");
+-		printf("Adapted to Verus by Monkins1010\n");
+-	    printf("Goto https://wiki.verus.io/#!index.md for mining setup guides. \n");
+-		printf("Git repo located at: " PACKAGE_URL " \n\n");
++	/* bloxminer: the banner (logo + upstream credits) is printed by blox_ui_init() once options are known */
+ 	
+ 
+ 	rpc_user = strdup("");
+@@ -3483,6 +3479,13 @@
  	if (num_cpus < 1)
  		num_cpus = 1;
-+
+ 
 +	for (i = 0; i < MAX_GPUS; i++) thr_cpu[i] = -1;
 +#if defined(__linux__) && !defined(__ANDROID__)
 +	CPU_ZERO(&allowed_cpus);
 +	if (sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0)
 +		allowed_cpu_count = CPU_COUNT(&allowed_cpus);
 +#endif
- 
++
  	// number of gpus
  	active_gpus = 1;
+ 
+@@ -3506,6 +3509,11 @@
+ 	/* parse command line */
+ 	parse_cmdline(argc, argv);
+ 
++	if (blox_sensors_only) {   /* bloxminer: topology / sensor / power diagnostics, then exit (no pool/config needed) */
++		blox_sensors_dump(stdout, blox_ccd_opt);
++		exit(EXIT_CODE_OK);
++	}
++
+ 	if (!opt_benchmark && !strlen(rpc_url)) {
+ 		// try default config file (user then binary folder)
+ 		char defconfig[MAX_PATH] = { 0 };
+@@ -3518,9 +3526,12 @@
+ 		}
+ 	}
+ 
++	/* bloxminer: open the log as soon as the options are known, so start-up failures are in it too */
++	blox_log_open(blox_log_path);
++
+ 	if (!strlen(rpc_url)) {
+ 		if (!opt_benchmark) {
+-			fprintf(stderr, "%s: no URL supplied\n", argv[0]);
++			applog(LOG_ERR, "no pool URL supplied");
+ 			show_usage_and_exit(1);
+ 		}
+ 		// ensure a pool is set with default params...
+@@ -3568,8 +3579,7 @@
+ 		i = chdir("/");
+ 		if (i < 0)
+ 			applog(LOG_ERR, "chdir() failed (errno = %d)", errno);
+-		signal(SIGHUP, signal_handler);
+-		signal(SIGTERM, signal_handler);
++		/* bloxminer: signal handlers are installed by blox_install_signals() below */
+ #else
+ 		HWND hcon = GetConsoleWindow();
+ 		if (hcon) {
+@@ -3584,8 +3594,7 @@
+ 	}
+ 
+ #ifndef WIN32
+-	/* Always catch Ctrl+C */
+-	signal(SIGINT, signal_handler);
++	/* bloxminer: Ctrl+C / SIGTERM handled by blox_install_signals() once the service thread runs */
+ #else
+ 	SetConsoleCtrlHandler((PHANDLER_ROUTINE)ConsoleHandler, TRUE);
+ 	if (opt_priority > 0) {
+@@ -3631,8 +3640,29 @@
+ 	// generally doesn't work well...
+ 	gpu_threads = max(gpu_threads, opt_n_threads / active_gpus);
+ 
++	/* bloxminer: one effective-options check before any thread starts */
++	if (opt_algo == ALGO_AUTO)
++		opt_algo = ALGO_EQUIHASH;   /* no -a given: VerusHash (upstream silently stopped every thread) */
++	if (opt_algo != ALGO_EQUIHASH) {
++		applog(LOG_ERR, "BloxMiner mines VerusHash only (algo \"verus\"); '%s' is not supported", algo_names[opt_algo]);
++		proper_exit(EXIT_CODE_USAGE);
++	}
++	if (opt_n_threads < 1 || opt_n_threads > MAX_GPUS) {
++		applog(LOG_ERR, "threads must be 1..%d (got %d)", MAX_GPUS, opt_n_threads);
++		proper_exit(EXIT_CODE_USAGE);
++	}
+ 
++	/* bloxminer: sensors, terminal dashboard, then the service thread + signal handlers */
++	blox_prepare();
++	blox_ui_init();
++	if (!blox_start())
++		return EXIT_CODE_SW_INIT_ERROR;
++#ifndef WIN32
++	blox_install_signals(opt_background);
++#endif
+ 
++
++
+ #ifdef HAVE_SYSLOG_H
+ 	if (use_syslog)
+ 		openlog(opt_syslog_pfx, LOG_PID, LOG_USER);
+@@ -3760,6 +3790,7 @@
+ 	if (opt_debug)
+ 		applog(LOG_DEBUG, "workio thread dead, exiting.");
+ 
+-	proper_exit(EXIT_CODE_OK);
++	proper_exit(EXIT_CODE_OK);   /* exits with app_exit_code (e.g. time limit) unless another thread owns the exit */
++	for (;;) pause();            /* bloxminer: another thread owns the exit; it calls exit() with its own code */
+ 	return 0;
+ }
+diff -ruN a/configure.ac b/configure.ac
+--- a/configure.ac	2026-09-26 09:25:09
++++ b/configure.ac	2026-09-27 13:18:12
+@@ -1,4 +1,4 @@
+-AC_INIT([ccminer_CPU], [3.8.3], [], [ccminer], [http://github.com/monkins1010/ccminer])
++AC_INIT([bloxminer], [2.1.0], [], [bloxminer], [https://github.com/bokiko/bloxminer])
+ 
+ AC_PREREQ([2.59c])
+ AC_CANONICAL_SYSTEM
+diff -ruN a/elist.h b/elist.h
+--- a/elist.h	2026-09-26 09:25:09
++++ b/elist.h	2026-09-27 13:37:48
+@@ -180,8 +180,9 @@
+  * @type:	the type of the struct this is embedded in.
+  * @member:	the name of the list_struct within the struct.
+  */
++#include <stddef.h>
+ #define list_entry(ptr, type, member) \
+-	((type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member)))
++	((type *)((char *)(ptr)-offsetof(type, member)))   /* bloxminer: offsetof, no null-pointer member access (UB) */
+ 
+ /**
+  * list_for_each	-	iterate over a list
+diff -ruN a/equi/equi-stratum.cpp b/equi/equi-stratum.cpp
+--- a/equi/equi-stratum.cpp	2026-09-26 09:25:09
++++ b/equi/equi-stratum.cpp	2026-09-27 14:50:15
+@@ -1,3 +1,4 @@
++#include <climits>
+ /**
+  * Equihash specific stratum protocol
+  * tpruvot@github - 2017 - Part under GPLv3 Licence
+@@ -110,10 +111,11 @@
+ 	uint8_t target_bin[32], target_be[32];
+ 
+ 	const char *target_hex = json_string_value(json_array_get(params, 0));
+-	if (!target_hex || strlen(target_hex) == 0)
++	/* bloxminer: a target is exactly 32 bytes of hex */
++	if (!blox_is_hex(target_hex, 64, 64) || !hex2bin(target_bin, target_hex, 32)) {
++		applog(LOG_ERR, "Stratum set_target: invalid target ignored");
+ 		return false;
+-
+-	hex2bin(target_bin, target_hex, 32);
++	}
+ 	memset(target_be, 0x00, 32);
+ 
+ 	uint8_t *bits_start = nullptr;
+@@ -130,14 +132,20 @@
+ 		}
+ 	}
+ 
+-	int padding = &target_bin[31] - bits_start;
++	if (bits_start == nullptr) {
++		applog(LOG_ERR, "Stratum set_target: zero target ignored");
++		return false;
++	}
++	/* bloxminer: compact form without reading outside target_be. For a first non-zero byte at index
++	 * 0..29 this equals the upstream memcpy of target_be[exponent-3..exponent-1]; indexes 30/31 used
++	 * to read before target_be, and upstream left the top byte of target_bits uninitialised. */
++	int first = (int)(bits_start - target_bin);
++	uint32_t exponent = 32 - first;
++	uint32_t target_bits = (uint32_t)target_bin[first] << 16
++		| (first + 1 < 32 ? (uint32_t)target_bin[first + 1] << 8 : 0)
++		| (first + 2 < 32 ? (uint32_t)target_bin[first + 2] : 0);   // coefficient
++	target_bits |= exponent << 24;                                      // exponent
+ 
+-	uint32_t target_bits;
+-	uint8_t exponent = ((padding * 8 + 1) + 7) / 8;
+-
+-	memcpy(&target_bits, &target_be[exponent - 3], 3);  // coefficient
+-	target_bits |= (exponent << 24);     				// exponent
+-
+ 	// applog_hex(target_bin, 32);
+ 	// applog_hex(target_be, 32);
+ 	// applog(LOG_BLUE, "target_bits %08x", target_bits);
+@@ -171,17 +179,29 @@
+ 	clean = json_is_true(json_array_get(params, p)); p++;
+ 	solution = json_string_value(json_array_get(params, p++));
+ 
+-	if (!job_id || !prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
+-	    strlen(prevhash) != 64 || strlen(version) != 8 ||
+-	    strlen(coinb1) != 64 || strlen(coinb2) != 64 ||
+-	    strlen(nbits) != 8 || strlen(stime) != 8) {
++	/* bloxminer: every field is checked and decoded into temporaries first; the job changes only when all
++	 * of them are valid, and then in one step under stratum_work_lock. The solution may be shorter than
++	 * 1344 bytes (the pool we tested sends 125); the rest is zero, as for the first job, so a shorter
++	 * solution never keeps bytes of the previous job. */
++	uchar t_ver[4], t_prev[32], t_nbits[4], t_ntime[4], t_sol[sizeof(sctx->job.solution)];
++	memset(t_sol, 0, sizeof(t_sol));
++	if (!job_id || !blox_is_hex(version, 8, 8) || !blox_is_hex(prevhash, 64, 64) ||
++	    !blox_is_hex(coinb1, 64, 64) || !blox_is_hex(coinb2, 64, 64) ||
++	    !blox_is_hex(nbits, 8, 8) || !blox_is_hex(stime, 8, 8) ||
++	    !blox_is_hex(solution, 2, 2 * sizeof(t_sol)) ||
++	    !hex2bin(t_ver, version, 4) || !hex2bin(t_prev, prevhash, 32) ||
++	    !hex2bin(t_nbits, nbits, 4) || !hex2bin(t_ntime, stime, 4) ||
++	    !hex2bin(t_sol, solution, strlen(solution) / 2)) {
+ 		applog(LOG_ERR, "Stratum notify: invalid parameters");
+ 		goto out;
+ 	}
+-	hex2bin(&sctx->job.solution, solution, 1344);
+ 	/* store stratum server time diff */
+-	hex2bin((uchar *)&ntime, stime, 4);
+-	ntime = ntime - (int) time(0);
++	{
++		uint32_t pool_time;
++		memcpy(&pool_time, t_ntime, 4);
++		int64_t tdiff = (int64_t) pool_time - (int64_t) time(0);      /* bloxminer: no signed overflow */
++		ntime = tdiff > INT_MAX ? INT_MAX : tdiff < INT_MIN ? INT_MIN : (int) tdiff;
++	}
+ 	if (ntime > sctx->srvtime_diff) {
+ 		sctx->srvtime_diff = ntime;
+ 		if (opt_protocol && ntime > 20)
+@@ -189,8 +209,9 @@
+ 	}
+ 
+ 	pthread_mutex_lock(&stratum_work_lock);
+-	hex2bin(sctx->job.version, version, 4);
+-	hex2bin(sctx->job.prevhash, prevhash, 32);
++	memcpy(sctx->job.solution, t_sol, sizeof(t_sol));
++	memcpy(sctx->job.version, t_ver, 4);
++	memcpy(sctx->job.prevhash, t_prev, 32);
+ 
+ 	coinb1_size = strlen(coinb1) / 2;
+ 	coinb2_size = strlen(coinb2) / 2;
+@@ -215,8 +236,8 @@
+ 	free(sctx->job.job_id);
+ 	sctx->job.job_id = strdup(job_id);
+ 
+-	hex2bin(sctx->job.nbits, nbits, 4);
+-	hex2bin(sctx->job.ntime, stime, 4);
++	memcpy(sctx->job.nbits, t_nbits, 4);
++	memcpy(sctx->job.ntime, t_ntime, 4);
+ 	sctx->job.clean = clean;
+ 
+ 	sctx->job.diff = sctx->next_diff;
+@@ -241,7 +262,7 @@
+ 		if (data && strlen(data)) {
+ 			char symbol[32] = { 0 };
+ 			uint32_t height = 0;
+-			int ss = sscanf(data, "equihash %s block %u", symbol, &height);
++			int ss = sscanf(data, "equihash %31s block %u", symbol, &height);   /* bloxminer: bounded */
+ 			if (height && ss > 1) sctx->job.height = height;
+ 			//if (opt_debug && ss > 1) applog(LOG_DEBUG, "%s", data);
+ 		}
+diff -ruN a/miner.h b/miner.h
+--- a/miner.h	2026-09-26 09:25:09
++++ b/miner.h	2026-09-27 13:07:29
+@@ -504,6 +504,7 @@
+ extern void cbin2hex(char *out, const char *in, size_t len);
+ extern char *bin2hex(const unsigned char *in, size_t len);
+ extern bool hex2bin(void *output, const char *hexstr, size_t len);
++bool blox_is_hex(const char *s, size_t minlen, size_t maxlen);
+ extern int timeval_subtract(struct timeval *result, struct timeval *x,
+ 	struct timeval *y);
+ extern bool fulltest(const uint32_t *hash, const uint32_t *target);
+diff -ruN a/util.cpp b/util.cpp
+--- a/util.cpp	2026-09-26 09:25:09
++++ b/util.cpp	2026-09-27 14:26:19
+@@ -34,6 +34,7 @@
+ #include <netinet/tcp.h>
+ #endif
+ #include "miner.h"
++#include "blox.h"
+ #include "elist.h"
+ 
+ 
+@@ -145,10 +146,18 @@
+ 			// no time prefix, for ccminer -n
+ 			sprintf(f, "%s%s\n", fmt, CL_N);
+ 		}
++		va_list ap2;
++		va_copy(ap2, ap);
+ 		pthread_mutex_lock(&applog_lock);
+ 		vfprintf(stdout, f, ap);	/* atomic write to stdout */
+ 		fflush(stdout);
++		if (blox_log_fp) {		/* bloxminer: same line, plain text, into --log-file */
++			char line[2048];
++			vsnprintf(line, sizeof(line), f, ap2);
++			blox_log_line_locked(line);
++		}
+ 		pthread_mutex_unlock(&applog_lock);
++		va_end(ap2);
+ 	}
+ 	va_end(ap);
+ }
+@@ -728,6 +737,17 @@
+ 	return s;
+ }
+ 
++/* bloxminer: true when s is a string of hex digits with even length in [minlen, maxlen] */
++bool blox_is_hex(const char *s, size_t minlen, size_t maxlen)
++{
++	if (!s) return false;
++	size_t n = strnlen(s, maxlen + 1);
++	if (n < minlen || n > maxlen || (n & 1)) return false;
++	for (size_t i = 0; i < n; i++)
++		if (!isxdigit((unsigned char)s[i])) return false;
++	return true;
++}
++
+ bool hex2bin(void *output, const char *hexstr, size_t len)
+ {
+ 	uchar *p = (uchar *) output;
+@@ -1453,7 +1473,9 @@
+ 	bool has_claim = !strcmp(algo, "lbry");
+ 	bool has_roots = !strcmp(algo, "phi2") && json_array_size(params) == 10;
+ 
+-	if (sctx->is_equihash) {
++	/* bloxminer: VerusHash only, so every notify uses the (validated) Verus/equihash layout, also when a
++	 * pool sends mining.notify before mining.set_target (the generic path dereferenced a missing solution) */
++	if (sctx->is_equihash || blox_algo_is_verus()) {
+ 		return equi_stratum_notify(sctx, params);
+ 	}
+ 
