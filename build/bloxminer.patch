@@ -1,0 +1,214 @@
+diff -ru a/Makefile.am b/Makefile.am
+--- a/Makefile.am	2026-09-26 09:25:09
++++ b/Makefile.am	2026-09-26 09:42:04
+@@ -33,7 +33,11 @@
+ ccminer_LDFLAGS  = $(PTHREAD_FLAGS)
+ 
+ ccminer_LDADD    = -lcurl @JANSSON_LIBS@ @PTHREAD_LIBS@ @WS2_LIBS@ @OPENMP_CFLAGS@ @LIBS@
+-ccminer_CPPFLAGS = @ARCH_FLAGS@ @OPENMP_CFLAGS@ $(CPPFLAGS) $(PTHREAD_FLAGS) $(JANSSON_INCLUDES) $(DEF_INCLUDES) -O2
++# hiveos-ccminer-verus: arch/opt level overridable at make time, e.g.
++#   make HIVE_ARCH_FLAGS="-march=x86-64-v3 -maes -mpclmul" HIVE_OPT=-O3
++HIVE_ARCH_FLAGS ?= @ARCH_FLAGS@
++HIVE_OPT ?= -O2
++ccminer_CPPFLAGS = $(HIVE_ARCH_FLAGS) @OPENMP_CFLAGS@ $(CPPFLAGS) $(PTHREAD_FLAGS) $(JANSSON_INCLUDES) $(DEF_INCLUDES) $(HIVE_OPT)
+ 
+ 
+ if HAVE_OSX
+diff -ru a/api.cpp b/api.cpp
+--- a/api.cpp	2026-09-26 09:25:09
++++ b/api.cpp	2026-09-27 03:07:58
+@@ -111,6 +111,24 @@
+ 
+ char driver_version[32] = { 0 };
+ 
++/* hiveos-ccminer-verus: per-thread observability (defined in ccminer.cpp) */
++extern double thr_hashrates[];
++extern time_t thr_lastwork[];
++extern double thr_lastdur[];
++extern double thr_ratek[];
++extern double thr_maxdur[];
++extern time_t hcv_mono_now(void);
++extern int thr_cpu[];
++extern pthread_mutex_t stats_lock;
++/* a thread is overdue when its current batch has run longer than twice its longest batch so far + 30 s
++ * (full batches last ~60-180 s; batches cut short by a new pool job can be ~1 s and must not shrink the limit) */
++static inline long thr_stale_limit(int i) {
++	long l = (long) (2.0 * thr_maxdur[i]) + 30;
++	if (l < 300) l = 300;          /* floor: a short first batch must not make a healthy long batch look overdue */
++	if (l > 600) l = 600;          /* cap: a stall is always reported within 10 min of the last work */
++	return l;
++}
++
+ /***************************************************************/
+ 
+ static void gpustatus(int thr_id)
+@@ -153,9 +171,22 @@
+ */
+ static char *getthreads(char *params)
+ {
++	/* CPU=<thread>;KHS=<latest batch rate>;AFF=<bound cpu|-1>;AGE=<s since batch completed|-1>;STATE=hashing|waiting|
++	 * KHS is the rate of the last completed scan batch (not the averaged summary rate). */
++	size_t len = 0;
++	time_t now = hcv_mono_now();
+ 	*buffer = '\0';
+-	for (int i = 0; i < opt_n_threads; i++)
+-		gpustatus(i);
++	pthread_mutex_lock(&stats_lock);
++	for (int i = 0; i < opt_n_threads; i++) {
++		long age = thr_lastwork[i] ? (long) difftime(now, thr_lastwork[i]) : -1;
++		int fresh = age >= 0 && age <= thr_stale_limit(i);
++		const char *state = fresh ? "hashing" : "waiting";
++		int n = snprintf(buffer + len, MYBUFSIZ - len, "CPU=%d;KHS=%.2f;AFF=%d;AGE=%ld;DUR=%.0f;STATE=%s|",
++			i, fresh ? thr_ratek[i] / 1000.0 : 0.0, thr_cpu[i], age, thr_lastdur[i], state);
++		if (n < 0 || (size_t) n >= MYBUFSIZ - len) { buffer[len] = '\0'; break; } /* truncated: consumer must detect missing threads */
++		len += n;
++	}
++	pthread_mutex_unlock(&stats_lock);
+ 	return buffer;
+ }
+ 
+@@ -181,16 +212,29 @@
+ 
+ 	get_currentalgo(algo, sizeof(algo));
+ 
++	/* STALL=1 only when EVERY thread is overdue against its own batch length (or none ever finished after 10 min) */
++	time_t newest = 0, mono = hcv_mono_now(); int overdue = 0; double freshk = 0;
++	pthread_mutex_lock(&stats_lock);
++	for (int i = 0; i < opt_n_threads; i++) {
++		if (thr_lastwork[i] > newest) newest = thr_lastwork[i];
++		long age = thr_lastwork[i] ? (long) difftime(mono, thr_lastwork[i]) : -1;
++		if (age < 0 ? uptime > 600 : age > thr_stale_limit(i)) overdue++;
++		else if (age >= 0) freshk += thr_ratek[i] / 1000.0;
++	}
++	pthread_mutex_unlock(&stats_lock);
++	long lastwork = newest ? (long) difftime(mono, newest) : -1;
++	int stall = opt_n_threads > 0 && overdue == opt_n_threads;
++
+ 	*buffer = '\0';
+ 	sprintf(buffer, "NAME=%s;VER=%s;API=%s;"
+ 		"ALGO=%s;GPUS=%d;KHS=%.2f;SOLV=%d;ACC=%d;REJ=%d;"
+ 		"ACCMN=%.3f;DIFF=%.6f;NETKHS=%.0f;"
+-		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u|",
++		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u;LASTWORK=%ld;STALL=%d;FRESHKHS=%.2f|",
+ 		PACKAGE_NAME, PACKAGE_VERSION, APIVERSION,
+ 		algo, active_gpus, (double)global_hashrate / 1000.,
+ 		solved_count, accepted_count, rejected_count,
+ 		accps, net_diff > 1e-6 ? net_diff : stratum_diff, (double)net_hashrate / 1000.,
+-		num_pools, wait_time, uptime, (uint32_t) ts);
++		num_pools, wait_time, uptime, (uint32_t) ts, lastwork, stall, freshk);
+ 	return buffer;
+ }
+ 
+diff -ru a/ccminer.cpp b/ccminer.cpp
+--- a/ccminer.cpp	2026-09-26 09:25:09
++++ b/ccminer.cpp	2026-09-27 03:07:58
+@@ -198,6 +198,18 @@
+ pthread_mutex_t applog_lock;
+ pthread_mutex_t stats_lock;
+ double thr_hashrates[MAX_GPUS] = { 0 };
++/* hiveos-ccminer-verus: per-thread observability (guarded by stats_lock) */
++time_t thr_lastwork[MAX_GPUS] = { 0 };   /* monotonic time (s) a scan batch last completed or was interrupted */
++time_t hcv_mono_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec; }
++static double hcv_mono_d(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
++double thr_lastdur[MAX_GPUS] = { 0 };    /* duration (s) of that batch; batches last up to minutes */
++double thr_ratek[MAX_GPUS] = { 0 };      /* H/s of that batch, for the API only (never feeds batch sizing) */
++double thr_maxdur[MAX_GPUS] = { 0 };     /* longest batch seen (s); a short job-interrupted batch must not shrink the overdue limit */
++int thr_cpu[MAX_GPUS];                   /* cpu the thread is bound to, -1 if unbound */
++#if defined(__linux__) && !defined(__ANDROID__)
++static cpu_set_t allowed_cpus;           /* process affinity snapshot taken before workers start */
++static int allowed_cpu_count = 0;
++#endif
+ uint64_t global_hashrate = 0;
+ double   stratum_diff = 0.0;
+ double   net_diff = 0;
+@@ -537,12 +549,29 @@
+ static void affine_to_cpu(int id) {
+ 	cpu_set_t set;
+ 	CPU_ZERO(&set);
+-	CPU_SET(id, &set);
+-	// thread only
+ #if !(defined(__ANDROID__) || (__ANDROID_API__ > 23))
+-		pthread_setaffinity_np(thr_info[id].pth, sizeof(&set), &set);
++	if (getenv("HCV_NO_AFFINITY")) { /* let the scheduler place threads (Oink 3.8.3a behaviour) */
++		pthread_mutex_lock(&stats_lock); thr_cpu[id] = -1; pthread_mutex_unlock(&stats_lock);
++		return;
++	}
++	/* bind thread id to the id-th cpu the process is allowed to run on (cpuset/taskset aware) */
++	int cpu = -1, seen = 0;
++	for (int c = 0; c < CPU_SETSIZE && allowed_cpu_count > 0; c++) {
++		if (!CPU_ISSET(c, &allowed_cpus)) continue;
++		if (seen++ == id) { cpu = c; break; }
++	}
++	if (cpu < 0) {
++		applog(LOG_WARNING, "CPU T%d: no allowed cpu left, running unbound", id);
++		pthread_mutex_lock(&stats_lock); thr_cpu[id] = -1; pthread_mutex_unlock(&stats_lock);
++		return;
++	}
++	CPU_SET(cpu, &set);
++	int err = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
++	if (err) applog(LOG_WARNING, "CPU T%d: affinity to cpu %d failed (%d), running unbound", id, cpu, err);
++	pthread_mutex_lock(&stats_lock); thr_cpu[id] = err ? -1 : cpu; pthread_mutex_unlock(&stats_lock);
+ #else
+-		sched_setaffinity(0, sizeof(&set), &set);
++	CPU_SET(id, &set);
++	sched_setaffinity(0, sizeof(set), &set);
+ #endif
+ }
+ #elif defined(__FreeBSD__) /* FreeBSD specific policy and affinity management */
+@@ -2198,6 +2227,7 @@
+ 
+ 		hashes_done = 0;
+ 		gettimeofday(&tv_start, NULL);
++		double hcv_start = hcv_mono_d();   /* monotonic batch start, API bookkeeping only */
+ 
+ 		// check (and reset) previous errors
+ 	//	cudaError_t err = cudaGetLastError();
+@@ -2225,8 +2255,19 @@
+ 		if (abort_flag)
+ 			break; // time to leave the mining loop...
+ 
+-		if (work_restart[thr_id].restart)
++		if (work_restart[thr_id].restart) {
++			/* interrupted by a new pool job: upstream discards the measurement; keep it for the API only */
++			double dt = hcv_mono_d() - hcv_start;
++			pthread_mutex_lock(&stats_lock);
++			thr_lastwork[thr_id] = hcv_mono_now();          /* the thread was working: always fresh */
++			if (dt >= 1.0 && hashes_done > 0) {                /* rate only from batches long enough to measure */
++				thr_ratek[thr_id] = hashes_done / dt;
++				thr_lastdur[thr_id] = dt;
++				if (dt > thr_maxdur[thr_id]) thr_maxdur[thr_id] = dt;
++			}
++			pthread_mutex_unlock(&stats_lock);
+ 			continue;
++		}
+ 
+ 		/* record scanhash elapsed time */
+ 		gettimeofday(&tv_end, NULL);
+@@ -2255,6 +2296,13 @@
+ 				pthread_mutex_lock(&stats_lock);
+ 				thr_hashrates[thr_id] = hashes_done / dtime;
+ 				thr_hashrates[thr_id] *= rate_factor;
++				double mdt = hcv_mono_d() - hcv_start;   /* API fields use monotonic time; thr_hashrates stays upstream */
++				thr_lastwork[thr_id] = hcv_mono_now();
++				if (mdt >= 0.001) {
++					thr_lastdur[thr_id] = mdt;
++					if (mdt > thr_maxdur[thr_id]) thr_maxdur[thr_id] = mdt;
++					thr_ratek[thr_id] = hashes_done / mdt;
++				}
+ 				if (loopcnt > 2) // ignore first (init time)
+ 					stats_remember_speed(thr_id, hashes_done, thr_hashrates[thr_id], (uint8_t) rc, work.height);
+ 				pthread_mutex_unlock(&stats_lock);
+@@ -3482,6 +3530,13 @@
+ #endif
+ 	if (num_cpus < 1)
+ 		num_cpus = 1;
++
++	for (i = 0; i < MAX_GPUS; i++) thr_cpu[i] = -1;
++#if defined(__linux__) && !defined(__ANDROID__)
++	CPU_ZERO(&allowed_cpus);
++	if (sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0)
++		allowed_cpu_count = CPU_COUNT(&allowed_cpus);
++#endif
+ 
+ 	// number of gpus
+ 	active_gpus = 1;

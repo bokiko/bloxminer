@@ -2,7 +2,7 @@
 
 # BloxMiner
 
-**High-Performance VerusHash v2.2 CPU Miner for Verus Coin**
+**VerusHash v2.2 CPU Miner for Verus Coin — built for HiveOS**
 
 <p>
   <a href="https://github.com/bokiko/bloxminer"><img src="https://img.shields.io/badge/GitHub-bloxminer-181717?style=for-the-badge&logo=github" alt="GitHub"></a>
@@ -10,33 +10,31 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-1.1.1-blue?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/Language-C++-00599C?style=flat-square&logo=cplusplus" alt="C++">
+  <img src="https://img.shields.io/badge/Version-2.0.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Based_on-ccminer-00599C?style=flat-square" alt="ccminer">
   <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
-  <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/HiveOS-Ready-green?style=flat-square" alt="HiveOS">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square" alt="License">
 </p>
 
 </div>
 
-
-> [!WARNING]
-> **This project is in beta and not ready for production use.** Expect breaking changes, incomplete features, and rough edges. Use at your own risk.
 ---
 
 ## Index
 
 - [Installation](#installation)
-  - [One-Line Install (Recommended)](#one-line-install-recommended)
-  - [Manual Install](#manual-install)
+  - [HiveOS Flight Sheet (Recommended)](#hiveos-flight-sheet-recommended)
+  - [HiveOS Terminal Install](#hiveos-terminal-install)
   - [Updating](#updating)
-  - [HiveOS](#hiveos)
 - [Usage](#usage)
 - [Configuration](#configuration)
 - [Features](#features)
 - [API](#api)
+- [Performance](#performance)
 - [Requirements](#requirements)
+- [Building](#building)
 - [Algorithm](#algorithm)
 - [License](#license)
 
@@ -44,87 +42,24 @@
 
 ## Installation
 
-### One-Line Install (Recommended)
-
-```bash
-curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/install.sh | bash
-```
-
-The installer will:
-1. Install build dependencies (cmake, libssl-dev, etc.)
-2. Clone and build BloxMiner to `~/bloxminer`
-3. Prompt for your wallet, pool, worker name, and thread count
-4. Save configuration to `~/bloxminer/bloxminer.json`
-5. Create run scripts and offer to start mining
-
-### Manual Install
-
-```bash
-# Install dependencies
-sudo apt update
-sudo apt install build-essential cmake libssl-dev git
-
-# Clone and build
-git clone https://github.com/bokiko/bloxminer.git ~/bloxminer
-cd ~/bloxminer
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-
-# Run (interactive setup on first run if no config exists)
-./bloxminer
-```
-
-### Updating
-
-Run the installer again - it will detect existing installation and offer to update:
-
-```bash
-curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/install.sh | bash
-# Choose [U] Update when prompted (default)
-```
-
-Or update manually:
-
-```bash
-cd ~/bloxminer
-git pull
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
-### HiveOS
-
-#### Quick Install (Terminal)
-
-```bash
-curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
-```
-
-The installer automatically:
-- Installs build dependencies
-- Detects Zen 2/Zen 3 CPUs and disables AVX-512 (prevents crashes)
-- Sets up RAPL power monitoring with persistent udev rules
-- Builds optimized binary for your CPU
-
-#### Flight Sheet Setup
+### HiveOS Flight Sheet (Recommended)
 
 1. **Create New Flight Sheet**
    - Coin: `VRSC` (Verus)
    - Wallet: Select your Verus wallet
-   - Pool: Configure your pool (e.g., `pool.verus.io:9999`)
+   - Pool: `Configure in miner`
 
 2. **Add Miner**
    - Miner: `Custom`
+   - Miner name: `bloxminer`
    - Installation URL:
      ```
-     https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh
+     https://github.com/bokiko/bloxminer/releases/download/2.0.0/bloxminer-2.0.0.tar.gz
      ```
    - Hash algorithm: `verushash`
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
-   - Pool URL: `%URL%`
-   - Pass: Number of threads (e.g., `32`) or leave empty for auto
+   - Pool URL: your pool, e.g. `stratum+tcp://veruscoin.cedric-crispin.com:4024`
+   - Pass: number of threads (e.g. `32`) or leave empty for all threads
 
 3. **Apply Flight Sheet** to your rig
 
@@ -133,155 +68,70 @@ The installer automatically:
 | Field | Value | Notes |
 |-------|-------|-------|
 | Miner | `custom` | Required |
-| Installation URL | `https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh` | First install only |
-| Miner name | `bloxminer` | After install |
+| Miner name | `bloxminer` | Must match exactly |
+| Installation URL | `https://github.com/bokiko/bloxminer/releases/download/2.0.0/bloxminer-2.0.0.tar.gz` | Keep it — HiveOS installs once and reuses it |
 | Hash algorithm | `verushash` | |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
-| Pool URL | `stratum+tcp://pool.verus.io:9999` | Your pool |
-| Pass | `32` | Thread count (optional) |
+| Pool URL | `stratum+tcp://host:port` | Your pool |
+| Pass | `32` | Thread count (optional). Any non-number is sent to the pool as the password |
+| Extra config arguments | *(empty)* | Optional ccminer JSON, e.g. `"threads": 12` |
 
-> **Important**: After first install, **clear the Installation URL field** (leave empty). HiveOS parses the miner name from the URL, which can cause issues if left populated.
-
-#### HiveOS Features
-
-- **Auto CPU Detection**: Zen 2/Zen 3 (Ryzen 3000/5000) automatically built without AVX-512
-- **Power Monitoring**: CPU power via RAPL shown in miner stats
-- **Stats Integration**: Hashrate, temperature, accepted/rejected shares reported to HiveOS dashboard
-- **Per-Thread Stats**: Individual thread hashrates visible in miner output
-
-#### Updating on HiveOS
-
-Re-run the installer to update:
+### HiveOS Terminal Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/bokiko/bloxminer/master/h-install.sh | bash
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer/releases/download/2.0.0/bloxminer-2.0.0.tar.gz
 ```
 
-Or via Miner actions in HiveOS web interface.
+Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
+the first time a flight sheet uses a Custom miner.
+
+### Updating
+
+Change the version in the Installation URL (e.g. `2.0.0` → a newer release) and apply the flight sheet.
+HiveOS downloads the new package and restarts the miner.
 
 ---
 
 ## Usage
 
-After installation, run the miner:
+HiveOS runs BloxMiner for you. Useful commands on the rig:
 
 ```bash
-# Using run script (recommended)
-cd ~/bloxminer && ./run.sh
-
-# Run in background
-cd ~/bloxminer && ./run-background.sh
-
-# View logs (background mode)
-tail -f ~/bloxminer/miner.log
-
-# Stop miner
-pkill -f bloxminer
+miner                 # open the miner screen (Ctrl+A, D to leave)
+miner restart         # restart
+tail -f /var/log/miner/bloxminer/bloxminer.log
 ```
 
-### Command Line Options
+The binary can also run outside HiveOS with standard ccminer options:
 
 ```bash
-./bloxminer [options]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-c, --config` | Config file path | bloxminer.json |
-| `-o, --pool` | Pool address (host:port). Repeat for failover | From config |
-| `-u, --user` | Wallet address | From config |
-| `-w, --worker` | Worker name | hostname |
-| `-p, --pass` | Pool password | x |
-| `-t, --threads` | Mining threads (0 = auto) | Auto-detect |
-| `-q, --quiet` | Quiet mode (warnings/errors only) | Off |
-| `--api-port` | API port (0 to disable) | 4068 |
-| `--api-bind` | API bind address | 127.0.0.1 |
-
-### Examples
-
-```bash
-# Use saved config (recommended)
-./bloxminer
-
-# Override thread count
-./bloxminer -t 8
-
-# Full command line (no config needed)
-./bloxminer -o pool.verus.io:9999 -u RYourWalletAddress -w rig1 -t 4
-
-# Multiple failover pools
-./bloxminer -o pool.verus.io:9999 -o na.luckpool.net:3956 -u RYourWalletAddress
-```
-
-### Install as System Service
-
-```bash
-sudo cp ~/bloxminer/bloxminer.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable bloxminer
-sudo systemctl start bloxminer
+/hive/miners/custom/bloxminer/ccminer -a verus \
+  -o stratum+tcp://veruscoin.cedric-crispin.com:4024 \
+  -u RYourWalletAddress.rig1 -p x -t 32
 ```
 
 ---
 
 ## Configuration
 
-BloxMiner saves settings to `bloxminer.json` so you don't need to enter them every time.
-
-### First Run (Interactive Setup)
-
-If no config file exists and no wallet is provided via CLI, the miner prompts for configuration:
-
-```
-========================================
-   BloxMiner First-Run Setup
-========================================
-
-Enter your Verus (VRSC) wallet address:
-> RYourWalletAddress
-
-Enter pool address [pool.verus.io:9999]:
->
-
-Enter worker name [hostname]:
-> rig1
-
-Enter thread count (1-32) [auto=32]:
->
-
-Save this configuration? [Y/n]: y
-Configuration saved to bloxminer.json
-```
-
-### Config File Format
+The flight sheet is turned into `/hive/miners/custom/bloxminer/config.json` every time the miner starts:
 
 ```json
 {
-  "wallet": "RYourWalletAddress",
-  "pools": [
-    {"host": "pool.verus.io", "port": 9999},
-    {"host": "na.luckpool.net", "port": 3956}
-  ],
-  "worker": "rig1",
-  "threads": 0,
-  "api": {
-    "enabled": true,
-    "port": 4068,
-    "bind": "127.0.0.1"
-  }
+  "pools": [ { "name": "pool1", "url": "stratum+tcp://host:port", "timeout": 150 } ],
+  "user": "RYourWalletAddress.rig1",
+  "pass": "x",
+  "algo": "verus",
+  "threads": 32,
+  "api-bind": "127.0.0.1:4068"
 }
 ```
 
-### Config File Locations
+Options in `/hive/miners/custom/bloxminer/h-manifest.conf`:
 
-1. `./bloxminer.json` (current directory - checked first)
-2. `~/.config/bloxminer/config.json` (user global)
-
-### Edit Configuration
-
-```bash
-nano ~/bloxminer/bloxminer.json
-```
+| Option | Values | Default |
+|--------|--------|---------|
+| `CCD_TEMP_MAP` | `auto` · `1` (force per-CCD temps) · `0` (package temp on every row) | `auto` |
 
 ---
 
@@ -289,65 +139,70 @@ nano ~/bloxminer/bloxminer.json
 
 | Category | Features |
 |----------|----------|
-| **Performance** | VerusHash v2.2, AES-NI acceleration, AVX2 optimizations, thread affinity |
-| **Reliability** | Failover pools, exponential backoff (5s→60s), auto pool switching after 3 failures, primary pool retry every 5 min |
-| **Monitoring** | htop-style display, per-thread hashrates, CPU temp, separate CPU/GPU power (RAPL + hwmon) |
-| **Compatibility** | Multi-threaded auto-detect, Stratum v1, all major pools, HiveOS ready |
+| **Performance** | Same speed as the fastest ccminer CPU build we measured (Oink70 3.8.3a), tuned for AMD Zen 3, reproducible build |
+| **HiveOS stats** | **Hashrate per physical core** (SMT threads summed), temperature per core row, CPU package power (RAPL), accepted/rejected |
+| **Temperatures** | AMD Ryzen 5000: temperature of each core's CCD (AMD has no per-core sensor) · Intel: real per-core temperature · others: package temperature |
+| **Reliability** | Stall detection — a stalled miner shows 0 H/s instead of its last rate (within 10 min without work) · CPU check with a clear HiveOS message on unsupported CPUs |
+| **Threads** | Each thread pinned to its own CPU (respects the process CPU set), bound CPU reported per thread |
 
-### Live Stats Display
+### What HiveOS receives (example, Ryzen 9 5950X)
 
 ```
-+--------------------------------------------------------------+
-|  BloxMiner v1.1.1 - VerusHash CPU Miner                      |
-+--------------------------------------------------------------+
-|  Hashrate: 26.97 MH/s     Accepted: 132      Rejected: 0     |
-|  55C   CPU: 101W  GPU: N/A  Eff: 268 KH/W    Up: 1h 24m      |
-|  Pool: pool.verus.io:9999                    Diff: 128       |
-+--------------------------------------------------------------+
-|  Thread hashrates (KH/s):                                    |
-|  897 899 842 853 840 833 847 848 839 841 825 827 822 825 ... |
-+--------------------------------------------------------------+
+core  0   3.14 MH/s   62°C  (CCD1)
+core  1   3.12 MH/s   62°C  (CCD1)
+ ...
+core  8   3.13 MH/s   63°C  (CCD2)
+ ...
+core 15   3.15 MH/s   64°C  (CCD2)
+                              cpu_power: 136 W
 ```
 
-- **CPU/GPU Power**: Separate readings from RAPL (CPU) and hwmon (AMD GPU)
-- **Efficiency**: Hashrate per watt (KH/W)
-- **Scroll region**: Logs scroll below header without overwriting stats
+CPU power is sent as `cpu_power` in the miner stats; how HiveOS displays it depends on the HiveOS version.
 
 ---
 
 ## API
 
-BloxMiner exposes a JSON API on port 4068:
+ccminer-compatible text API on `127.0.0.1:4068` (local only):
 
 ```bash
-curl http://localhost:4068
+echo -n summary | nc 127.0.0.1 4068
+echo -n threads | nc 127.0.0.1 4068
 ```
 
-```json
-{
-  "miner": "BloxMiner",
-  "version": "1.1.1",
-  "algorithm": "verushash",
-  "uptime": 12345,
-  "hashrate": {
-    "total": 26970.5,
-    "threads": [897.4, 899.2, 842.1, ...],
-    "unit": "KH/s"
-  },
-  "shares": {
-    "accepted": 132,
-    "rejected": 0
-  },
-  "hardware": {
-    "threads": 32,
-    "temp": 55,
-    "cpu_power": 101.0,
-    "gpu_power": 0.0,
-    "efficiency": 268.0,
-    "efficiency_unit": "KH/W"
-  }
-}
+`summary` (BloxMiner adds `LASTWORK`, `STALL` and `FRESHKHS` — the total of threads that worked recently):
+
 ```
+NAME=ccminer_CPU;VER=3.8.3;ALGO=verus;KHS=49221.86;ACC=15;REJ=0;UPTIME=152;LASTWORK=14;STALL=0;FRESHKHS=49180.32|
+```
+
+`threads` — one entry per mining thread:
+
+```
+CPU=0;KHS=1567.96;AFF=0;AGE=9;DUR=62;STATE=hashing|CPU=1;KHS=1526.47;AFF=1;AGE=4;DUR=58;STATE=hashing|...
+```
+
+| Field | Meaning |
+|-------|---------|
+| `KHS` | Rate of the thread's last completed batch (0 when overdue) |
+| `AFF` | CPU the thread is bound to (`-1` = unbound) |
+| `AGE` / `DUR` | Seconds since the last batch finished / how long that batch took |
+| `STATE` | `hashing`, or `waiting` when the current batch is overdue: 2 × the thread's longest batch + 30 s, at least 5 min and at most 10 min |
+
+---
+
+## Performance
+
+2 × AMD Ryzen 9 5950X (32 threads), HiveOS on Ubuntu 22.04, same pool, alternated runs against
+Oink70's ccminer 3.8.3a (the fastest CPU build we measured):
+
+| Rig | Oink70 3.8.3a | **BloxMiner** |
+|-----|---------------|---------------|
+| cask10 | 49.71 MH/s | **49.94 MH/s** |
+| cask18 | 49.35 MH/s | **49.56 MH/s** |
+
+Balanced ABBA run of the 2.0.0 binary on both rigs (2 × 10 min per miner per rig): BloxMiner **+0.4 %** versus Oink — equal
+within measurement noise — while adding per-core stats. Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -355,12 +210,24 @@ curl http://localhost:4068
 
 | Category | Requirement |
 |----------|-------------|
-| **OS** | Ubuntu 20.04+, Debian 11+, HiveOS |
-| **CPU** | x86-64 with AES-NI, AVX2, PCLMULQDQ |
-| **Compiler** | GCC 9+ or Clang 10+ |
-| **Build** | CMake 3.16+, OpenSSL dev libs |
+| **OS** | HiveOS on Ubuntu 22.04 or newer (glibc ≥ 2.34, OpenSSL 3). Older 18.04 images: update with `hive-replace --stable` |
+| **CPU** | x86-64-v3 (AVX2, BMI2, FMA) with AES-NI and PCLMULQDQ — AMD Ryzen / EPYC, Intel Haswell or newer |
+| **Tested** | AMD Ryzen 9 5950X. Other Zen 3 CPUs share the same core; Intel should work but is untested |
 
-Most Intel (Haswell+) and AMD (Zen+) processors are supported.
+---
+
+## Building
+
+Reproducible on Ubuntu 22.04 x86-64:
+
+```bash
+build/build.sh                  # clang 14, -march=x86-64-v3 -mtune=znver3 -O3 → out/ccminer-O3
+build/package.sh out/ccminer-O3 # → bloxminer-2.0.0.tar.gz
+```
+
+Source: [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183` + [`build/bloxminer.patch`](build/bloxminer.patch).
+The patch adds the per-thread API, stall detection and the thread-pinning fix. The hashing code is unchanged.
+The release binary's sha256 is listed in the release notes.
 
 ---
 
@@ -391,15 +258,18 @@ Hash Result (32 bytes)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+GPL-3.0 — see [LICENSE](LICENSE). BloxMiner 2.x is built from ccminer, which is GPL-licensed.
+BloxMiner 1.x (the earlier from-scratch C++ miner, MIT) remains in this repository's history.
 
 ---
 
 ## Acknowledgments
 
-- [VerusCoin Team](https://verus.io) - Original VerusHash implementation
-- [ccminer-verus](https://github.com/monkins1010/ccminer) - Reference CPU implementation
+- [VerusCoin Team](https://verus.io) - VerusHash
+- [monkins1010/ccminer](https://github.com/monkins1010/ccminer) - Verus ccminer (Christian Buchner, Christian H., tpruvot and contributors)
+- [Oink70/ccminer-verus](https://github.com/Oink70/ccminer-verus) - CPU builds and reference speed
 - [Daniel Lemire](https://github.com/lemire/clhash) - CLHash algorithm
+- [LLVM Project](https://llvm.org) - clang and libomp (Apache-2.0 with LLVM exception)
 
 ---
 

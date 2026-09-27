@@ -1,48 +1,23 @@
-# Build directories
-build/
-cmake-build-*/
+# Release artefacts (built by build/build.sh, published as GitHub release assets)
+bloxminer/ccminer
+bloxminer/libomp.so.5
+bloxminer/config.json
+*.tar.gz
 out/
-.cache/
 
-# IDE/Editor files
+# OS / editor
+.DS_Store
+*.swp
+*~
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.project
-.cproject
-.settings/
-
-# Compiled files
-*.o
-*.obj
-*.a
-*.so
-*.dylib
-*.exe
-bloxminer
-
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-compile_commands.json
-
-# OS files
-.DS_Store
-Thumbs.db
 
 # Logs
 *.log
-
-# Config files with sensitive data
-config.json
-*.conf
-tests/test_clhash_compare
 
 # Internal development ledger files
 CONTINUITY.md
 CONTINUATION.md
 thoughts/
+.claude/
+.backups/
