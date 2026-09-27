@@ -5,7 +5,7 @@
   <img src="assets/logo-light.svg" alt="BloxMiner" width="420">
 </picture>
 
-**VerusHash v2.2 CPU miner for Verus (VRSC) — runs on any x86-64 Linux, HiveOS-ready**
+**VerusHash v2.2 CPU miner for Verus (VRSC) — 0 % dev fee, runs on any x86-64 Linux, HiveOS-ready**
 
 <p>
   <a href="https://github.com/bokiko/bloxminer"><img src="https://img.shields.io/badge/GitHub-bloxminer-181717?style=for-the-badge&logo=github" alt="GitHub"></a>
@@ -19,6 +19,7 @@
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/HiveOS-Ready-green?style=flat-square" alt="HiveOS">
   <img src="https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/Dev_fee-0%25-brightgreen?style=flat-square" alt="0% dev fee">
 </p>
 
 </div>
@@ -54,6 +55,7 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
 | | |
 |---|---|
 | **VRSC** | Supported and tested on Verus stratum pools |
+| **Fees** | **None.** No dev fee and no donation mining: every share goes to your wallet on the pool you configure. Open source (GPL-3.0); the full change to ccminer is [`build/bloxminer.patch`](build/bloxminer.patch) |
 | **Verus PBaaS chains** | The Verus merged-mining header handling is included (from monkins1010's ccminer). Whether a pool offers merged mining or a PBaaS chain, and which rewards you get, depends on the pool. Not tested by us |
 | **Other coins / algorithms** | Not supported. Any `algo` other than `verus` is refused at start with a message |
 
