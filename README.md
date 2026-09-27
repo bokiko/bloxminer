@@ -2,7 +2,7 @@
 
 # BloxMiner
 
-**VerusHash v2.2 CPU Miner for Verus Coin — built for HiveOS**
+**VerusHash v2.2 CPU miner for Verus (VRSC) — runs on any x86-64 Linux, HiveOS-ready**
 
 <p>
   <a href="https://github.com/bokiko/bloxminer"><img src="https://img.shields.io/badge/GitHub-bloxminer-181717?style=for-the-badge&logo=github" alt="GitHub"></a>
@@ -210,7 +210,7 @@ within measurement noise — while adding per-core stats. Full method, diagnosis
 
 | Category | Requirement |
 |----------|-------------|
-| **OS** | HiveOS on Ubuntu 22.04 or newer (glibc ≥ 2.34, OpenSSL 3). Older 18.04 images: update with `hive-replace --stable` |
+| **OS** | Any x86-64 Linux with glibc ≥ 2.34 and OpenSSL 3 (e.g. Ubuntu 22.04+, Debian 12+), including HiveOS on Ubuntu 22.04+. Older HiveOS 18.04 images: update with `hive-replace --stable` |
 | **CPU** | x86-64-v3 (AVX2, BMI2, FMA) with AES-NI and PCLMULQDQ — AMD Ryzen / EPYC, Intel Haswell or newer |
 | **Tested** | AMD Ryzen 9 5950X. Other Zen 3 CPUs share the same core; Intel should work but is untested |
 
