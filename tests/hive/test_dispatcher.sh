@@ -36,8 +36,19 @@ CONF=$T/config.json
 HUGEFILE=$T/state/.bloxminer-hugepages
 
 hconfig() {   # url template pass extra algo -> runs the dispatcher h-config.sh, sets $out $rc
-	out=$(CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5 \
-		bash "$BLOX_DIR/h-config.sh" 2>&1); rc=$?
+	# SOURCED, exactly as Hive really invokes it (hive-ref/miner's miner_config_gen():
+	# `. $MINER_DIR/$CUSTOM_MINER/h-config.sh`; hive-ref/miner-run: `source $MINER_DIR/h-config.sh`) - with
+	# CUSTOM_* as plain, NON-exported variables of the calling shell, never in the process environment. This
+	# used to be `CUSTOM_URL=$1 ... bash "$BLOX_DIR/h-config.sh"`: an EXPORTED child-process call, which is
+	# exactly the shape that masked the cask18 bug (a non-exported CUSTOM_URL, invisible to a plain child
+	# process, produced "the pool URL in the flight sheet is empty" for both engines - see the Round 4 section
+	# below). Each call still gets its own throwaway bash -c child for isolation between test cases, same as
+	# before; only HOW the variables reach h-config.sh changed (source vs. an exported child process).
+	out=$(bash -c '
+		set +a
+		CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5
+		. "$BLOX_DIR/h-config.sh"
+	' _ "$1" "$2" "$3" "$4" "$5" 2>&1); rc=$?
 }
 # cfgengine - calls h-common.sh's engine_from_config directly: the SOLE authority for which engine is active.
 cfgengine() { bash -c '. "$BLOX_DIR/h-manifest.conf" 2>/dev/null; . "$BLOX_DIR/h-common.sh" 2>/dev/null; engine_from_config' 2>/dev/null; }
@@ -72,6 +83,15 @@ hconfig "p:1" "W" "" "" "rx/graft"
 if [[ $rc == 0 && $(jq -r '.pools[0].algo' "$CONF" 2>/dev/null) == "rx/graft" ]]; then ok "algo rx/graft kept as-is in config"; else bad "algo rx/graft kept as-is in config" "$(cat "$CONF" 2>/dev/null)"; fi
 hconfig "p:1" "W" "" "" "verus"
 if [[ $rc == 0 && $(jq -r '.algo' "$CONF" 2>/dev/null) == "verus" ]]; then ok "algo alias verus -> config algo verus"; else bad "algo alias verus -> config algo verus" "$(cat "$CONF" 2>/dev/null)"; fi
+
+# config.json actually carries the real flight-sheet pool URL / wallet template through, for both engines - not
+# previously asserted anywhere in this file, which is exactly how the cask18 empty-pool-URL bug went unnoticed
+hconfig "pool.example.com:1234" "MyWallet.rig1" "" "" ""
+if [[ $(jq -r '.pools[0].url' "$CONF" 2>/dev/null) == "stratum+tcp://pool.example.com:1234" ]]; then ok "verus: config.json pool URL matches CUSTOM_URL"; else bad "verus: config.json pool URL matches CUSTOM_URL" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.user' "$CONF" 2>/dev/null) == "MyWallet.rig1" ]]; then ok "verus: config.json user matches CUSTOM_TEMPLATE"; else bad "verus: config.json user matches CUSTOM_TEMPLATE" "$(cat "$CONF" 2>/dev/null)"; fi
+hconfig "pool.example.com:5678" "MyWallet.rig2" "" "" "rx/0"
+if [[ $(jq -r '.pools[0].url' "$CONF" 2>/dev/null) == "stratum+tcp://pool.example.com:5678" ]]; then ok "rx: config.json pool URL matches CUSTOM_URL"; else bad "rx: config.json pool URL matches CUSTOM_URL" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.pools[0].user' "$CONF" 2>/dev/null) == "MyWallet.rig2" ]]; then ok "rx: config.json user matches CUSTOM_TEMPLATE"; else bad "rx: config.json user matches CUSTOM_TEMPLATE" "$(cat "$CONF" 2>/dev/null)"; fi
 
 # ============================================================== 2. unknown algo: fails cleanly, no restart storm
 setup_pkg
@@ -418,6 +438,67 @@ if grep -qF "$BLOX_DIR/bloxminer: No such file" <<< "$run_out"; then ok "h-run o
 hconfig "p:1" "W" "" "" "rx/0"
 run_out=$(timeout 2 bash "$BLOX_DIR/h-run.sh" 2>&1)
 if grep -qF "$BLOX_DIR/xmrig: No such file" <<< "$run_out"; then ok "h-run on rx execs ./xmrig"; else bad "h-run on rx execs ./xmrig" "$run_out"; fi
+
+# ============================================================== 9. Round 4: Hive's REAL sourcing behaviour,
+#    end to end. hconfig() above (section 1 onward) already runs h-config.sh SOURCED with non-exported CUSTOM_*
+#    vars, which is what actually exercises the fix - but it always starts from a fresh $BLOX_DIR-relative
+#    invocation. This section goes one step further and reproduces Hive's own call shape as literally as
+#    possible: a wallet.conf-like fixture sourced with `set +a` (CUSTOM_* end up as plain, non-exported
+#    variables of the CALLING shell, exactly as /hive/miners/custom/h-config.sh:55's
+#    `. $MINER_DIR/$CUSTOM_MINER/h-config.sh` and /hive/bin/miner:386's `source $MINER_DIR/h-config.sh` leave
+#    them - see hive-ref/miner and hive-ref/miner-run), from a starting directory that is NOT $BLOX_DIR (Hive
+#    never cds us there either), then this dispatcher is sourced directly into that same shell. Proves three
+#    things no earlier section does: (a) config.json gets the REAL CUSTOM_URL/CUSTOM_TEMPLATE/CUSTOM_PASS for
+#    BOTH engines - the exact cask18 bug (a non-exported CUSTOM_URL, invisible to the OLD code's child-process
+#    engine call, produced "the pool URL in the flight sheet is empty" for both engines and no miner ever
+#    started); (b) the calling shell SURVIVES a dispatcher-level AND an engine-level error (never killed by an
+#    escaping `exit`) - proven by a marker printed immediately after the source call, which can only appear if
+#    that call returned control instead of terminating the process; (c) the calling shell's cwd is unchanged.
+setup_pkg
+WALLET="$T/wallet.conf"
+hive_sourced() {   # $1=url $2=template $3=pass $4=extra $5=algo -> sets $out $rc $survived $pwd_after
+	printf 'CUSTOM_URL=%q\nCUSTOM_TEMPLATE=%q\nCUSTOM_PASS=%q\nCUSTOM_USER_CONFIG=%q\nCUSTOM_ALGO=%q\n' \
+		"$1" "$2" "$3" "$4" "$5" > "$WALLET"
+	out=$(BLOX_DIR="$BLOX_DIR" WALLET="$WALLET" STARTDIR="$T" bash -c '
+		set +a
+		cd "$STARTDIR"                # start somewhere OTHER than BLOX_DIR - Hive never cds us there either
+		. "$WALLET"                   # CUSTOM_* now plain, NON-exported vars of THIS shell - never in the env
+		. "$BLOX_DIR/h-config.sh"     # the real Hive call shape: sourced, never executed as a subprocess
+		rc=$?
+		printf "SURVIVED rc=%d pwd=%s\n" "$rc" "$PWD"
+	' 2>&1)
+	survived=$(grep -q '^SURVIVED rc=' <<< "$out" && echo y)
+	rc=$(sed -n 's/^SURVIVED rc=\(-\{0,1\}[0-9]*\) pwd=.*/\1/p' <<< "$out")
+	pwd_after=$(sed -n 's/^SURVIVED rc=-\{0,1\}[0-9]* pwd=//p' <<< "$out")
+}
+
+# ---- verus: correct config.json from real (non-exported) flight-sheet vars, caller survives, cwd unchanged
+hive_sourced "pool.example.com:9001" "WALLET.worker9" "7" "" "verus"
+if [[ -n $survived && $rc == 0 && $pwd_after == "$T" ]]; then ok "Hive-sourced verus: dispatcher returns cleanly, caller survives, cwd unchanged"; else bad "Hive-sourced verus: dispatcher returns cleanly, caller survives, cwd unchanged" "$out"; fi
+if [[ $(jq -r '.pools[0].url' "$CONF" 2>/dev/null) == "stratum+tcp://pool.example.com:9001" ]]; then ok "Hive-sourced verus: config.json pool URL matches the non-exported CUSTOM_URL"; else bad "Hive-sourced verus: config.json pool URL matches the non-exported CUSTOM_URL" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.user' "$CONF" 2>/dev/null) == "WALLET.worker9" ]]; then ok "Hive-sourced verus: config.json user matches the non-exported CUSTOM_TEMPLATE"; else bad "Hive-sourced verus: config.json user matches the non-exported CUSTOM_TEMPLATE" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.threads' "$CONF" 2>/dev/null) == 7 ]]; then ok "Hive-sourced verus: config.json threads matches the non-exported CUSTOM_PASS (thread count)"; else bad "Hive-sourced verus: config.json threads matches the non-exported CUSTOM_PASS" "$(cat "$CONF" 2>/dev/null)"; fi
+
+# ---- rx: same, other engine (Pass is a POOL PASSWORD here, not a thread count)
+hive_sourced "pool.example.com:9002" "WALLET.worker2" "secretpass" "" "rx/wow"
+if [[ -n $survived && $rc == 0 && $pwd_after == "$T" ]]; then ok "Hive-sourced rx: dispatcher returns cleanly, caller survives, cwd unchanged"; else bad "Hive-sourced rx: dispatcher returns cleanly, caller survives, cwd unchanged" "$out"; fi
+if [[ $(jq -r '.pools[0].url' "$CONF" 2>/dev/null) == "stratum+tcp://pool.example.com:9002" ]]; then ok "Hive-sourced rx: config.json pool URL matches the non-exported CUSTOM_URL"; else bad "Hive-sourced rx: config.json pool URL matches the non-exported CUSTOM_URL" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.pools[0].user' "$CONF" 2>/dev/null) == "WALLET.worker2" ]]; then ok "Hive-sourced rx: config.json user matches the non-exported CUSTOM_TEMPLATE"; else bad "Hive-sourced rx: config.json user matches the non-exported CUSTOM_TEMPLATE" "$(cat "$CONF" 2>/dev/null)"; fi
+if [[ $(jq -r '.pools[0].pass' "$CONF" 2>/dev/null) == "secretpass" ]]; then ok "Hive-sourced rx: config.json pass matches the non-exported CUSTOM_PASS"; else bad "Hive-sourced rx: config.json pass matches the non-exported CUSTOM_PASS" "$(cat "$CONF" 2>/dev/null)"; fi
+
+# ---- the calling shell survives a DISPATCHER-level error too (bad algo), not just the success path - and the
+#      config.json from the last successful call above is left completely untouched by the failure
+before_err_conf=$(cat "$CONF")
+hive_sourced "pool.example.com:9003" "W" "" "" "bogus-algo"
+if [[ -n $survived && $rc != 0 ]]; then ok "Hive-sourced bad algo: caller survives the error (no exit escapes)"; else bad "Hive-sourced bad algo: caller survives the error (no exit escapes)" "$out"; fi
+if [[ $pwd_after == "$T" ]]; then ok "Hive-sourced bad algo: caller cwd unchanged"; else bad "Hive-sourced bad algo: caller cwd unchanged" "pwd_after=$pwd_after out=$out"; fi
+if [[ $(cat "$CONF") == "$before_err_conf" ]]; then ok "Hive-sourced bad algo: config.json from the prior good run left untouched"; else bad "Hive-sourced bad algo: config.json left untouched" "changed"; fi
+
+# ---- and survives an ENGINE-level failure too (empty URL): the engine's own h-config.sh fail()/exit 1 runs
+#      inside this dispatcher's subshell (see h-config.sh), which must not escape any further than that either
+hive_sourced "" "W" "" "" "verus"
+if [[ -n $survived && $rc != 0 ]]; then ok "Hive-sourced engine-level failure (empty URL): caller survives"; else bad "Hive-sourced engine-level failure (empty URL): caller survives" "$out"; fi
+if [[ $pwd_after == "$T" ]]; then ok "Hive-sourced engine-level failure (empty URL): caller cwd unchanged"; else bad "Hive-sourced engine-level failure (empty URL): caller cwd unchanged" "pwd_after=$pwd_after out=$out"; fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
