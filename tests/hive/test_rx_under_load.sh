@@ -235,14 +235,19 @@ with open(os.path.join(root, "net", "tcp"), "w") as f:
 os.makedirs(os.path.join(root, "sys", "vm"), exist_ok=True)
 os.makedirs(os.path.join(root, "sys", "kernel", "random"), exist_ok=True)
 with open(os.path.join(root, "sys", "vm", "nr_hugepages"), "w") as f:
-	f.write("1201\n")   # prelim(1200) + max(0, need(1200) - free0(1199)) - exactly what finalize should confirm
+	f.write("1201\n")   # prelim(1200) + max(0, need(1201) - free0(1200)) - exactly what finalize should confirm
 with open(os.path.join(root, "meminfo"), "w") as f:
-	f.write("HugePages_Free:      1199 kB\n")
+	f.write("HugePages_Free:      1200 kB\nHugepagesize:        2048 kB\n")
 with open(os.path.join(root, "sys", "kernel", "random", "boot_id"), "w") as f:
 	f.write("case3-boot\n")
+# Round 5b: finalize_rx_hugepages now reads XMRig's own KERNEL-mapped huge pages from smaps_rollup (the API's
+# own "hugepages" total undercounts by the RandomX JIT buffer - see h-common.sh) - 1201 pages, matching the
+# exact cask18 live value, not the API's [1200,1200] below.
+with open(os.path.join(root, TARGET_PID, "smaps_rollup"), "w") as f:
+	f.write("Rss:                 512 kB\nPss:                 512 kB\nPrivate_Hugetlb:  2459648 kB\nShared_Hugetlb:  0 kB\n")
 PY
 mkdir -p "$T/state3"
-printf 'prior=0\nprelim=1200\nfree0=1199\nboot=case3-boot\nfinal=0\n' > "$T/state3/.bloxminer-hugepages"
+printf 'prior=0\nprelim=1200\nfree0=1200\nboot=case3-boot\nfinal=0\n' > "$T/state3/.bloxminer-hugepages"
 
 SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hugepages: [1200, 1200]}')
 BACK3=$(python3 -c '

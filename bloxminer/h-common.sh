@@ -138,7 +138,26 @@ reject_foreign_selector() {
 #     at line 439) and `/2/summary` (line 471, `REQ_SUMMARY`, using the caller's own API version - rx's
 #     engines/rx/h-stats.sh already queries `/2/summary` and `/2/backends` this exact way for ownership-verified
 #     stats, so this is the SAME reply shape/port/ownership check this package already trusts elsewhere, not a
-#     new interface).
+#     new interface). ROUND 5b: this total is kept ONLY as a readiness signal (allocated==total) - see below for
+#     why it is no longer the "need" value the predicted-total formula itself uses.
+#
+# ROUND 5b - the API's own total still undercounts "need" by exactly one allocation. Proven live on cask18,
+# 2026-09-29 (package 2c89cc4c.../commit 12e9cfa): record prior=0/prelim=1200/free0=1200, the API reported
+# `hugepages:[1200,1200]` (fully allocated, by its own accounting), yet live vm.nr_hugepages was really 1201 -
+# Round 5's formula (`prelim + max(0, api_total - free0)` = 1200) called that an unexplained foreign conflict,
+# a false positive. `/proc/<xmrig pid>/smaps_rollup` showed `Private_Hugetlb: 2459648 kB` = exactly 1201 x
+# 2048 kB, matching the live value exactly (`Shared_Hugetlb: 0`). Root cause: HugePagesInfo (and so the API's
+# total) only ever counts allocations that went through a `VirtualMemory::reserve()`-backed path
+# (VirtualMemory_unix.cpp:233-236/259, one per dataset/scratchpad) - but RandomX's JIT code buffer is allocated
+# by a SEPARATE path, `VirtualMemory::allocateExecutableMemory` (VirtualMemory_unix.cpp:142-176, called from
+# crypto/randomx/jit_compiler_x86.cpp's `JitCompilerX86` via crypto/randomx/virtual_memory.cpp:36-37), which on
+# Linux (VirtualMemory_unix.cpp:165-171) mmaps `MAP_HUGETLB` directly with NO `LinuxMemory::reserve()` call and
+# NO `HugePagesInfo` bookkeeping at all - a real huge page the kernel actually committed, completely invisible
+# to XMRig's own self-reported total. The fix: ask the KERNEL what this exact, ownership-verified xmrig process
+# actually has mapped right now (`_hp_xmrig_need_pages`, via `/proc/<pid>/smaps_rollup`'s own
+# `Private_Hugetlb`+`Shared_Hugetlb`, divided by `/proc/meminfo`'s own `Hugepagesize` - never hardcoded), not
+# what XMRig's incomplete self-report claims. This cannot miss the JIT buffer, or any other future allocation
+# path this package does not know about, the same way trusting the API's own accounting did.
 #
 # DESIGN: the record now holds, from note_rx_hugepages_start (called before rx's own exec, same as before):
 #   prior=<N>    the value observed BEFORE `hugepages -rx` ran (what to restore, unchanged in meaning)
@@ -151,13 +170,15 @@ reject_foreign_selector() {
 #                reboot, but a boot_id mismatch is an extra, cheap, explicit guard against acting on it anyway)
 #   final=0      not yet finalised - see finalize_rx_hugepages below
 # Finalisation (h-stats.sh, every ~10 s poll while engine==rx and final=0 - see finalize_rx_hugepages) waits
-# until XMRig's OWN reported numbers positively prove the raising is finished and entirely its own doing:
-# ownership of the API port confirmed (the same /proc/net/tcp -> inode -> pid -> exe check rx's own h-stats.sh
-# already does), khs>0 (real hashing under way), and hugepages allocated==total (no more reserve() calls
-# pending) - only THEN is `live vm.nr_hugepages` compared against the value XMRig's own rule predicts
-# (`prelim + max(0, total - free0)`, the closed form derived above). An exact match writes `ours=<live>` and
-# `final=1` - THIS is the value a later Verus start is entitled to restore over (restore_verus_hugepages,
-# below, now also requires final=1 before it looks at prior/ours at all). A mismatch (something else changed
+# until readiness is proven - ownership of the API port confirmed (the same /proc/net/tcp -> inode -> pid ->
+# exe check rx's own h-stats.sh already does), khs>0 (real hashing under way), and the API's own hugepages
+# allocated==total (its allocator has stopped moving) - and only THEN reads the KERNEL's own truth of what that
+# process actually has mapped (`_hp_xmrig_need_pages`, Round 5b - see above for why the API's own total is not
+# used here). `live vm.nr_hugepages` is compared against the value XMRig's own rule predicts
+# (`prelim + max(0, need - free0)`, the closed form derived above, with `need` now the kernel-measured value).
+# An exact match writes `ours=<live>` and `final=1` - THIS is the value a later Verus start is entitled to
+# restore over (restore_verus_hugepages, below, now also requires final=1 before it looks at prior/ours at
+# all). A mismatch (something else changed
 # nr_hugepages during the startup window - the one case the old code silently mis-attributed to this package)
 # is never finalised: logged ONCE (final is set to "conflict", a terminal state this function never revisits,
 # so it never spams the log every poll), record kept for a human/reboot to sort out. Backward compatibility: an
@@ -166,9 +187,11 @@ reject_foreign_selector() {
 # never matches an empty/missing value, so such a record is left untouched (never wrongly trusted) until the
 # next reboot clears it; no migration code is needed for that, per design.
 # DOCUMENTED LIMITATION: if RandomX 1 GB-pages is in effect (engines/rx/h-config.sh's opt-in
-# `"randomx":{"1gb-pages":true}`, gated behind its own >=3 GiB/NUMA-node free check), XMRig's reported
-# "hugepages" total mixes 1 GB-page and 2 MB-page units (HugePagesInfo.cpp:26-30 vs :32-34, summed with no
-# conversion) and no longer corresponds 1:1 to `/proc/sys/vm/nr_hugepages`, so the predicted-value formula above
+# `"randomx":{"1gb-pages":true}`, gated behind its own >=3 GiB/NUMA-node free check), smaps_rollup's
+# Private_Hugetlb/Shared_Hugetlb fields (Round 5b) sum 1 GB-page and 2 MB-page mappings into the SAME byte
+# counters with no way to tell them apart (and the API's own total mixed units here too - HugePagesInfo.cpp:26-
+# 30 vs :32-34, summed with no conversion), so neither corresponds 1:1 to `/proc/sys/vm/nr_hugepages`'s own 2 MB
+# units, and the predicted-value formula above
 # does not apply. finalize_rx_hugepages detects this from config.json itself (the same file h-config.sh wrote)
 # and refuses to finalize for that session - logged once, record kept, exactly like any other unconfirmed case.
 HUGEPAGES_FILE="$STATEDIR/.bloxminer-hugepages"
@@ -185,6 +208,43 @@ _hp_boot_id() { local f="${BLOX_PROCFS_ROOT:-/proc}/sys/kernel/random/boot_id"; 
 # _hp_free_hugepages - HugePages_Free from /proc/meminfo (BLOX_PROCFS_ROOT overridable for tests). Empty/absent
 # on any read failure - callers treat that exactly like any other missing precondition (never finalize).
 _hp_free_hugepages() { awk '/^HugePages_Free:/{print $2; exit}' "${BLOX_PROCFS_ROOT:-/proc}/meminfo" 2>/dev/null; }
+
+# _hp_hugepage_size_kb - Hugepagesize (kB) from /proc/meminfo (BLOX_PROCFS_ROOT overridable for tests). Round
+# 5b: this is what /proc/sys/vm/nr_hugepages AND /proc/<pid>/smaps_rollup's Hugetlb fields are both denominated
+# in - never hardcoded to 2048, even though that is every observed rig's actual value, since nothing forces it.
+_hp_hugepage_size_kb() { awk '/^Hugepagesize:/{print $2; exit}' "${BLOX_PROCFS_ROOT:-/proc}/meminfo" 2>/dev/null; }
+
+# _hp_xmrig_need_pages <owner pid> - KERNEL TRUTH of how many huge pages that ownership-verified xmrig process
+# actually has mapped right now (Private_Hugetlb + Shared_Hugetlb from ITS OWN /proc/<pid>/smaps_rollup, never
+# any other process's), in units of _hp_hugepage_size_kb. Prints nothing - caller treats that as "unreadable or
+# incomplete", fails safe, never finalizes - unless both Hugetlb fields are present, numeric, a valid
+# Hugepagesize was read, and the byte total divides evenly into whole pages.
+# ROUND 5b: replaces trusting the xmrig HTTP API's own "hugepages":[allocated,total] for this number. Proven
+# wrong live on cask18, 2026-09-29 (2c89cc4c/commit 12e9cfa): record prior=0/prelim=1200/free0=1200, API
+# reported [1200,1200] (fully allocated), but live vm.nr_hugepages was really 1201 and Round 5's formula (using
+# the API's total) called that an unexplained foreign conflict - when smaps_rollup showed Private_Hugetlb=
+# 2459648 kB = exactly 1201 x 2048 kB, matching live exactly. Root cause: the API's total is built from
+# HugePagesInfo, which only ever counts allocations that went through xmrig::VirtualMemory::reserve()-backed
+# paths (VirtualMemory_unix.cpp:233-236/259, one per dataset/scratchpad) - but RandomX's JIT code buffer is
+# allocated by a SEPARATE path, xmrig::VirtualMemory::allocateExecutableMemory (VirtualMemory_unix.cpp:142-176,
+# called from crypto/randomx/jit_compiler_x86.cpp's JitCompilerX86 via crypto/randomx/virtual_memory.cpp:36-37)
+# which on Linux (VirtualMemory_unix.cpp:165-171) mmaps MAP_HUGETLB directly, with NO LinuxMemory::reserve()
+# call and NO HugePagesInfo bookkeeping - so it consumes a real huge page the kernel actually committed, yet is
+# completely invisible to XMRig's own self-reported total. Reading /proc/<pid>/smaps_rollup instead asks the
+# kernel what is ACTUALLY mapped, not what XMRig's own (incomplete) accounting claims - it cannot miss this or
+# any other future untracked allocation the same way. The xmrig HTTP API's hugepages field is kept ONLY as a
+# readiness signal (allocated==total, in finalize_rx_hugepages) - never again as the source of the "need" value.
+_hp_xmrig_need_pages() {
+	local f="${BLOX_PROCFS_ROOT:-/proc}/$1/smaps_rollup" priv shared hpkb
+	[[ -r $f ]] || return 0
+	priv=$(awk '/^Private_Hugetlb:/{print $2; exit}' "$f" 2>/dev/null)
+	shared=$(awk '/^Shared_Hugetlb:/{print $2; exit}' "$f" 2>/dev/null)
+	[[ $priv =~ ^[0-9]+$ && $shared =~ ^[0-9]+$ ]] || return 0
+	hpkb=$(_hp_hugepage_size_kb)
+	[[ $hpkb =~ ^[0-9]+$ && $hpkb -gt 0 ]] || return 0
+	(( (priv + shared) % hpkb == 0 )) || return 0   # not a whole number of pages - inconsistent, never guess
+	echo $(( (priv + shared) / hpkb ))
+}
 
 # _hp_rewrite <final> [ours] - atomically rewrites the record, keeping prior/prelim/free0/boot as they already
 # are and setting only `final` (and `ours`, when given - only ever passed on a successful finalisation).
@@ -296,16 +356,21 @@ finalize_rx_hugepages() {
 	sum=$(curl -fsS --max-time 0.5 "http://127.0.0.1:$api_port/2/summary" 2>/dev/null)
 	jq -e 'type == "object"' > /dev/null 2>&1 <<< "$sum" || return 0
 
+	# ---- readiness ONLY (Round 5b: no longer the source of the "need" value used below - see
+	# _hp_xmrig_need_pages's comment for why the API's own total undercounts by the RandomX JIT buffer).
+	# allocated==total is still a useful proxy for "XMRig's own allocator has stopped moving" before trusting a
+	# kernel snapshot of what it actually mapped.
 	local hp_allocated hp_total
 	hp_allocated=$(jq -r '(.hugepages[0]) // empty' <<< "$sum" 2>/dev/null)
 	hp_total=$(jq -r '(.hugepages[1]) // empty' <<< "$sum" 2>/dev/null)
 	[[ $hp_allocated =~ ^[0-9]+$ && $hp_total =~ ^[0-9]+$ && $hp_total -gt 0 ]] || return 0
 	(( hp_allocated == hp_total )) || return 0   # dataset/scratchpads still being allocated - retry next poll
 
-	# ---- documented limitation: 1 GB-pages mixes units into the same "hugepages" total (see the top-of-section
-	# comment) - this package's arithmetic below does not apply; never finalize this session.
+	# ---- documented limitation: 1 GB-pages aggregates into the same smaps_rollup Hugetlb byte counters with no
+	# way to tell 2 MB pages and 1 GB pages apart, so dividing by _hp_hugepage_size_kb below would not correctly
+	# recover a 2 MB-page count either - this package's arithmetic does not apply; never finalize this session.
 	if [[ $(jq -r '(.randomx["1gb-pages"] // false)' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null) == true ]]; then
-		log_hugepages_note "BloxMiner: RandomX 1gb-pages is enabled - XMRig's reported hugepage total mixes 1GB/2MB units, so this package's finalization arithmetic does not apply; never finalizing this rx session, ownership record kept"
+		log_hugepages_note "BloxMiner: RandomX 1gb-pages is enabled - XMRig's actual huge-page mapping mixes 1GB/2MB units, so this package's finalization arithmetic does not apply; never finalizing this rx session, ownership record kept"
 		_hp_rewrite conflict
 		return 0
 	fi
@@ -314,20 +379,30 @@ finalize_rx_hugepages() {
 	prior=$(_hp_field prior); prelim=$(_hp_field prelim); free0=$(_hp_field free0)
 	[[ $prior =~ ^[0-9]+$ && $prelim =~ ^[0-9]+$ && $free0 =~ ^[0-9]+$ ]] || return 0   # corrupt record - never finalize
 
-	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" cur
-	cur=""; [[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
-	[[ $cur =~ ^[0-9]+$ ]] || return 0
-
-	local short=$(( hp_total - free0 )); (( short < 0 )) && short=0
-	local predicted=$(( prelim + short ))
-
-	if [[ $cur != "$predicted" ]]; then
-		log_hugepages_note "BloxMiner: vm.nr_hugepages ($cur) does not match XMRig's own predicted reservation (prelim $prelim + max(0, need $hp_total - free0 $free0) = $predicted) once the dataset finished allocating - something else changed it during the startup window; never finalizing this rx session, record kept"
+	# ---- Round 5b: KERNEL TRUTH of what this exact, ownership-verified xmrig process actually has mapped -
+	# never a foreign pid's smaps_rollup (owner_pid was already positively confirmed above), never the API's
+	# own (incomplete) self-report. Missing/unreadable/incomplete -> fail safe, log once, never finalize.
+	local need_pages; need_pages=$(_hp_xmrig_need_pages "$owner_pid")
+	if [[ ! $need_pages =~ ^[0-9]+$ || $need_pages -le 0 ]]; then
+		log_hugepages_note "BloxMiner: could not read a complete huge-page mapping from /proc/$owner_pid/smaps_rollup (Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
 		_hp_rewrite conflict
 		return 0
 	fi
 
-	_hp_rewrite 1 "$cur"   # everything XMRig itself raised, positively confirmed, nothing foreign involved
+	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" cur
+	cur=""; [[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
+	[[ $cur =~ ^[0-9]+$ ]] || return 0
+
+	local short=$(( need_pages - free0 )); (( short < 0 )) && short=0
+	local predicted=$(( prelim + short ))
+
+	if [[ $cur != "$predicted" ]]; then
+		log_hugepages_note "BloxMiner: vm.nr_hugepages ($cur) does not match XMRig's own predicted reservation (prelim $prelim + max(0, need $need_pages - free0 $free0) = $predicted, need from /proc/$owner_pid/smaps_rollup) once the dataset finished allocating - something else changed it during the startup window; never finalizing this rx session, record kept"
+		_hp_rewrite conflict
+		return 0
+	fi
+
+	_hp_rewrite 1 "$cur"   # everything XMRig itself raised, positively confirmed via its own kernel-mapped huge pages, nothing foreign involved
 }
 
 # restore_verus_hugepages - called just before exec'ing the verus engine. ONLY if a record exists (a fresh
