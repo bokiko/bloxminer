@@ -341,6 +341,49 @@ SYSCTL_FAIL=0
 if sysctl_called; then ok "failed sysctl write: a restore WAS attempted (nr_hugepages still matched ours)"; else bad "failed sysctl write: a restore WAS attempted" "$(cat "$SYSCTL_LOG")"; fi
 if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before2" ]]; then ok "failed sysctl write: ownership record RETAINED, not dropped"; else bad "failed sysctl write: ownership record RETAINED" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING)"; fi
 
+# ---- NEW (Round 3): ANY single missing/corrupt piece of the record, or an unreadable CURRENT value, must
+#      NEVER fall through to a restore attempt - the restore fires only when prior, ours, AND the live current
+#      value are all valid numbers AND current == ours. Every other case here: no sysctl call, the record is
+#      RETAINED (never dropped - a permanently corrupt record just stays on tmpfs until a reboot clears it),
+#      and a log line explains why.
+hconfig "p:1" "W" "" "" ""   # a valid verus config throughout this block - only the hugepage record is corrupted
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= missing entirely
+: > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "missing ours -> no sysctl call, record retained, logged"; else bad "missing ours -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=banana\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= non-numeric
+: > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt ours (non-numeric) -> no sysctl call, record retained, logged"; else bad "corrupt ours (non-numeric) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=banana\nours=512\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # prior= non-numeric
+: > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt prior -> no sysctl call, record retained, logged"; else bad "corrupt prior -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\n' > "$HUGEFILE"; rm -f "$PROCFILE"   # current value unreadable
+: > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "could not read the current" "$T/log/bloxminer.log" 2>/dev/null; then ok "unreadable current value -> no sysctl call, record retained, logged"; else bad "unreadable current value -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+echo 512 > "$PROCFILE"
+
+# note_rx_hugepages_start itself must never WRITE a record with an invalid "ours": simulate a `hugepages -rx`
+# that leaves the current value unreadable afterwards (e.g. a transient /proc glitch) - no record at all, logged
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+cat > "$FAKEBIN/hugepages" <<'SH'
+#!/bin/sh
+echo "hugepages $*" >> "$SYSCTL_LOG"
+[ "$1" = "-rx" ] && rm -f "$PROCFILE"
+exit 0
+SH
+echo 0 > "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable post-reservation value -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable post-reservation value -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+cat > "$FAKEBIN/hugepages" <<'SH'
+#!/bin/sh
+echo "hugepages $*" >> "$SYSCTL_LOG"
+[ "$1" = "-rx" ] && echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+exit 0
+SH
+chmod +x "$FAKEBIN/hugepages"
+
 # ============================================================== 7. stats never from the previous engine
 # Neither fixture engine's real API is running here, so each one falls back to its own DEFINED no-API answer
 # (see each engine's own gated h-stats.sh): verus (unchanged, gated behaviour) reports empty stats outright;

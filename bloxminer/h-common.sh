@@ -121,7 +121,10 @@ log_hugepages_note() {
 # own already-raised value would become the "prior" restored on the next Verus start): reads the CURRENT
 # vm.nr_hugepages ("prior"), runs Hive's `hugepages -rx` if present (see the top comment for why), then reads
 # vm.nr_hugepages again ("ours" - the value this package is now entitled to restore FROM). No-op entirely (no
-# sysctl/proc access at all) if the record already exists or the current value cannot be read.
+# sysctl/proc access at all, no record written) if the record already exists, "prior" cannot be read, OR
+# "ours" cannot be read afterwards - a record is only ever written when BOTH values are known-good numbers;
+# writing one with a missing/invalid "ours" would let restore_verus_hugepages's own strict check (below) never
+# fire safely, so this function simply never produces that record in the first place.
 note_rx_hugepages_start() {
 	[[ -e $HUGEPAGES_FILE ]] && return 0
 	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior post tmp
@@ -129,10 +132,11 @@ note_rx_hugepages_start() {
 	prior=$(<"$proc") 2>/dev/null
 	[[ $prior =~ ^[0-9]+$ ]] || return 0
 	{ command -v hugepages > /dev/null 2>&1 && hugepages -rx; } > /dev/null 2>&1
-	post=$prior
-	if [[ -r $proc ]]; then
-		local p2; p2=$(<"$proc") 2>/dev/null
-		[[ $p2 =~ ^[0-9]+$ ]] && post=$p2
+	post=""
+	[[ -r $proc ]] && post=$(<"$proc") 2>/dev/null
+	if [[ ! $post =~ ^[0-9]+$ ]]; then
+		log_hugepages_note "BloxMiner: could not read vm.nr_hugepages after reserving for rx ($proc unreadable/invalid) - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
+		return 0
 	fi
 	tmp="$HUGEPAGES_FILE.tmp.$$"
 	{ printf 'prior=%s\nours=%s\n' "$prior" "$post" > "$tmp"; } 2>/dev/null && mv -f "$tmp" "$HUGEPAGES_FILE" 2>/dev/null
@@ -140,27 +144,41 @@ note_rx_hugepages_start() {
 
 # restore_verus_hugepages - called just before exec'ing the verus engine. ONLY if a record exists (a fresh
 # install, or a Verus start never preceded by an rx start under this package's ownership, touches
-# vm.nr_hugepages at all): if the CURRENT value no longer matches the recorded "ours" - something else changed
-# it since this package's own rx reservation - this is no longer a value this package owns; it is left
-# completely untouched, the conflict is logged, and the record is KEPT (not dropped: a later Verus start may
-# find the value has settled back to "ours" and can then complete the restore, and dropping the record here
-# would silently abandon "prior" forever with no other trace of it). Otherwise restores vm.nr_hugepages to
-# "prior" - the record is removed ONLY once that write is confirmed to have succeeded; a failed write (e.g.
-# permission denied) leaves the record in place for the next Verus start to retry, rather than silently
-# forgetting "prior".
+# vm.nr_hugepages at all). The restore fires ONLY when ALL THREE of "prior", "ours" (both from the record) and
+# the CURRENT value (read fresh, right now) are valid, non-negative integers AND current == ours - i.e. this
+# package can positively confirm the live value is still exactly what it itself last set. Any single one of
+# those being missing, non-numeric, or unreadable - a corrupt/legacy-shaped record, a "randomx"-only partial
+# write, an unreadable /proc - is treated exactly like a live mismatch: vm.nr_hugepages is left COMPLETELY
+# untouched, never a "restore anyway" fallback on partial information. In every one of those non-restoring
+# cases the record is KEPT, never dropped: a permanently corrupt record has nowhere better to go than staying
+# on tmpfs (STATEDIR is /run/hive when present) until the next reboot clears it along with the non-persistent
+# reservation it describes - silently deleting it would erase the one place "prior" is recorded, for no gain.
+# The record is removed ONLY once an actual restore write is confirmed to have succeeded; a failed write
+# (e.g. permission denied) also keeps it, for the next Verus start to retry.
 restore_verus_hugepages() {
 	[[ -e $HUGEPAGES_FILE ]] || return 0
 	local prior ours cur proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages"
 	prior=$(sed -n 's/^prior=//p' "$HUGEPAGES_FILE" 2>/dev/null)
 	ours=$(sed -n 's/^ours=//p' "$HUGEPAGES_FILE" 2>/dev/null)
-	if [[ ! $prior =~ ^[0-9]+$ ]]; then rm -f "$HUGEPAGES_FILE" 2>/dev/null; return 0; fi   # corrupt/unreadable record: nothing usable
 	cur=""; [[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
-	if [[ -n $ours && $ours =~ ^[0-9]+$ && -n $cur && $cur != "$ours" ]]; then
+
+	if [[ ! $prior =~ ^[0-9]+$ || ! $ours =~ ^[0-9]+$ ]]; then
+		log_hugepages_note "BloxMiner: huge-page ownership record is invalid or corrupt (prior=${prior:-<missing>}, ours=${ours:-<missing>}) - left vm.nr_hugepages untouched, record kept"
+		return 0
+	fi
+	if [[ ! $cur =~ ^[0-9]+$ ]]; then
+		log_hugepages_note "BloxMiner: could not read the current vm.nr_hugepages ($proc unreadable) - left untouched, record kept (ours=$ours, prior=$prior)"
+		return 0
+	fi
+	if [[ $cur != "$ours" ]]; then
 		log_hugepages_note "BloxMiner: vm.nr_hugepages changed outside this package (ours=$ours, now=$cur) - left untouched, prior=$prior kept on record"
 		return 0
 	fi
+
 	if command -v sysctl > /dev/null 2>&1 && sysctl -q -w vm.nr_hugepages="$prior" 2>/dev/null; then
 		rm -f "$HUGEPAGES_FILE" 2>/dev/null   # only consumed once the restore is verified to have succeeded
+	else
+		log_hugepages_note "BloxMiner: failed to restore vm.nr_hugepages to $prior - record kept for a later attempt"
 	fi
 	true
 }
