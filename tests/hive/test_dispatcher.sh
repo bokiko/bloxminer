@@ -259,34 +259,56 @@ fi
 
 # ============================================================== 6. huge-page ownership handoff: ONLY the
 #    reservation this package itself made is ever touched - never a blind host-wide reset, and never restored
-#    over the top of a change something else made since. The record holds "prior" (what to restore) AND
-#    "ours" (the value this package itself last set, captured by calling the same idempotent `hugepages -rx`
-#    Hive tool the rx engine's own h-run.sh calls - see h-common.sh's top-of-section comment for why) - a
-#    Verus start only ever restores when the CURRENT value still equals "ours"; otherwise it is left alone, a
+#    over the top of a change something else made since. note_rx_hugepages_start (rx start, h-run.sh) records
+#    prior=/prelim=/free0=/boot=/final=0; a Verus start only ever restores when final=1 (finalize_rx_hugepages,
+#    h-stats.sh - tested end to end, including the whole cask18 scenario, in tests/hive/test_hugepage_
+#    finalization.sh) AND the CURRENT value still equals the finalized "ours"; otherwise it is left alone, a
 #    conflict is logged, and the record is KEPT (never silently dropped) for a later attempt. A failed restore
-#    write also keeps the record - it is consumed ONLY on a verified, successful restore.
+#    write also keeps the record - it is consumed ONLY on a verified, successful (readback-checked) restore.
+#    This section covers note_rx_hugepages_start's OWN field-writing/never-overwrite behaviour and restore_
+#    verus_hugepages's OWN gating/atomicity - `finalize_record_for_test` stands in for finalize_rx_hugepages
+#    (which needs a real xmrig HTTP API, out of scope for this file) by writing exactly what it would have
+#    written on success, so restore's own logic can be exercised without duplicating the finalization suite.
 setup_pkg
 FAKEBIN="$T/fakebin"; mkdir -p "$FAKEBIN"
-PROCROOT="$T/proc"; mkdir -p "$PROCROOT/sys/vm"
+PROCROOT="$T/proc"; mkdir -p "$PROCROOT/sys/vm" "$PROCROOT/sys/kernel/random"
 PROCFILE="$PROCROOT/sys/vm/nr_hugepages"
+MEMINFO="$PROCROOT/meminfo"
+BOOTFILE="$PROCROOT/sys/kernel/random/boot_id"
+printf 'boot-TEST-CONSTANT\n' > "$BOOTFILE"
 cat > "$FAKEBIN/sysctl" <<'SH'
 #!/bin/sh
 echo "sysctl $*" >> "$SYSCTL_LOG"
 [ "${SYSCTL_FAIL:-0}" = "1" ] && exit 1
+# Round 5: restore_verus_hugepages now reads vm.nr_hugepages BACK after this call and only removes the record
+# if it really changed - so this fake must really write it, not just log the call and exit 0.
+for a in "$@"; do case $a in vm.nr_hugepages=*) echo "${a#vm.nr_hugepages=}" > "$PROCFILE" ;; esac; done
 exit 0
 SH
 chmod +x "$FAKEBIN/sysctl"
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
 echo "hugepages $*" >> "$SYSCTL_LOG"
-[ "$1" = "-rx" ] && echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+if [ "$1" = "-rx" ]; then
+	echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+	printf 'HugePages_Free:  %8d kB\n' "${HUGEPAGES_FREE0:-100}" > "$MEMINFO"
+fi
 exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
-SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE
+SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE MEMINFO BOOTFILE
 sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
 hugepages_called() { grep -q '^hugepages ' "$SYSCTL_LOG" 2>/dev/null; }
-run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # engine binary absent -> exec fails after the hugepage step, harmless here
+run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # engine binary absent -> exec fails after the hugepage step, harmless here
+# marks the CURRENT record final=1, ours=<live nr_hugepages> - simulates a successful finalize_rx_hugepages
+# poll (real end-to-end finalization behaviour, including the exact xmrig-src-derived formula, is covered in
+# tests/hive/test_hugepage_finalization.sh) so this section can test restore_verus_hugepages's OWN logic.
+finalize_record_for_test() {
+	local prior prelim free0 boot
+	prior=$(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null); prelim=$(sed -n 's/^prelim=//p' "$HUGEFILE" 2>/dev/null)
+	free0=$(sed -n 's/^free0=//p' "$HUGEFILE" 2>/dev/null); boot=$(sed -n 's/^boot=//p' "$HUGEFILE" 2>/dev/null)
+	printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nfinal=1\nours=%s\n' "$prior" "$prelim" "$free0" "$boot" "$(cat "$PROCFILE")" > "$HUGEFILE"
+}
 
 # ---- fresh verus start, a foreign reservation already on the box (512), no ownership record -> untouched
 echo 512 > "$PROCFILE"
@@ -299,15 +321,20 @@ fi
 if [[ $(cat "$PROCFILE") == 512 ]]; then ok "fresh verus start: host's own nr_hugepages value (512) left as-is"; else bad "fresh verus start: host's own nr_hugepages value (512) left as-is" "$(cat "$PROCFILE")"; fi
 
 # ---- rx start (from the 512 baseline) -> runs `hugepages -rx` itself (idempotent with rx's own later call),
-#      records prior=512 (what was there before) and ours=1200 (what it just set, via the fake tool)
-HUGEPAGES_TARGET=1200
+#      records prior=512 (what was there before), prelim=1200 (post-`hugepages -rx`, via the fake tool),
+#      free0=100 (fake HugePages_Free), boot=the fixture's boot_id, and final=0 - NOT "ours" any more (Round 5:
+#      only finalize_rx_hugepages, proven separately, ever writes that - see the top-of-section comment)
+HUGEPAGES_TARGET=1200; HUGEPAGES_FREE0=100
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-if [[ $(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null) == 512 && $(sed -n 's/^ours=//p' "$HUGEFILE" 2>/dev/null) == 1200 ]]; then
-	ok "rx start: records prior=512 (pre-rx) and ours=1200 (post-rx, via hugepages -rx)"
+rec1=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec1") == 512 && $(sed -n 's/^prelim=//p' <<< "$rec1") == 1200 \
+      && $(sed -n 's/^free0=//p' <<< "$rec1") == 100 && $(sed -n 's/^boot=//p' <<< "$rec1") == boot-TEST-CONSTANT \
+      && $(sed -n 's/^final=//p' <<< "$rec1") == 0 && -z $(sed -n 's/^ours=//p' <<< "$rec1") ]]; then
+	ok "rx start: records prior=512, prelim=1200, free0=100, boot, final=0 (no ours= yet)"
 else
-	bad "rx start: records prior=512 (pre-rx) and ours=1200 (post-rx, via hugepages -rx)" "$(cat "$HUGEFILE" 2>/dev/null)"
+	bad "rx start: records prior=512, prelim=1200, free0=100, boot, final=0 (no ours= yet)" "$rec1"
 fi
-# a FRESH rx start calls `hugepages -rx` TWICE: once from note_rx_hugepages_start itself (to observe "ours"),
+# a FRESH rx start calls `hugepages -rx` TWICE: once from note_rx_hugepages_start itself (to observe "prelim"),
 # once more from engines/rx/h-run.sh's own unchanged, unconditional call right after exec - both hit the same
 # fake tool here, so counting (not just presence) is what actually distinguishes a fresh start from a restart
 # below. Never sysctl directly (that only ever happens on a Verus start).
@@ -318,42 +345,53 @@ if [[ $(cat "$PROCFILE") == 1200 ]]; then ok "rx start: nr_hugepages actually ra
 #      note_rx_hugepages_start returns immediately without calling hugepages itself: only ONE call this time
 #      (the rx engine's own unconditional one), not two, and no overwrite of the existing record
 hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run
-if [[ $(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null) == 512 && $(sed -n 's/^ours=//p' "$HUGEFILE" 2>/dev/null) == 1200 ]]; then ok "rx restarted: existing record (prior=512/ours=1200) NOT overwritten"; else bad "rx restarted: existing record NOT overwritten" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
+if [[ $(cat "$HUGEFILE" 2>/dev/null) == "$rec1" ]]; then ok "rx restarted: existing record (prior=512/prelim=1200/final=0) NOT overwritten"; else bad "rx restarted: existing record NOT overwritten" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
 if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "rx restarted: hugepages -rx called only ONCE (the engine's own; this dispatcher's own call is skipped)"; else bad "rx restarted: hugepages -rx called only ONCE" "$(cat "$SYSCTL_LOG")"; fi
 
-# ---- verus after two rx starts, nr_hugepages still == ours (1200, nothing else touched it) -> restored to
-#      the ORIGINAL prior (512), record removed
+# ---- verus with final=0 (never finalized yet) -> must NEVER restore, even though current == prelim (1200):
+#      Round 5's whole point is that "current == the value right after `hugepages -rx`" is NOT sufficient proof
+#      any more - only a finalized "ours" is.
+: > "$SYSCTL_LOG"; hconfig "p:1" "W" "" "" ""; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]]; then ok "verus with final=0: never restores, even though current==prelim (1200)"; else bad "verus with final=0: never restores" "$(cat "$SYSCTL_LOG")"; fi
+if grep -q "not finalized" "$T/log/bloxminer.log" 2>/dev/null; then ok "verus with final=0: logged as not-yet-finalized"; else bad "verus with final=0: logged as not-yet-finalized" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+# ---- NOW finalize (simulating h-stats.sh having proven it - see test_hugepage_finalization.sh) -> verus
+#      restores to the ORIGINAL prior (512), record removed, readback verified
+finalize_record_for_test
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
-if grep -q "nr_hugepages=512" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (restarted twice): restored to the ORIGINAL prior value (512)"; else bad "verus after rx (restarted twice): restored to the ORIGINAL prior value (512)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
-if [[ ! -e $HUGEFILE ]]; then ok "verus after rx: ownership record removed (restore verified successful)"; else bad "verus after rx: ownership record removed" "still present: $(cat "$HUGEFILE")"; fi
+if grep -q "nr_hugepages=512" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after finalization: restored to the ORIGINAL prior value (512)"; else bad "verus after finalization: restored to the ORIGINAL prior value (512)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
+if [[ ! -e $HUGEFILE ]]; then ok "verus after finalization: ownership record removed (restore verified successful)"; else bad "verus after finalization: ownership record removed" "still present: $(cat "$HUGEFILE")"; fi
 
 # ---- verus again, no record (already consumed above) -> no sysctl call at all
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "verus with no record -> no sysctl call" "$(cat "$SYSCTL_LOG")"; fi
 
-# ---- rx from a 0 baseline -> verus restores to 0 (not just non-zero values are handled correctly)
+# ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+finalize_record_for_test
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
-if grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (0 baseline): restored to 0"; else bad "verus after rx (0 baseline): restored to 0" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
+if grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (0 baseline), finalized: restored to 0"; else bad "verus after rx (0 baseline), finalized: restored to 0" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
 
-# ---- NEW: something else changes nr_hugepages AFTER this package's own rx reservation (foreign write, e.g.
-#      another workload or an operator) -> the next Verus start must NEVER overwrite it: left untouched, the
-#      conflict is logged (own log file, not a Hive toast - this is not fatal), and the record is KEPT (not
-#      dropped) so a later attempt still has "prior" on file.
+# ---- something else changes nr_hugepages AFTER finalization (foreign write, e.g. another workload or an
+#      operator) -> the next Verus start must NEVER overwrite it: left untouched, the conflict is logged (own
+#      log file, not a Hive toast - this is not fatal), and the record is KEPT (not dropped) so a later attempt
+#      still has "prior" on file.
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"; rm -f "$T/log/bloxminer.log"
-hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, ours=1200
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, prelim=1200
+finalize_record_for_test   # final=1, ours=1200
 echo 777 > "$PROCFILE"   # a THIRD party changes it - no longer "ours" (1200)
 recorded_before=$(cat "$HUGEFILE")
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
-if ! sysctl_called && [[ $(cat "$PROCFILE") == 777 ]]; then ok "foreign change after rx start (1200 -> 777): Verus start never overwrites it"; else bad "foreign change after rx start: Verus start never overwrites it" "sysctl_log=$(cat "$SYSCTL_LOG") proc=$(cat "$PROCFILE")"; fi
+if ! sysctl_called && [[ $(cat "$PROCFILE") == 777 ]]; then ok "foreign change after finalization (1200 -> 777): Verus start never overwrites it"; else bad "foreign change after finalization: Verus start never overwrites it" "sysctl_log=$(cat "$SYSCTL_LOG") proc=$(cat "$PROCFILE")"; fi
 if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before" ]]; then ok "foreign change: ownership record KEPT unchanged (prior=0/ours=1200), not dropped"; else bad "foreign change: ownership record KEPT unchanged" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING)"; fi
 if [[ -f $T/log/bloxminer.log ]] && grep -q "changed outside this package" "$T/log/bloxminer.log"; then ok "foreign change: conflict logged to this package's own log"; else bad "foreign change: conflict logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-# ---- NEW: nr_hugepages still == ours (no conflict), but the sysctl WRITE itself fails (e.g. permission
-#      denied) -> the record must be RETAINED, never dropped on a failed attempt
+# ---- nr_hugepages still == ours (no conflict), but the sysctl WRITE itself fails (e.g. permission denied) ->
+#      the record must be RETAINED, never dropped on a failed attempt
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"; rm -f "$T/log/bloxminer.log"
-hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, ours=1200 (nr_hugepages is 1200 now)
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, prelim=1200 (nr_hugepages is 1200 now)
+finalize_record_for_test   # final=1, ours=1200
 recorded_before2=$(cat "$HUGEFILE")
 SYSCTL_FAIL=1
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
@@ -361,30 +399,31 @@ SYSCTL_FAIL=0
 if sysctl_called; then ok "failed sysctl write: a restore WAS attempted (nr_hugepages still matched ours)"; else bad "failed sysctl write: a restore WAS attempted" "$(cat "$SYSCTL_LOG")"; fi
 if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before2" ]]; then ok "failed sysctl write: ownership record RETAINED, not dropped"; else bad "failed sysctl write: ownership record RETAINED" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING)"; fi
 
-# ---- NEW (Round 3): ANY single missing/corrupt piece of the record, or an unreadable CURRENT value, must
+# ---- Round 3: ANY single missing/corrupt piece of a FINALIZED record, or an unreadable CURRENT value, must
 #      NEVER fall through to a restore attempt - the restore fires only when prior, ours, AND the live current
 #      value are all valid numbers AND current == ours. Every other case here: no sysctl call, the record is
 #      RETAINED (never dropped - a permanently corrupt record just stays on tmpfs until a reboot clears it),
-#      and a log line explains why.
+#      and a log line explains why. (final=1 is included in every fixture below - these test the NEXT gate
+#      down, not the final=1 gate itself, which section 6's earlier "verus with final=0" case already covers.)
 hconfig "p:1" "W" "" "" ""   # a valid verus config throughout this block - only the hugepage record is corrupted
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= missing entirely
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= missing entirely
 : > "$SYSCTL_LOG"; run_h_run
-if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "missing ours -> no sysctl call, record retained, logged"; else bad "missing ours -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "missing ours (final=1) -> no sysctl call, record retained, logged"; else bad "missing ours (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=banana\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= non-numeric
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=banana\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= non-numeric
 : > "$SYSCTL_LOG"; run_h_run
-if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt ours (non-numeric) -> no sysctl call, record retained, logged"; else bad "corrupt ours (non-numeric) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt ours (non-numeric, final=1) -> no sysctl call, record retained, logged"; else bad "corrupt ours (non-numeric, final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=banana\nours=512\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # prior= non-numeric
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=banana\nours=512\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # prior= non-numeric
 : > "$SYSCTL_LOG"; run_h_run
-if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt prior -> no sysctl call, record retained, logged"; else bad "corrupt prior -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt prior (final=1) -> no sysctl call, record retained, logged"; else bad "corrupt prior (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\n' > "$HUGEFILE"; rm -f "$PROCFILE"   # current value unreadable
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\nfinal=1\n' > "$HUGEFILE"; rm -f "$PROCFILE"   # current value unreadable
 : > "$SYSCTL_LOG"; run_h_run
-if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "could not read the current" "$T/log/bloxminer.log" 2>/dev/null; then ok "unreadable current value -> no sysctl call, record retained, logged"; else bad "unreadable current value -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "could not read the current" "$T/log/bloxminer.log" 2>/dev/null; then ok "unreadable current value (final=1) -> no sysctl call, record retained, logged"; else bad "unreadable current value (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 echo 512 > "$PROCFILE"
 
-# note_rx_hugepages_start itself must never WRITE a record with an invalid "ours": simulate a `hugepages -rx`
+# note_rx_hugepages_start itself must never WRITE a record with an invalid "prelim": simulate a `hugepages -rx`
 # that leaves the current value unreadable afterwards (e.g. a transient /proc glitch) - no record at all, logged
 rm -f "$HUGEFILE" "$T/log/bloxminer.log"
 cat > "$FAKEBIN/hugepages" <<'SH'
@@ -395,14 +434,52 @@ exit 0
 SH
 echo 0 > "$PROCFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable post-reservation value -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable post-reservation value -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
 echo "hugepages $*" >> "$SYSCTL_LOG"
-[ "$1" = "-rx" ] && echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+if [ "$1" = "-rx" ]; then
+	echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+	printf 'HugePages_Free:  %8d kB\n' "${HUGEPAGES_FREE0:-100}" > "$MEMINFO"
+fi
 exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
+
+# note_rx_hugepages_start must also never WRITE a record with an invalid "free0" (Round 5 - HugePages_Free is
+# the other value finalize_rx_hugepages's predicted-total formula needs): simulate a fake `hugepages -rx` that
+# leaves meminfo unreadable - no record at all, logged
+rm -f "$HUGEFILE" "$T/log/bloxminer.log" "$MEMINFO"
+cat > "$FAKEBIN/hugepages" <<'SH'
+#!/bin/sh
+echo "hugepages $*" >> "$SYSCTL_LOG"
+if [ "$1" = "-rx" ]; then
+	echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+	rm -f "$MEMINFO"
+fi
+exit 0
+SH
+echo 0 > "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+cat > "$FAKEBIN/hugepages" <<'SH'
+#!/bin/sh
+echo "hugepages $*" >> "$SYSCTL_LOG"
+if [ "$1" = "-rx" ]; then
+	echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+	printf 'HugePages_Free:  %8d kB\n' "${HUGEPAGES_FREE0:-100}" > "$MEMINFO"
+fi
+exit 0
+SH
+chmod +x "$FAKEBIN/hugepages"
+
+# legacy (pre-Round-5) record: only prior=/ours=, no final= line at all - never trusted for a restore (missing
+# final never equals "1"), left untouched until the next reboot clears tmpfs; no migration code needed.
+hconfig "p:1" "W" "" "" ""   # a verus config, so run_h_run below actually exercises restore_verus_hugepages
+rm -f "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\n' > "$HUGEFILE"; echo 1200 > "$PROCFILE"
+: > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "not finalized" "$T/log/bloxminer.log" 2>/dev/null; then ok "legacy pre-Round-5 record (no final=): never restored, kept, logged"; else bad "legacy pre-Round-5 record (no final=): never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+rm -f "$HUGEFILE"
 
 # ============================================================== 7. stats never from the previous engine
 # Neither fixture engine's real API is running here, so each one falls back to its own DEFINED no-API answer
@@ -499,6 +576,161 @@ if [[ $(cat "$CONF") == "$before_err_conf" ]]; then ok "Hive-sourced bad algo: c
 hive_sourced "" "W" "" "" "verus"
 if [[ -n $survived && $rc != 0 ]]; then ok "Hive-sourced engine-level failure (empty URL): caller survives"; else bad "Hive-sourced engine-level failure (empty URL): caller survives" "$out"; fi
 if [[ $pwd_after == "$T" ]]; then ok "Hive-sourced engine-level failure (empty URL): caller cwd unchanged"; else bad "Hive-sourced engine-level failure (empty URL): caller cwd unchanged" "pwd_after=$pwd_after out=$out"; fi
+
+# ============================================================== 10. Round 5 (Codex test-gap review): h-run.sh
+#    SOURCED, exactly as Hive's real supervisor loop does it (hive-ref/miner-run:189-211,247 - `( run_miner )`,
+#    a SUBSHELL, calls miner_export_params (source h-manifest.conf + h-config.sh) then `source $MINER_DIR/
+#    h-run.sh`, all inside that one subshell per miner-start iteration). Section 8 above only runs h-run.sh
+#    EXECUTED (`bash h-run.sh`), which - since the engine binaries are absent in this fixture - never proves
+#    more than "the terminal exec targets the right path before failing on ENOENT". This section uses REAL
+#    executable engine stubs to prove: a successful sourced run really execs the stub (never a plain child
+#    call), the stub's own exit status propagates all the way back through source+exec (exactly what miner-
+#    run's own `exitcode=$?` right after `( run_miner )` depends on for its restart-count/backoff logic), AND -
+#    the actual Round 4-shaped risk, just in h-run.sh instead of h-config.sh - that an early failure path
+#    (missing manifest, engine_from_config unable to resolve) truly `return`s rather than `exit`s when sourced,
+#    proven WITHOUT a protective subshell wrapper (a subshell would trivially shield the caller regardless of
+#    which one h-run.sh actually uses).
+setup_pkg
+RUNLOG="$T/run.log"
+stub_engine() {   # $1 = bloxminer|xmrig (the binary path h-run.sh execs into for verus/rx respectively) $2 = exit code
+	cat > "$BLOX_DIR/$1" <<SH
+#!/bin/sh
+echo "STUB $BLOX_DIR/$1 \$* PID=\$\$" >> "$RUNLOG"
+exit $2
+SH
+	chmod +x "$BLOX_DIR/$1"
+}
+
+# ---- success path, REAL Hive shape: h-run.sh sourced inside a subshell (`( ... )`, exactly like `( run_miner
+#      )`) - the terminal `exec` replaces THAT subshell's own process image with the stub, so the stub's exit
+#      status becomes the subshell's own $? - proving exec really happened (a forked/backgrounded call could
+#      never make the parent's own `$?` reflect the child's status this way) and that it propagates end to end.
+hconfig "p:1" "W" "" "" ""   # verus config
+stub_engine bloxminer 0
+: > "$RUNLOG"
+( BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" bash -c '. "$BLOX_DIR/h-run.sh"' ); rc=$?
+if [[ $rc == 0 ]] && grep -qF "STUB $BLOX_DIR/bloxminer" "$RUNLOG" 2>/dev/null; then
+	ok "h-run.sh sourced (real Hive '( run_miner )' shape), verus: execs the stub, exit status (0) propagates"
+else
+	bad "h-run.sh sourced, verus: execs the stub, exit status propagates" "rc=$rc log=$(cat "$RUNLOG" 2>/dev/null)"
+fi
+
+hconfig "p:1" "W" "" "" "rx/0"   # rx config
+stub_engine xmrig 0
+: > "$RUNLOG"
+( BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" bash -c '. "$BLOX_DIR/h-run.sh"' ); rc=$?
+if [[ $rc == 0 ]] && grep -qF "STUB $BLOX_DIR/xmrig" "$RUNLOG" 2>/dev/null; then
+	ok "h-run.sh sourced (real Hive shape), rx: execs the stub, exit status (0) propagates"
+else
+	bad "h-run.sh sourced, rx: execs the stub, exit status propagates" "rc=$rc log=$(cat "$RUNLOG" 2>/dev/null)"
+fi
+
+# ---- the stub's own NON-zero exit status also propagates all the way back through source+exec
+stub_engine bloxminer 17
+hconfig "p:1" "W" "" "" ""
+: > "$RUNLOG"
+( BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" bash -c '. "$BLOX_DIR/h-run.sh"' ); rc=$?
+if [[ $rc == 17 ]]; then ok "h-run.sh sourced: the engine's own non-zero exit status (17) propagates all the way back"; else bad "h-run.sh sourced: engine exit status propagates" "rc=$rc"; fi
+
+# ---- failure paths must `return`, not `exit`, when sourced - proven WITHOUT a subshell wrapper (see the
+#      section header for why), exactly like section 9's hive_sourced() proves the same thing for h-config.sh.
+run_h_run_survives() {   # $1 = test label -> asserts the caller prints its own marker AFTER sourcing, with a
+	# non-zero rc (h-run.sh's own early failure), proving `return` (not `exit`) really ran
+	out=$(BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" bash -c '
+		. "$BLOX_DIR/h-run.sh"
+		rc=$?
+		printf "SURVIVED rc=%d\n" "$rc"
+	' 2>&1)
+	if grep -q '^SURVIVED rc=' <<< "$out" && [[ $(sed -n 's/^SURVIVED rc=//p' <<< "$out") != 0 ]]; then
+		ok "h-run.sh sourced (no subshell), $1: returns (not exits) - caller survives, non-zero rc"
+	else
+		bad "h-run.sh sourced (no subshell), $1: returns (not exits) - caller survives" "$out"
+	fi
+}
+mv "$BLOX_DIR/h-manifest.conf" "$T/h-manifest.conf.aside"
+run_h_run_survives "missing h-manifest.conf"
+mv "$T/h-manifest.conf.aside" "$BLOX_DIR/h-manifest.conf"
+
+hconfig "p:1" "W" "" "" ""; rm -f "$CONF"
+run_h_run_survives "engine_from_config cannot resolve (missing config.json)"
+
+# ============================================================== 11. Round 5 (Codex test-gap review): h-stats.sh
+#    SOURCED REPEATEDLY IN ONE CALLER SHELL (never a fresh bash -c per poll, which is exactly what section 7
+#    above does and exactly why it could never have caught a variable/function leaking from one poll into the
+#    next - a brand-new shell has no leftover state to leak in the first place). Hive's own agent sources this
+#    file on the same long-lived interval, never restarting between polls - this reproduces that shape and
+#    checks for retained variables/functions, port contamination, and stale khs/stats surviving an engine
+#    switch, across a real rx (working API, non-zero khs) -> verus -> rx (different algo, API down) -> verus
+#    sequence, entirely inside ONE bash process.
+setup_pkg
+S11_PROC="$T/proc11"; mkdir -p "$S11_PROC/net"
+: > "$BLOX_DIR/xmrig"; chmod +x "$BLOX_DIR/xmrig"   # placeholder: only its resolved /proc/<pid>/exe path is compared
+python3 - "$S11_PROC" "$BLOX_DIR/xmrig" <<'PY'
+import os, sys
+root, xmrig_path = sys.argv[1], sys.argv[2]
+pid = "8801"
+fddir = os.path.join(root, pid, "fd"); os.makedirs(fddir, exist_ok=True)
+os.symlink("socket:[313131]", os.path.join(fddir, "5"))
+os.symlink(xmrig_path, os.path.join(root, pid, "exe"))
+with open(os.path.join(root, "net", "tcp"), "w") as f:
+	f.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+	f.write("   0: 0100007F:1105 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 313131 1 0000000000000000 100 0 0 10 0\n")
+PY
+S11_API_CFG="$T/s11_replies.json"
+jq -n '{summary: {uptime:60, connection:{accepted:3,rejected:0}, algo:"rx/0", version:"6.26.0"},
+        backends: [{type:"cpu", threads:[{affinity:0, hashrate:[500000.0,null,null]}]}]}' > "$S11_API_CFG"
+python3 "$HERE/fake_xmrig_api.py" 4357 "$S11_API_CFG" > "$T/s11_api.out" 2>&1 & S11_API_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/s11_api.out" 2>/dev/null && break; sleep 0.1; done
+
+hconfig "p:1" "W" "" "" "rx/0"   # step A/B config: rx/0
+MULTI="$T/multi_poll.sh"
+cat > "$MULTI" <<'EOF'
+set -u
+poll() { . "$BLOX_DIR/h-stats.sh"; }
+
+# ---- A: rx active, API DOWN (unreachable port) -> fallback: khs=0, stats.algo reflects CURRENT config (rx/0)
+BLOX_API_PORT=1 poll
+printf 'A khs=[%s] algo=%s PORT=[%s]\n' "$khs" "$(jq -r '.algo // "NONE"' <<< "$stats" 2>/dev/null)" "${PORT:-unset}"
+
+# ---- B: rx active, API UP, ownership-verified -> REAL non-zero khs this time
+BLOX_API_PORT=4357 poll
+printf 'B khs=[%s] algo=%s PORT=[%s]\n' "$khs" "$(jq -r '.algo // "NONE"' <<< "$stats" 2>/dev/null)" "${PORT:-unset}"
+
+# ---- C: switch to verus -> must be verus's OWN empty answer (khs=0, stats=""), NEVER step B's non-zero khs
+#      or algo leaking through, and $PORT is never read by verus at all (only checked here for visibility)
+printf '{"algo":"verus"}' > "$CUSTOM_CONFIG_FILENAME"
+poll
+printf 'C khs=[%s] stats=[%s] PORT=[%s]\n' "$khs" "$stats" "${PORT:-unset}"
+
+# ---- D: back to rx, a DIFFERENT algo AND a different (still down) port than step A - proves neither the OLD
+#      algo (rx/0) nor the OLD dead port (1) linger
+printf '{"pools":[{"algo":"rx/arq"}],"randomx":{}}' > "$CUSTOM_CONFIG_FILENAME"
+BLOX_API_PORT=2 poll
+printf 'D khs=[%s] algo=%s PORT=[%s]\n' "$khs" "$(jq -r '.algo // "NONE"' <<< "$stats" 2>/dev/null)" "${PORT:-unset}"
+
+# ---- E: verus again -> still verus's own empty answer, not step D's rx fallback object
+printf '{"algo":"verus"}' > "$CUSTOM_CONFIG_FILENAME"
+poll
+printf 'E khs=[%s] stats=[%s]\n' "$khs" "$stats"
+EOF
+res=$(BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" BLOX_PROCFS_ROOT="$S11_PROC" bash "$MULTI" 2>&1)
+kill "$S11_API_PID" 2>/dev/null; wait "$S11_API_PID" 2>/dev/null
+
+lineA=$(grep '^A ' <<< "$res"); lineB=$(grep '^B ' <<< "$res"); lineC=$(grep '^C ' <<< "$res")
+lineD=$(grep '^D ' <<< "$res"); lineE=$(grep '^E ' <<< "$res")
+if [[ $lineA == "A khs=[0] algo=rx/0 PORT=[1]" ]]; then ok "one shell, step A (rx, API down): khs=0, algo=rx/0, PORT=1"; else bad "one shell, step A" "$lineA"; fi
+if [[ $lineB == "B khs=[500.00] algo=rx/0 PORT=[4357]" ]]; then ok "one shell, step B (rx, API up): REAL khs=500.00, PORT updated to 4357"; else bad "one shell, step B (rx, API up): real khs, PORT=4357" "$lineB"; fi
+if [[ $lineC == "C khs=[0] stats=[] PORT=[4357]" ]]; then
+	ok "one shell, step C (-> verus): verus's OWN empty answer - step B's khs=500.00/algo NEVER leaked through"
+else
+	bad "one shell, step C (-> verus): no leftover from step B (khs=500.00, algo rx/0)" "$lineC"
+fi
+if [[ $lineD == "D khs=[0] algo=rx/arq PORT=[2]" ]]; then
+	ok "one shell, step D (rx/arq, API down again): reflects the NEW algo/port, not step A's (rx/0, PORT=1) or step B's (PORT=4357)"
+else
+	bad "one shell, step D: reflects new algo/port only, no staleness" "$lineD"
+fi
+if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus again): still verus's own empty answer, no leftover from step D"; else bad "one shell, step E: no leftover from step D" "$lineE"; fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

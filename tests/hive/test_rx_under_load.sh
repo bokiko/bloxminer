@@ -13,7 +13,8 @@
 # the default path; skipped if neither is present)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKGSRC=$(cd "$HERE/../../bloxminer/engines/rx" && pwd)
-MANIFEST_SRC=$(cd "$HERE/../../bloxminer" && pwd)/h-manifest.conf   # shared top-level manifest (3.0.0)
+TOPSRC=$(cd "$HERE/../../bloxminer" && pwd)   # the full top-level package (dispatcher + both engines) - case 3 only
+MANIFEST_SRC="$TOPSRC/h-manifest.conf"   # shared top-level manifest (3.0.0)
 T=$(mktemp -d)
 BUSY_PIDS=()
 XMRIG_PID=""
@@ -180,6 +181,112 @@ CFG
 	kill -9 "$XMRIG_PID" 2>/dev/null; wait "$XMRIG_PID" 2>/dev/null; XMRIG_PID=""
 else
 	echo "SKIP: real xmrig bench case ($XMRIG_BIN not found - build it first with build/build.sh)"
+fi
+
+
+# ================================================================== case 3: Round 5 (Codex test-gap review) -
+#    SUSTAINED polling (>= 60 polls) under full CPU load through the FINAL PACKAGE's TOP-LEVEL h-stats.sh
+#    (dispatcher: sources h-common.sh, engines/rx/h-stats.sh, THEN calls finalize_rx_hugepages - cases 1/2 above
+#    only ever test the engine's own h-stats.sh directly, which never exercises the new finalization code at
+#    all). Proves finalize_rx_hugepages adds no meaningful cost once finalized (the overwhelming majority of a
+#    real rx session's polls) and never causes a false zero or a budget overrun even while it is still actively
+#    checking on every poll (before finalizing) under full CPU load - the exact conditions ("runs every 10 s
+#    under 100% CPU") its own design comment requires.
+BLOX_DIR3="$T/pkg3"; mkdir -p "$BLOX_DIR3" "$T/log3" "$T/state3"
+cp -r "$TOPSRC"/* "$BLOX_DIR3/"
+chmod +x "$BLOX_DIR3"/*.sh "$BLOX_DIR3"/engines/*/*.sh
+CONF3="$T/config3.json"
+sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$CONF3#" \
+    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log3/bloxminer#" "$MANIFEST_SRC" > "$BLOX_DIR3/h-manifest.conf"
+jq -n '{pools: [{algo: "rx/0"}], randomx: {}}' > "$CONF3"
+: > "$BLOX_DIR3/xmrig"; chmod +x "$BLOX_DIR3/xmrig"
+cp "$T/pkg/bloxsense" "$BLOX_DIR3/bloxsense"   # the same ~0.55 s-sleeping fixture case 1 already built (case
+	# 1's own package dir, "$T/pkg" - NOT the shared $BLOX_DIR variable, which case 2 above may have repointed
+	# at "$T/pkg2" if it ran)
+
+PROC3="$T/proc3"
+python3 - "$PROC3" "$BLOX_DIR3/xmrig" <<'PY'
+import os, sys
+root, xmrig_path = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.join(root, "net"), exist_ok=True)
+TARGET_PID = "9101"
+TARGET_INODE = 666666
+n = 0
+for i in range(3000, 3375):   # 375 unrelated processes x 4 fds = ~1500 fds, matching case 1's shape
+	fddir = os.path.join(root, str(i), "fd")
+	os.makedirs(fddir, exist_ok=True)
+	for j in range(4):
+		os.symlink("socket:[%d]" % (800000 + n), os.path.join(fddir, str(j)))
+		n += 1
+fddir = os.path.join(root, TARGET_PID, "fd")
+os.makedirs(fddir, exist_ok=True)
+os.symlink("socket:[%d]" % TARGET_INODE, os.path.join(fddir, "23"))
+os.symlink(xmrig_path, os.path.join(root, TARGET_PID, "exe"))
+taskdir = os.path.join(root, TARGET_PID, "task")
+for c in range(32):
+	d = os.path.join(taskdir, str(c))
+	os.makedirs(d, exist_ok=True)
+	with open(os.path.join(d, "status"), "w") as f:
+		f.write("Cpus_allowed_list:\t%d\n" % c)
+hexport = "%04X" % 4071
+with open(os.path.join(root, "net", "tcp"), "w") as f:
+	f.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+	f.write("   0: 0100007F:%s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0\n" % (hexport, TARGET_INODE))
+os.makedirs(os.path.join(root, "sys", "vm"), exist_ok=True)
+os.makedirs(os.path.join(root, "sys", "kernel", "random"), exist_ok=True)
+with open(os.path.join(root, "sys", "vm", "nr_hugepages"), "w") as f:
+	f.write("1201\n")   # prelim(1200) + max(0, need(1200) - free0(1199)) - exactly what finalize should confirm
+with open(os.path.join(root, "meminfo"), "w") as f:
+	f.write("HugePages_Free:      1199 kB\n")
+with open(os.path.join(root, "sys", "kernel", "random", "boot_id"), "w") as f:
+	f.write("case3-boot\n")
+PY
+mkdir -p "$T/state3"
+printf 'prior=0\nprelim=1200\nfree0=1199\nboot=case3-boot\nfinal=0\n' > "$T/state3/.bloxminer-hugepages"
+
+SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hugepages: [1200, 1200]}')
+BACK3=$(python3 -c '
+import json
+threads = [{"affinity": c, "hashrate": [500.0 + c, None, None]} for c in range(32)]
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+')
+jq -n --argjson s "$SUM3" --argjson b "$BACK3" '{summary: $s, backends: $b}' > "$T/replies3.json"
+: > "$T/api3.out"
+python3 "$HERE/fake_xmrig_api.py" 4071 "$T/replies3.json" > "$T/api3.out" 2>&1 & API3_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api3.out" && break; sleep 0.1; done
+grep -q ready "$T/api3.out" || bad "sustained polling: fake API startup" "$(cat "$T/api3.out" 2>/dev/null)"
+
+export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4071 BLOX_STATE_DIR="$T/state3"
+saturate_cpus
+sleep 0.3
+N_POLLS=60
+n_zero=0; n_over_budget=0; max_elapsed=0
+for i in $(seq 1 "$N_POLLS"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  poll $i: ZERO khs ($res)"; }
+	awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over_budget=$((n_over_budget+1)); echo "  poll $i: OVER BUDGET (${elapsed}s)"; }
+	awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
+done
+stop_saturating
+kill "$API3_PID" 2>/dev/null; wait "$API3_PID" 2>/dev/null
+unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT BLOX_STATE_DIR
+
+if [[ $n_zero == 0 && $n_over_budget == 0 ]]; then
+	ok "sustained polling ($N_POLLS polls, top-level h-stats.sh, full CPU load): no false zeros, all under 3.0 s (max ${max_elapsed}s)"
+else
+	bad "sustained polling ($N_POLLS polls): no false zeros, all under budget" "n_zero=$n_zero n_over_budget=$n_over_budget max=${max_elapsed}s"
+fi
+final3=$(sed -n 's/^final=//p' "$T/state3/.bloxminer-hugepages" 2>/dev/null)
+ours3=$(sed -n 's/^ours=//p' "$T/state3/.bloxminer-hugepages" 2>/dev/null)
+if [[ $final3 == 1 && $ours3 == 1201 ]]; then
+	ok "sustained polling: finalize_rx_hugepages finalized during the run (final=1, ours=1201) and never regressed across $N_POLLS polls"
+else
+	bad "sustained polling: finalized during the run, stable across all polls" "final=$final3 ours=$ours3"
 fi
 
 echo "$pass passed, $fail failed"

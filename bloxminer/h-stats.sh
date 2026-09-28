@@ -17,3 +17,10 @@ engine=$(engine_from_config) || { khs=0; stats=""; return 0 2>/dev/null || exit 
 
 # shellcheck disable=SC1090   # $engine is one of exactly two known, fixed values (verus|rx), never external input
 . "$BLOX_DIR/engines/$engine/h-stats.sh"
+
+# Huge-page ownership finalization (rx only, see h-common.sh's "Huge-page ownership" section): must run AFTER
+# the engine h-stats.sh above so $khs (and rx's own exported PORT/PROC/PKG) are set - and must never touch
+# $khs/$stats itself or make this script fail/print, on any outcome: finalize_rx_hugepages already returns 0
+# on every path (nothing here to check), engine scripts stay completely untouched.
+[[ $engine == rx ]] && finalize_rx_hugepages
+true

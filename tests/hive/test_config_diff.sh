@@ -24,23 +24,38 @@ tar xzf "$VERUS_TGZ" -C "$T/gated-verus"
 tar xzf "$RX_TGZ" -C "$T/gated-rx"
 
 # ---------------------------------------------------------------- Verus: gated 2.1.0 vs dispatcher (v3)
+# Round 5 (Codex test-gap review): both runners below now SOURCE their h-config.sh with CUSTOM_* as plain,
+# NON-exported variables of the calling shell - Hive's real invocation shape (hive-ref/miner:
+# `. $MINER_DIR/$CUSTOM_MINER/h-config.sh`; see tests/hive/test_dispatcher.sh's hconfig() for the identical
+# pattern and why an exported child-process call is exactly the shape that hid the cask18 sourcing bug from
+# every earlier round's tests). This changes nothing about what diff_configs actually compares - config.json's
+# CONTENT never depended on export vs. source (a child process still receives an exported var); it only makes
+# this suite exercise the same call shape as test_dispatcher.sh instead of a shape no real Hive invocation uses.
 run_gated_verus() {   # $1 url $2 template $3 pass $4 extra -> writes $T/gated.json
 	local d="$T/rv"; rm -rf "$d"; mkdir -p "$d" "$T/logrv"
 	cp "$T/gated-verus/bloxminer/h-config.sh" "$T/gated-verus/bloxminer/h-manifest.conf" "$d/"
 	sed -i.bak -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/gated.json#" \
 	           -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/logrv/bloxminer#" "$d/h-manifest.conf"
 	rm -f "$T/gated.json"
-	BLOX_DIR=$d CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 bash "$d/h-config.sh" > /dev/null 2>&1
+	BLOX_DIR=$d bash -c '
+		set +a
+		CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4
+		. "$BLOX_DIR/h-config.sh"
+	' _ "$1" "$2" "$3" "$4" > /dev/null 2>&1
 }
-run_v3_verus() {   # $1 url $2 template $3 pass $4 extra -> writes $T/v3.json
+run_v3_verus() {   # $1 url $2 template $3 pass $4 extra $5 algo -> writes $T/v3.json
 	local d="$T/nv"; rm -rf "$d"; mkdir -p "$d" "$T/lognv"
 	cp -r "$ROOT"/bloxminer/* "$d/"
 	chmod +x "$d"/*.sh "$d"/engines/*/*.sh
 	sed -i.bak -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/v3.json#" \
 	           -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/lognv/bloxminer#" "$d/h-manifest.conf"
 	rm -f "$T/v3.json"
-	message() { :; }; export -f message
-	BLOX_DIR=$d CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5 bash "$d/h-config.sh" > /dev/null 2>&1
+	BLOX_DIR=$d bash -c '
+		set +a
+		message() { :; }
+		CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5
+		. "$BLOX_DIR/h-config.sh"
+	' _ "$1" "$2" "$3" "$4" "$5" > /dev/null 2>&1
 }
 diff_configs() {   # compares $T/gated.json to $T/v3.json, both jq-canonicalised, with "log-file" stripped:
 	# that value is CUSTOM_LOG_BASENAME.log, a per-package PATH (never a literal shipped in either release) -
@@ -75,7 +90,11 @@ run_gated_rx() {   # $1 url $2 template $3 pass $4 extra $5 algo -> writes $T/ga
 	sed -i.bak -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/gated.json#" \
 	           -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/logrx1/bloxminer-x#" "$d/h-manifest.conf"
 	rm -f "$T/gated.json"
-	BLOX_DIR=$d CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5 bash "$d/h-config.sh" > /dev/null 2>&1
+	BLOX_DIR=$d bash -c '
+		set +a
+		CUSTOM_URL=$1 CUSTOM_TEMPLATE=$2 CUSTOM_PASS=$3 CUSTOM_USER_CONFIG=$4 CUSTOM_ALGO=$5
+		. "$BLOX_DIR/h-config.sh"
+	' _ "$1" "$2" "$3" "$4" "$5" > /dev/null 2>&1
 }
 for case_desc_url_tpl_pass_extra_algo in \
 	"host:port, default algo|pool.example.com:9999|W.rig|x|" \
