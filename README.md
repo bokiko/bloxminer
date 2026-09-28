@@ -5,17 +5,19 @@
   <img src="assets/logo-light.svg" alt="BloxMiner" width="420">
 </picture>
 
-**VerusHash v2.2 CPU miner for Verus (VRSC) — 0 % dev fee, runs on any x86-64 Linux, HiveOS-ready**
+**CPU miner for Verus (VRSC, VerusHash v2.2) and Monero-family RandomX coins — one download, 0 % dev fee, runs
+on any x86-64 Linux, HiveOS-ready**
 
 <p>
   <a href="https://github.com/bokiko/bloxminer"><img src="https://img.shields.io/badge/GitHub-bloxminer-181717?style=for-the-badge&logo=github" alt="GitHub"></a>
   <a href="https://verus.io"><img src="https://img.shields.io/badge/Verus-VRSC-3165D4?style=for-the-badge" alt="Verus"></a>
+  <a href="https://www.getmonero.org"><img src="https://img.shields.io/badge/RandomX-XMR_and_friends-FF6600?style=for-the-badge" alt="RandomX"></a>
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-2.1.0-blue?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/Based_on-ccminer-00599C?style=flat-square" alt="ccminer">
-  <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
+  <img src="https://img.shields.io/badge/Version-3.0.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Based_on-ccminer_%2B_XMRig-00599C?style=flat-square" alt="ccminer + XMRig">
+  <img src="https://img.shields.io/badge/Algorithms-VerusHash_v2.2_%2B_RandomX-blue?style=flat-square" alt="VerusHash + RandomX">
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/HiveOS-Ready-green?style=flat-square" alt="HiveOS">
   <img src="https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square" alt="License">
@@ -29,6 +31,7 @@
 ## Index
 
 - [What it mines](#what-it-mines)
+- [Two engines, one download](#two-engines-one-download)
 - [Installation](#installation)
   - [HiveOS Flight Sheet (Recommended)](#hiveos-flight-sheet-recommended)
   - [HiveOS Terminal Install](#hiveos-terminal-install)
@@ -50,14 +53,59 @@
 
 ## What it mines
 
-BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](https://verus.io).
+BloxMiner mines **VerusHash v2.2** — the proof-of-work of [Verus (VRSC)](https://verus.io) — **and RandomX** —
+the proof-of-work of [Monero (XMR)](https://www.getmonero.org) and the RandomX-family coins XMRig itself
+supports (Wownero, ArQmA, Graft, Safex, YadaCoin). One download; the flight sheet's algorithm picks which one
+runs — see [Two engines, one download](#two-engines-one-download).
 
 | | |
 |---|---|
-| **VRSC** | Supported and tested on Verus stratum pools |
-| **Fees** | **None.** No dev fee and no donation mining: every share goes to your wallet on the pool you configure. Open source (GPL-3.0); the full change to ccminer is [`build/bloxminer.patch`](build/bloxminer.patch) |
+| **VRSC / XMR and RandomX-family coins** | Supported and tested on Verus and Monero-family stratum pools |
+| **Fees** | **None, on either engine.** No dev fee and no donation mining: every share goes to your wallet on the pool you configure. Open source (GPL-3.0); the full changes are [`build/bloxminer.patch`](build/bloxminer.patch) (ccminer/Verus) and [`build/donate0.patch`](build/donate0.patch) (XMRig/RandomX, one line: the built-in donation level set to 0) |
 | **Verus PBaaS chains** | The Verus merged-mining header handling is included (from monkins1010's ccminer). Whether a pool offers merged mining or a PBaaS chain, and which rewards you get, depends on the pool. Not tested by us |
-| **Other coins / algorithms** | Not supported. Any `algo` other than `verus` is refused at start with a message |
+| **Other coins / algorithms** | Not supported. A flight-sheet algorithm that is neither a VerusHash nor a RandomX-family value is refused at start with a message — see the table below |
+
+---
+
+## Two engines, one download
+
+BloxMiner 3.0.0 ships **both** mining engines in a single package (still installed as the Custom miner
+`bloxminer`, so a 2.1.0 rig upgrades in place by only changing the Installation URL's version — see
+[Updating](#updating)). Which engine actually runs is decided every time the miner (re)starts, from the flight
+sheet's **Hash algorithm** field — never both at once, and switching is just editing the flight sheet and
+restarting the miner:
+
+| Hash algorithm (flight sheet) | Engine | Notes |
+|---|---|---|
+| *(empty)* | Verus (VerusHash v2.2) | Backward compatible: a 2.1.0 flight sheet never had this field |
+| `verus`, `verushash` | Verus (VerusHash v2.2) | |
+| `randomx`, `rx/0` | RandomX | XMR and RandomX-family coins that use the plain `rx/0` variant |
+| `rx/wow`, `rx/arq`, `rx/graft`, `rx/sfx`, `rx/yada` | RandomX | The other RandomX-family variants XMRig supports |
+| anything else | *(refused)* | HiveOS shows an error message; the miner does not start (no restart loop) |
+
+The two engines are otherwise **exactly** their own already-released, independently gated selves — BloxMiner
+2.1.0's ccminer engine and BloxMiner-X 1.0.0's XMRig engine, byte-identical binaries, nothing rebuilt for this
+package. Only the parts that genuinely have to be shared (the package directory, the log file base, the engine
+picker itself) are new. That means:
+
+- **Pass means something different per engine** (unchanged from each engine's own 1.x/2.x behaviour): on the
+  Verus engine, Pass is a **thread count** (`1`–`128`, or empty for every CPU); on the RandomX engine, Pass is
+  the **pool password** sent as-is (numeric or not) — RandomX's own thread count comes from XMRig's cache-aware
+  autoconfig, steerable via Extra config (see [Configuration](#configuration)).
+- **"Pass" in the miner screen/API means something different per engine too**: the Verus engine's `A`/`R`
+  counts and per-core table are its own (see [The miner screen](#the-miner-screen)); the RandomX engine reports
+  XMRig's own accepted/rejected counts and per-core rows the same way BloxMiner-X 1.0.0 did.
+- **Each engine keeps its own Extra config options** — the Verus ones (`threads`, `ccd-temp-map`, `dashboard`,
+  …, see [Configuration](#configuration)) only apply when Hash algorithm selects the Verus engine; the RandomX
+  ones (`tls`, `1gb-pages`, `cpu`, …) only apply when it selects the RandomX engine. Setting a Verus-only key
+  while mining RandomX (or vice versa) has no effect.
+- **The API port differs**: `127.0.0.1:4068` (Verus engine) or `127.0.0.1:4069` (RandomX engine) — see
+  [API](#api). `WEB_PORT` in the HiveOS manifest is fixed at `4068`, so the HiveOS web UI's port link only ever
+  points at the Verus engine's API; it is simply dead while the RandomX engine is active (the miner screen and
+  HiveOS farm stats are unaffected either way — neither depends on `WEB_PORT`).
+- **Switching engines is clean**: the previous engine is never left running (HiveOS stops it before the new one
+  starts), its config.json is fully rewritten for the new engine, and if the RandomX engine had reserved huge
+  pages, switching to the Verus engine releases them (the Verus engine never wants hugepages reserved).
 
 ---
 
@@ -66,8 +114,8 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
 ### HiveOS Flight Sheet (Recommended)
 
 1. **Create New Flight Sheet**
-   - Coin: `VRSC` (Verus)
-   - Wallet: Select your Verus wallet
+   - Coin: `VRSC` (Verus) or `XMR` (Monero)/your RandomX-family coin
+   - Wallet: Select your wallet
    - Pool: `Configure in miner`
 
 2. **Add Miner**
@@ -75,12 +123,12 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
    - Miner name: `bloxminer`
    - Installation URL:
      ```
-     https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz
+     https://github.com/bokiko/bloxminer/releases/download/3.0.0/bloxminer-3.0.0.tar.gz
      ```
-   - Hash algorithm: `verushash`
+   - Hash algorithm: `verushash` (Verus) or `randomx` / `rx/0` / `rx/wow` / `rx/arq` / `rx/graft` / `rx/sfx` / `rx/yada` (RandomX) — see [Two engines, one download](#two-engines-one-download)
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
-   - Pool URL: your pool, e.g. `stratum+tcp://veruscoin.cedric-crispin.com:4024`
-   - Pass: number of threads, `1`–`128` (e.g. `32`), or empty for all CPUs
+   - Pool URL: your pool, e.g. `stratum+tcp://veruscoin.cedric-crispin.com:4024` (Verus) or `stratum+tcp://pool.example.com:PORT` / `stratum+ssl://...` (RandomX)
+   - Pass: **Verus** — number of threads, `1`–`128` (e.g. `32`), or empty for all CPUs. **RandomX** — the pool password (or empty)
 
 3. **Apply Flight Sheet** to your rig
 
@@ -90,19 +138,19 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
 |-------|-------|-------|
 | Miner | `custom` | Required |
 | Miner name | `bloxminer` | Must match exactly |
-| Installation URL | `https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz` | HiveOS installs it once and reuses it |
-| Hash algorithm | `verushash` | |
+| Installation URL | `https://github.com/bokiko/bloxminer/releases/download/3.0.0/bloxminer-3.0.0.tar.gz` | HiveOS installs it once and reuses it, for either engine |
+| Hash algorithm | `verushash` or `randomx`/`rx/wow`/… | Picks the engine — see [Two engines, one download](#two-engines-one-download) |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
-| Pool URL | `stratum+tcp://host:port` | Your pool (`host:port` also works) |
-| Pass | `32` | Thread count `1`–`128` (optional). Empty = every CPU HiveOS gives the miner. Any text that is not a number is sent to the pool as the password |
-| Extra config arguments | *(empty)* | Optional JSON members, see [Configuration](#configuration) |
+| Pool URL | `stratum+tcp://host:port` (or `stratum+ssl://` for RandomX) | Your pool (`host:port` also works) |
+| Pass | Verus: `32` (thread count `1`–`128`, optional, empty = every CPU). RandomX: the pool password, or empty | Meaning depends on the engine — see [Two engines, one download](#two-engines-one-download) |
+| Extra config arguments | *(empty)* | Optional JSON members, engine-specific — see [Configuration](#configuration) |
 
-A pool that needs a **numeric** password: leave Pass empty and put `"pass": "1234"` in Extra config.
+A **Verus** pool that needs a **numeric** password: leave Pass empty and put `"pass": "1234"` in Extra config.
 
 ### HiveOS Terminal Install
 
 ```bash
-/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer/releases/download/3.0.0/bloxminer-3.0.0.tar.gz
 ```
 
 Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
@@ -110,8 +158,10 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `2.0.0` → `2.1.0`) and apply the flight sheet.
-HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same.
+Change the version in the Installation URL (e.g. `2.1.0` → `3.0.0`) and apply the flight sheet.
+HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same — a 2.1.0
+Verus rig keeps mining Verus (Hash algorithm was already `verushash`, or is added now for clarity); switching
+an existing rig to RandomX is just changing Hash algorithm, Pool URL and Wallet, then applying.
 
 ---
 
@@ -221,12 +271,36 @@ command line, so its values win (upstream ccminer behaviour).
 `/hive/miners/custom/bloxminer/h-manifest.conf` sets the default `CCD_TEMP_MAP` (`auto`); Extra config
 `"ccd-temp-map"` overrides it.
 
+**RandomX engine** (Hash algorithm `randomx`/`rx/0`/`rx/wow`/…): the same flight sheet fields produce XMRig's
+own config.json instead (`threads` above does not apply — see [Two engines, one download](#two-engines-one-download)):
+
+```json
+{
+  "cpu": { "enabled": true, "huge-pages": true },
+  "randomx": {},
+  "donate-level": 0, "donate-over-proxy": 0,
+  "http": { "enabled": true, "host": "127.0.0.1", "port": 4069, "restricted": true },
+  "pools": [ { "url": "stratum+tcp://host:port", "user": "XYourWalletAddress.rig1", "pass": "x", "algo": "rx/0" } ]
+}
+```
+
+RandomX Extra config keys (JSON members, merged in): `"tls": true` (force TLS even without `stratum+ssl://`),
+`"1gb-pages": true` (only applied when every NUMA node reports ≥ 3 GiB free right now, else dropped with a
+message), `"cpu": {...}` (merged into the `cpu` object — e.g. `"cpu": {"max-threads-hint": 50}`; `enabled` and
+`huge-pages` are always forced on and cannot be overridden), and any of XMRig's own top-level options that are
+not already set by BloxMiner (`donate-level`, `http`, `log-file`, … are always fixed). `algo`, `api`/`http` and
+`log-file` are always set by BloxMiner; if you put them in Extra config they are ignored with a message.
+
 ---
 
 ## CPU support
 
-BloxMiner runs on any x86-64-v3 CPU with AES-NI and PCLMUL (AMD Zen or newer, Intel Haswell or newer).
-Run `bloxminer --sensors` to see exactly what it detects on your machine.
+CPU requirements are per engine (each keeps its own gated check, unchanged): the **Verus engine** needs
+x86-64-v3 with AES-NI and PCLMUL (AMD Zen or newer, Intel Haswell or newer); the **RandomX engine** needs only
+AES-NI (RandomX itself requires AES acceleration) on any x86-64 CPU — see
+[Two engines, one download](#two-engines-one-download). The table below describes the Verus engine's own
+per-core stats; the RandomX engine's stats and topology detection are XMRig's own (BloxMiner-X 1.0.0, unchanged).
+Run `bloxminer --sensors` to see exactly what the Verus engine detects on your machine.
 
 | Feature | Where it works |
 |---------|----------------|
@@ -246,14 +320,17 @@ controlled load test (load pinned to one CCD at a time, only that CCD's sensor r
 
 ## HiveOS stats
 
-What HiveOS receives every agent tick (read from the miner's local API by `h-stats.sh`):
+What HiveOS receives every agent tick, read from whichever engine is currently active (`h-stats.sh` is a thin
+dispatcher: it never mixes data from the two engines — see [Two engines, one download](#two-engines-one-download)):
 
 | Field | Content |
 |-------|---------|
 | `hs` | One value per physical core (kH/s), or per thread, or one total |
 | `temp` | Per row: CCD / core temperature, else package temperature |
 | `ar` | Accepted, rejected |
-| `uptime`, `ver`, `algo` | Miner uptime (s), `2.1.0`, `verushash` |
+| `uptime` | Miner uptime (s) |
+| `ver` | `3.0.0 (verus, engine 2.1.0)` on the Verus engine, `3.0.0 (xmrig 6.26.0)` on the RandomX engine |
+| `algo` | `verushash` (Verus engine) or the active RandomX variant, e.g. `rx/0`, `rx/wow` (RandomX engine) |
 | `cpu_power` | CPU package power in W (omitted when unavailable, never sent as 0). The HiveOS web (0.6-231, Sept 2026) does not show it in the CONSUMPTION tile; it is in the miner screen, log, API and `--sensors` |
 
 The total is the sum of **fresh** rows: a thread counts only while it keeps finishing work. When every thread is
@@ -268,7 +345,11 @@ benchmark numbers below use the miner's averaged summary rate instead.
 
 ## API
 
-ccminer-compatible text API, `127.0.0.1:4068` by default (HiveOS keeps it local):
+**Verus engine** — ccminer-compatible text API, `127.0.0.1:4068` by default (HiveOS keeps it local). **RandomX
+engine** — XMRig's own JSON HTTP API, `127.0.0.1:4069`, restricted/local, e.g. `curl http://127.0.0.1:4069/2/summary`
+(see the [XMRig API docs](https://xmrig.com/docs/miner/api)). Only the Verus engine's text API is documented
+below (unchanged from 2.1.0); `WEB_PORT` (the HiveOS web UI port link) is fixed at `4068` either way — see
+[Two engines, one download](#two-engines-one-download).
 
 ```bash
 echo -n summary | nc 127.0.0.1 4068
@@ -342,9 +423,10 @@ Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 
 | You see | Meaning / fix |
 |---------|---------------|
-| HiveOS message *"BloxMiner needs an x86-64-v3 CPU …"* | The CPU lacks AVX2/BMI2/FMA or AES-NI. BloxMiner cannot run on it |
-| *"Pass is a thread count and must be 1-128"* | Pass is a number outside 1–128. Use a valid count, or put a numeric pool password in Extra config |
-| *"BloxMiner mines VerusHash only"* | An `algo` other than `verus` was given (command line or config) |
+| HiveOS message *"BloxMiner needs an x86-64-v3 CPU …"* | Verus engine: the CPU lacks AVX2/BMI2/FMA or AES-NI. Switch to the RandomX engine (needs only AES-NI) if your coin choice allows it, otherwise this CPU cannot mine Verus with BloxMiner |
+| HiveOS message *"BloxMiner needs an x86-64 CPU with AES-NI …"* | RandomX engine: the CPU lacks AES-NI, which RandomX itself requires |
+| *"Pass is a thread count and must be 1-128"* | Verus engine: Pass is a number outside 1–128. Use a valid count, or put a numeric pool password in Extra config |
+| *"Algorithm must be empty (Verus/VerusHash) …"* | The flight sheet's Hash algorithm is neither empty/Verus nor a RandomX-family value — see [Two engines, one download](#two-engines-one-download) |
 | One row instead of one per core | The miner API did not answer completely in time, or threads could not be bound; `echo -n cores \| nc 127.0.0.1 4068` shows why |
 | `...` in a core cell | That core has not finished its first batch yet (first minute after start) |
 | Hashrate 0 and `STALLED` | No thread finished work for several minutes — usually the pool connection; check the log |
@@ -364,31 +446,54 @@ Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Building
 
-On Ubuntu 22.04 x86-64:
+BloxMiner 3.0.0 does **not** rebuild either engine: `build/package.sh` takes the two engines' own already-built,
+already-released, already-gated binaries (BloxMiner 2.1.0's `bloxminer`+`libomp.so.5`, BloxMiner-X 1.0.0's
+`xmrig`+`bloxsense`), verifies every one of their sha256 hashes against that release's own recorded provenance,
+and assembles the combined package deterministically — two independent runs (including a fresh network re-clone
+of both upstream engines for the source bundle below) give byte-identical output:
 
 ```bash
-build/build.sh                      # clang 14, -march=x86-64-v3 -mtune=znver3 -O3 → out/bloxminer-O3 (+ .provenance)
-build/package.sh out/bloxminer-O3   # → bloxminer-2.1.0.tar.gz + SHA256SUMS
+build/package.sh bloxminer-2.1.0.tar.gz bloxminer-O3.provenance bloxminer-x-1.0.0.tar.gz
+# -> bloxminer-3.0.0.tar.gz + bloxminer-3.0.0-src.tar.gz + SHA256SUMS
 ```
 
-Source: [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183` + [`build/bloxminer.patch`](build/bloxminer.patch).
-The patch adds the BloxMiner screen, log file, sensors and power, the `cores` API, stall detection and fixes for
-pool-input and option parsing; the hashing code (`verus/`) is unchanged.
+To build either engine itself from source (only needed to produce new binaries, e.g. for a future release —
+3.0.0 ships the existing ones unchanged), on Ubuntu 22.04 x86-64:
 
-`build.sh` records the upstream commit, patch hash, flags and the exact version of every build package in
-`<binary>.provenance`; the package's `SOURCE.md` is generated from it. With those package versions the build is
-reproducible bit for bit (two independent builds give the published sha256); newer compiler packages give a
-working but different binary.
+```bash
+build/build.sh      # Verus engine: clang 14, -march=x86-64-v3 -mtune=znver3 -O3 -> out/bloxminer-O3 (+ .provenance)
+build/build-rx.sh   # RandomX engine: gcc 11, cmake Release, static libuv/hwloc/OpenSSL -> out/xmrig, out/bloxsense (+ build.provenance)
+```
 
-Tests (also run by CI): `tests/hive/test_hive_scripts.sh`, and against a built binary
-`tests/engine/cli_test.sh`, `tests/engine/stratum_fuzz.py` and the fake-sysfs sensor tests `tests/engine/test_sys.cpp`
+Source: **Verus engine** — [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183`
++ [`build/bloxminer.patch`](build/bloxminer.patch) (adds the BloxMiner screen, log file, sensors and power, the
+`cores` API, stall detection and fixes for pool-input and option parsing; the hashing code (`verus/`) is
+unchanged). **RandomX engine** — [xmrig/xmrig](https://github.com/xmrig/xmrig) `v6.26.0` +
+[`build/donate0.patch`](build/donate0.patch) (one line: the built-in donation level, 1 % → 0 %) plus
+`bloxsense`, BloxMiner's own CPU/sensor helper (shared byte-identical between both engines' packaging, new code
+in BloxMiner-X 1.0.0).
+
+`build.sh`/`build-rx.sh` record the upstream commit, patch hash, flags and the exact version of every build
+package/static dependency in `<binary>.provenance`/`build.provenance`; each release's `SOURCE.md` is generated
+from it, and `build/package.sh` re-verifies all of it (and re-clones + re-patches both upstream trees for the
+GPL source bundle) before it will assemble a 3.0.0 package — see [SOURCE.md](bloxminer/SOURCE.md) in the
+package and `bloxminer-3.0.0-src.tar.gz`.
+
+Tests (also run by CI): `tests/hive/test_dispatcher.sh` (engine selection, the state file, hugepage hygiene on
+switch), `tests/hive/test_config_diff.sh` (this package's generated configs are byte-equal to the gated
+2.1.0/X 1.0.0 ones for the same inputs), `tests/hive/test_verus_hive_scripts.sh` and
+`tests/hive/test_rx_hive_scripts.sh` (each engine's own gated suite, adapted to the shared package layout),
+`tests/hive/test_rx_under_load.sh` (RandomX engine under full CPU load, including the real `xmrig`+`bloxsense`),
+`tests/build/test_package_provenance.sh` (every sha256 `package.sh` checks really is checked) and
+`tests/bloxsense/run_tests.sh`. Against a built Verus engine binary: `tests/engine/cli_test.sh`,
+`tests/engine/stratum_fuzz.py` and the fake-sysfs sensor tests `tests/engine/test_sys.cpp`
 (`tests/engine/prepare_source.sh` creates the patched source).
 
 ---
 
 ## Algorithm
 
-VerusHash v2.2 combines multiple cryptographic primitives for ASIC resistance:
+**VerusHash v2.2** (Verus engine) combines multiple cryptographic primitives for ASIC resistance:
 
 ```
 Block Data (1487 bytes)
@@ -409,14 +514,22 @@ Final Haraka512 (keyed)
 Hash Result (32 bytes)
 ```
 
+**RandomX** (RandomX engine) is Monero's proof-of-work: a randomised sequence of general-purpose CPU
+instructions and virtual-machine programs per hash, specifically designed to run efficiently only on general
+CPUs (favouring a large cache/random memory access over GPU/ASIC/FPGA throughput). BloxMiner's RandomX engine is
+XMRig, upstream and unmodified except the donation patch above — see the
+[RandomX design document](https://github.com/tevador/RandomX/blob/master/doc/design.md) for the algorithm itself.
+
 ---
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE). BloxMiner 2.x is built from ccminer, which is GPL-licensed.
-The release package also contains `libomp.so.5` (LLVM, Apache-2.0 with LLVM exception; `LICENSE.libomp`,
-`LICENSE.Apache-2.0`). The logo's wordmark is drawn from the Inter typeface (SIL Open Font License 1.1).
-BloxMiner 1.x (the earlier from-scratch C++ miner, MIT) remains in this repository's history.
+GPL-3.0 — see [LICENSE](LICENSE). The Verus engine is built from ccminer; the RandomX engine is built from
+XMRig — both GPL-licensed. The release package also contains `libomp.so.5` (LLVM, Apache-2.0 with LLVM
+exception; `LICENSE.libomp`, `LICENSE.Apache-2.0`, Verus engine only) and, statically linked into the RandomX
+engine, libuv (MIT), hwloc (BSD-3-Clause) and OpenSSL 3 (Apache-2.0) — see `LICENSES/`. The logo's wordmark is
+drawn from the Inter typeface (SIL Open Font License 1.1). BloxMiner 1.x (the earlier from-scratch C++ miner,
+MIT) remains in this repository's history.
 
 ---
 
@@ -425,6 +538,8 @@ BloxMiner 1.x (the earlier from-scratch C++ miner, MIT) remains in this reposito
 - [VerusCoin Team](https://verus.io) - VerusHash
 - [monkins1010/ccminer](https://github.com/monkins1010/ccminer) - Verus ccminer (Christian Buchner, Christian H., tpruvot and contributors)
 - [Oink70/ccminer-verus](https://github.com/Oink70/ccminer-verus) - CPU builds and reference speed
+- [Monero Project](https://www.getmonero.org) / [tevador](https://github.com/tevador/RandomX) - RandomX
+- [XMRig](https://github.com/xmrig/xmrig) - RandomX engine (xmrig.com, XMRig contributors)
 - [Daniel Lemire](https://github.com/lemire/clhash) - CLHash algorithm
 - [LLVM Project](https://llvm.org) - clang and libomp (Apache-2.0 with LLVM exception)
 - [Inter](https://rsms.me/inter/) - typeface of the logo wordmark

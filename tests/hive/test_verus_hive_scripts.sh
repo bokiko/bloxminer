@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Tests for bloxminer/h-config.sh and bloxminer/h-stats.sh (Linux: needs jq, nc, timeout, python3).
+# Tests for bloxminer/engines/verus/h-config.sh and h-stats.sh (adapted from BloxMiner 2.1.0's gated
+# suite: harness paths + the shared top-level manifest/version + the new "ver" format only - all
+# assertions kept). (Linux: needs jq, nc, timeout, python3).
 # Usage: tests/hive/test_hive_scripts.sh
 set -u
-HERE=$(cd "$(dirname "$0")" && pwd); PKG=$(cd "$HERE/../../bloxminer" && pwd)
+HERE=$(cd "$(dirname "$0")" && pwd); PKG=$(cd "$HERE/../../bloxminer/engines/verus" && pwd)
+MANIFEST_SRC=$(cd "$HERE/../../bloxminer" && pwd)/h-manifest.conf   # shared top-level manifest (3.0.0)
 T=$(mktemp -d); trap 'kill "$API_PID" 2>/dev/null; rm -rf "$T"' EXIT
 pass=0; fail=0; API_PID=
 ok()  { pass=$((pass+1)); printf '%-52s ok\n' "$1"; }
@@ -12,7 +15,7 @@ export BLOX_DIR=$T/pkg
 mkdir -p "$BLOX_DIR"
 cp "$PKG"/h-config.sh "$PKG"/h-stats.sh "$BLOX_DIR"/
 sed -e "s#^CUSTOM_CONFIG_FILENAME=.*#CUSTOM_CONFIG_FILENAME=$T/config.json#" \
-    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log/bloxminer#" "$PKG/h-manifest.conf" > "$BLOX_DIR/h-manifest.conf"
+    -e "s#^CUSTOM_LOG_BASENAME=.*#CUSTOM_LOG_BASENAME=$T/log/bloxminer#" "$MANIFEST_SRC" > "$BLOX_DIR/h-manifest.conf"
 CONF=$T/config.json
 NPROC=$(nproc); (( NPROC > 128 )) && NPROC=128
 
@@ -102,7 +105,7 @@ stats_case() {  # name summary cores jq-assertion
 }
 
 stats_case "complete per-core reply" "$SUM_OK" "$CORES_OK" \
-	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "2.1.0" and .stats.algo == "verushash"'
+	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "3.0.0 (verus, engine 2.1.0)" and .stats.algo == "verushash"'
 stats_case "numbers are JSON numbers" "$SUM_OK" "$CORES_OK" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and (.stats.hs | map(type) | unique) == ["number"]'
 stats_case "stale cores reply -> FRESHKHS" "$SUM_OK" "${CORES_OK/AGE=1.2/AGE=9.5}" '.khs == "11900.00" and .stats.hs == [11900]'
