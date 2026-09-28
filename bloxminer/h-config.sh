@@ -24,6 +24,14 @@ if ! select_engine "${CUSTOM_ALGO:-}"; then
 	fail "BloxMiner: Algorithm must be empty (Verus/VerusHash), \"verus\"/\"verushash\", \"randomx\", or one of rx/0 rx/wow rx/arq rx/graft rx/sfx rx/yada (got \"${CUSTOM_ALGO:-}\")"
 fi
 
+# Reject Extra config that carries the OTHER engine's own config.json marker BEFORE the engine's own
+# h-config.sh ever runs, so a rejection leaves config.json completely untouched (not just "correct but
+# ambiguous" - see engine_from_config/reject_foreign_selector in h-common.sh for why this key specifically,
+# and why it can only ever come from Extra config, never from either engine's own fixed output).
+if ! reject_foreign_selector "$ENGINE" "${CUSTOM_USER_CONFIG:-}"; then
+	fail "BloxMiner: Extra config \"$FOREIGN_SELECTOR_KEY\" selects the other engine and cannot be combined with the $ENGINE engine (Algorithm=\"${CUSTOM_ALGO:-}\")"
+fi
+
 export BLOX_DIR
 CUSTOM_ALGO=$NORM_ALGO "$BLOX_DIR/engines/$ENGINE/h-config.sh" || exit 1   # the engine's own h-config.sh
 	# already sent the Hive error message on failure and left the previous config.json untouched (tmp+mv).

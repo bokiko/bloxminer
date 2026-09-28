@@ -108,7 +108,45 @@ else
 	bad "rx engine h-config failure leaves config.json untouched" "rc=$rc"
 fi
 
-# ============================================================== 4. engine derivation: config.json is the SOLE
+# ============================================================== 4. Extra config cannot select the OTHER
+#    engine. Neither engine's PROTECTED-key stripping covers the OTHER engine's own config.json marker (verus
+#    does not protect "randomx" - it has no use for that key itself; rx does not protect a top-level "algo" -
+#    its own algo lives nested under pools[0].algo), so without this check Extra config could make
+#    engine_from_config misidentify - or flag ambiguous - a config generated for the OTHER engine than the one
+#    the flight sheet actually selected. reject_foreign_selector (h-config.sh, before the engine's own
+#    h-config.sh ever runs) refuses any Extra config carrying that key: config.json is left completely
+#    untouched, never merely "correct but ambiguous".
+setup_pkg
+rm -f "$CONF"   # a clean baseline: no leftover config.json from an earlier section's successful hconfig call
+hconfig "p:1" "W" "" '"randomx": {"1gb-pages": true}' ""      # verus (empty algo) + a "randomx" top-level key
+if [[ $rc != 0 && ! -f $CONF ]] && grep -qF "randomx" <<< "$out"; then
+	ok "verus + Extra config \"randomx\" -> rejected, config.json never written"
+else
+	bad "verus + Extra config \"randomx\" -> rejected, config.json never written" "rc=$rc conf_exists=$([[ -f $CONF ]] && echo yes) out=$out"
+fi
+hconfig "p:1" "W" "" '"randomx": {"1gb-pages": true}' "verus"   # explicit "verus" algo, not just empty
+if [[ $rc != 0 && ! -f $CONF ]]; then ok "verus (explicit) + Extra config \"randomx\" -> rejected"; else bad "verus (explicit) + Extra config \"randomx\" -> rejected" "rc=$rc"; fi
+
+hconfig "p:1" "W" "" '"algo": "verus"' "rx/0"                  # rx + a top-level "algo" key (not pools[0].algo)
+if [[ $rc != 0 && ! -f $CONF ]] && grep -qF "algo" <<< "$out"; then
+	ok "rx + Extra config \"algo\" -> rejected, config.json never written"
+else
+	bad "rx + Extra config \"algo\" -> rejected, config.json never written" "rc=$rc conf_exists=$([[ -f $CONF ]] && echo yes) out=$out"
+fi
+
+# a rejection must never leave a PREVIOUS good config.json touched either (same atomicity guarantee as section 3)
+hconfig "p:1" "W" "4" "" ""                                     # good verus baseline
+good_conf3=$(cat "$CONF")
+hconfig "p:1" "W" "4" '"randomx": {}' ""
+if [[ $rc != 0 && $(cat "$CONF") == "$good_conf3" ]]; then ok "foreign-selector rejection leaves a PRIOR good config.json untouched"; else bad "foreign-selector rejection leaves a PRIOR good config.json untouched" "rc=$rc"; fi
+
+# regression: legitimate Extra config (no foreign selector key) for both engines still works exactly as before
+hconfig "p:1" "W" "" '"dashboard": true' ""
+if [[ $rc == 0 && $(jq -r '.algo' "$CONF" 2>/dev/null) == verus ]]; then ok "verus + legitimate Extra config (dashboard) still accepted"; else bad "verus + legitimate Extra config (dashboard) still accepted" "rc=$rc out=$out"; fi
+hconfig "p:1" "W" "" '"tls": true' "rx/0"
+if [[ $rc == 0 && $(jq -r '.pools[0].tls' "$CONF" 2>/dev/null) == true ]]; then ok "rx + legitimate Extra config (tls) still accepted"; else bad "rx + legitimate Extra config (tls) still accepted" "rc=$rc out=$out"; fi
+
+# ============================================================== 5. engine derivation: config.json is the SOLE
 #    authority. A leftover/mismatched marker file (however it got there - an old install, a half-completed
 #    switch simulated either direction) is ignored outright; config always wins. Anything engine_from_config
 #    cannot positively recognise - missing, unreadable, garbage, valid JSON with neither engine's marker, or jq
@@ -162,6 +200,19 @@ if [[ -z $(cfgengine) ]]; then ok "config.json with neither engine's marker -> f
 run_h_run_fail_closed "config.json with neither marker"
 run_h_stats_fail_closed "config.json with neither marker"
 
+# a hand-crafted config.json (never something either engine's own h-config.sh would produce - section 4 keeps
+# a LEGITIMATELY generated one from ever reaching this state) carrying BOTH markers is ambiguous -> fails
+# closed exactly like neither marker being present, never a guess either way
+printf '{"algo":"verus","randomx":{}}\n' > "$CONF"
+if [[ -z $(cfgengine) ]]; then ok "config.json with BOTH markers (algo=verus AND randomx) -> fails closed, ambiguous"; else bad "config.json with BOTH markers (algo=verus AND randomx) -> fails closed, ambiguous" "$(cfgengine)"; fi
+run_h_run_fail_closed "config.json with both markers"
+run_h_stats_fail_closed "config.json with both markers"
+
+# a "randomx" key present but not an object (never something either engine would write) does not count as the
+# rx marker - only the OTHER, correctly-typed marker (if any) is honoured, never treated as an added ambiguity
+printf '{"algo":"verus","randomx":"not-an-object"}\n' > "$CONF"
+if [[ $(cfgengine) == verus ]]; then ok "config.json with wrong-type \"randomx\" (string) + valid algo=verus -> verus, not ambiguous"; else bad "config.json with wrong-type \"randomx\" (string) + valid algo=verus -> verus, not ambiguous" "$(cfgengine)"; fi
+
 hconfig "p:1" "W" "" "" ""   # a genuinely valid config again, to isolate the jq-absence case from a bad config
 # shellcheck disable=SC1007,SC2016   # PATH="" is intentional; the single-quoted $vars expand inside the child, not here
 noqj=$(PATH="" "$BASHBIN" -c '. "$BLOX_DIR/h-manifest.conf" 2>/dev/null; . "$BLOX_DIR/h-common.sh" 2>/dev/null; engine_from_config' 2>/dev/null)
@@ -186,58 +237,111 @@ else
 	bad "h-stats.sh: jq unavailable -> returns cleanly (khs=0, empty stats, never crashes)" "rc=$rc res=$res"
 fi
 
-# ============================================================== 5. huge-page ownership handoff: ONLY the
-#    reservation this package itself made is ever touched - never a blind host-wide reset.
+# ============================================================== 6. huge-page ownership handoff: ONLY the
+#    reservation this package itself made is ever touched - never a blind host-wide reset, and never restored
+#    over the top of a change something else made since. The record holds "prior" (what to restore) AND
+#    "ours" (the value this package itself last set, captured by calling the same idempotent `hugepages -rx`
+#    Hive tool the rx engine's own h-run.sh calls - see h-common.sh's top-of-section comment for why) - a
+#    Verus start only ever restores when the CURRENT value still equals "ours"; otherwise it is left alone, a
+#    conflict is logged, and the record is KEPT (never silently dropped) for a later attempt. A failed restore
+#    write also keeps the record - it is consumed ONLY on a verified, successful restore.
 setup_pkg
 FAKEBIN="$T/fakebin"; mkdir -p "$FAKEBIN"
+PROCROOT="$T/proc"; mkdir -p "$PROCROOT/sys/vm"
+PROCFILE="$PROCROOT/sys/vm/nr_hugepages"
 cat > "$FAKEBIN/sysctl" <<'SH'
 #!/bin/sh
 echo "sysctl $*" >> "$SYSCTL_LOG"
+[ "${SYSCTL_FAIL:-0}" = "1" ] && exit 1
 exit 0
 SH
 chmod +x "$FAKEBIN/sysctl"
-SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG
-PROCROOT="$T/proc"; mkdir -p "$PROCROOT/sys/vm"
-run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # engine binary absent -> exec fails after the hugepage step, harmless here
+cat > "$FAKEBIN/hugepages" <<'SH'
+#!/bin/sh
+echo "hugepages $*" >> "$SYSCTL_LOG"
+[ "$1" = "-rx" ] && echo "${HUGEPAGES_TARGET:-1200}" > "$PROCFILE"
+exit 0
+SH
+chmod +x "$FAKEBIN/hugepages"
+SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE
+sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
+hugepages_called() { grep -q '^hugepages ' "$SYSCTL_LOG" 2>/dev/null; }
+run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # engine binary absent -> exec fails after the hugepage step, harmless here
 
 # ---- fresh verus start, a foreign reservation already on the box (512), no ownership record -> untouched
-echo 512 > "$PROCROOT/sys/vm/nr_hugepages"
+echo 512 > "$PROCFILE"
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
-if [[ ! -s $SYSCTL_LOG && ! -e $HUGEFILE ]]; then
-	ok "fresh verus start, foreign reservation (512), no record -> untouched, no sysctl call"
+if ! sysctl_called && ! hugepages_called && [[ ! -e $HUGEFILE ]]; then
+	ok "fresh verus start, foreign reservation (512), no record -> untouched, no sysctl/hugepages call"
 else
-	bad "fresh verus start, foreign reservation (512), no record -> untouched, no sysctl call" "sysctl_log=$(cat "$SYSCTL_LOG" 2>/dev/null) hugefile=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE")"
+	bad "fresh verus start, foreign reservation (512), no record -> untouched, no sysctl/hugepages call" "log=$(cat "$SYSCTL_LOG" 2>/dev/null) hugefile=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE")"
 fi
-if [[ $(cat "$PROCROOT/sys/vm/nr_hugepages") == 512 ]]; then ok "fresh verus start: host's own nr_hugepages value (512) left as-is"; else bad "fresh verus start: host's own nr_hugepages value (512) left as-is" "$(cat "$PROCROOT/sys/vm/nr_hugepages")"; fi
+if [[ $(cat "$PROCFILE") == 512 ]]; then ok "fresh verus start: host's own nr_hugepages value (512) left as-is"; else bad "fresh verus start: host's own nr_hugepages value (512) left as-is" "$(cat "$PROCFILE")"; fi
 
-# ---- rx start (from the 512 baseline) -> records 512 as the prior value, makes no sysctl call itself
+# ---- rx start (from the 512 baseline) -> runs `hugepages -rx` itself (idempotent with rx's own later call),
+#      records prior=512 (what was there before) and ours=1200 (what it just set, via the fake tool)
+HUGEPAGES_TARGET=1200
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-if [[ $(cat "$HUGEFILE" 2>/dev/null) == 512 ]]; then ok "rx start: records the pre-rx nr_hugepages (512) as the prior value"; else bad "rx start: records the pre-rx nr_hugepages (512) as the prior value" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
-if [[ ! -s $SYSCTL_LOG ]]; then ok "rx start: no sysctl call (only records; never raises/lowers anything itself)"; else bad "rx start: no sysctl call" "$(cat "$SYSCTL_LOG")"; fi
-echo 1200 > "$PROCROOT/sys/vm/nr_hugepages"   # simulate Hive's own `hugepages -rx` having raised it (engines/rx/h-run.sh's own concern, untouched by this package)
+if [[ $(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null) == 512 && $(sed -n 's/^ours=//p' "$HUGEFILE" 2>/dev/null) == 1200 ]]; then
+	ok "rx start: records prior=512 (pre-rx) and ours=1200 (post-rx, via hugepages -rx)"
+else
+	bad "rx start: records prior=512 (pre-rx) and ours=1200 (post-rx, via hugepages -rx)" "$(cat "$HUGEFILE" 2>/dev/null)"
+fi
+# a FRESH rx start calls `hugepages -rx` TWICE: once from note_rx_hugepages_start itself (to observe "ours"),
+# once more from engines/rx/h-run.sh's own unchanged, unconditional call right after exec - both hit the same
+# fake tool here, so counting (not just presence) is what actually distinguishes a fresh start from a restart
+# below. Never sysctl directly (that only ever happens on a Verus start).
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 2 ]] && ! sysctl_called; then ok "rx start: calls hugepages -rx TWICE (this dispatcher's own + the rx engine's own), never sysctl directly"; else bad "rx start: calls hugepages -rx TWICE, never sysctl directly" "$(cat "$SYSCTL_LOG")"; fi
+if [[ $(cat "$PROCFILE") == 1200 ]]; then ok "rx start: nr_hugepages actually raised to 1200 by this dispatcher's own call"; else bad "rx start: nr_hugepages actually raised to 1200" "$(cat "$PROCFILE")"; fi
 
-# ---- rx "restarted" (still rx, e.g. a flight-sheet edit that keeps the algo) -> must NOT overwrite the record
+# ---- rx "restarted" (still rx, e.g. a flight-sheet edit that keeps the algo) -> record already exists, so
+#      note_rx_hugepages_start returns immediately without calling hugepages itself: only ONE call this time
+#      (the rx engine's own unconditional one), not two, and no overwrite of the existing record
 hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run
-if [[ $(cat "$HUGEFILE" 2>/dev/null) == 512 ]]; then ok "rx restarted: existing record (512) NOT overwritten by rx's own raised value"; else bad "rx restarted: existing record (512) NOT overwritten by rx's own raised value" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
-echo 1200 > "$PROCROOT/sys/vm/nr_hugepages"   # (still simulating rx's own reservation being active)
+if [[ $(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null) == 512 && $(sed -n 's/^ours=//p' "$HUGEFILE" 2>/dev/null) == 1200 ]]; then ok "rx restarted: existing record (prior=512/ours=1200) NOT overwritten"; else bad "rx restarted: existing record NOT overwritten" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "rx restarted: hugepages -rx called only ONCE (the engine's own; this dispatcher's own call is skipped)"; else bad "rx restarted: hugepages -rx called only ONCE" "$(cat "$SYSCTL_LOG")"; fi
 
-# ---- verus after two rx starts -> restored to the ORIGINAL prior (512), record removed
+# ---- verus after two rx starts, nr_hugepages still == ours (1200, nothing else touched it) -> restored to
+#      the ORIGINAL prior (512), record removed
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
 if grep -q "nr_hugepages=512" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (restarted twice): restored to the ORIGINAL prior value (512)"; else bad "verus after rx (restarted twice): restored to the ORIGINAL prior value (512)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
-if [[ ! -e $HUGEFILE ]]; then ok "verus after rx: ownership record removed"; else bad "verus after rx: ownership record removed" "still present: $(cat "$HUGEFILE")"; fi
+if [[ ! -e $HUGEFILE ]]; then ok "verus after rx: ownership record removed (restore verified successful)"; else bad "verus after rx: ownership record removed" "still present: $(cat "$HUGEFILE")"; fi
 
 # ---- verus again, no record (already consumed above) -> no sysctl call at all
 : > "$SYSCTL_LOG"; run_h_run
-if [[ ! -s $SYSCTL_LOG ]]; then ok "verus with no record -> no sysctl call"; else bad "verus with no record -> no sysctl call" "$(cat "$SYSCTL_LOG")"; fi
+if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "verus with no record -> no sysctl call" "$(cat "$SYSCTL_LOG")"; fi
 
 # ---- rx from a 0 baseline -> verus restores to 0 (not just non-zero values are handled correctly)
-echo 0 > "$PROCROOT/sys/vm/nr_hugepages"; rm -f "$HUGEFILE"
+echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-echo 1200 > "$PROCROOT/sys/vm/nr_hugepages"
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
 if grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (0 baseline): restored to 0"; else bad "verus after rx (0 baseline): restored to 0" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
 
-# ============================================================== 6. stats never from the previous engine
+# ---- NEW: something else changes nr_hugepages AFTER this package's own rx reservation (foreign write, e.g.
+#      another workload or an operator) -> the next Verus start must NEVER overwrite it: left untouched, the
+#      conflict is logged (own log file, not a Hive toast - this is not fatal), and the record is KEPT (not
+#      dropped) so a later attempt still has "prior" on file.
+echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"; rm -f "$T/log/bloxminer.log"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, ours=1200
+echo 777 > "$PROCFILE"   # a THIRD party changes it - no longer "ours" (1200)
+recorded_before=$(cat "$HUGEFILE")
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
+if ! sysctl_called && [[ $(cat "$PROCFILE") == 777 ]]; then ok "foreign change after rx start (1200 -> 777): Verus start never overwrites it"; else bad "foreign change after rx start: Verus start never overwrites it" "sysctl_log=$(cat "$SYSCTL_LOG") proc=$(cat "$PROCFILE")"; fi
+if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before" ]]; then ok "foreign change: ownership record KEPT unchanged (prior=0/ours=1200), not dropped"; else bad "foreign change: ownership record KEPT unchanged" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING)"; fi
+if [[ -f $T/log/bloxminer.log ]] && grep -q "changed outside this package" "$T/log/bloxminer.log"; then ok "foreign change: conflict logged to this package's own log"; else bad "foreign change: conflict logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+# ---- NEW: nr_hugepages still == ours (no conflict), but the sysctl WRITE itself fails (e.g. permission
+#      denied) -> the record must be RETAINED, never dropped on a failed attempt
+echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"; rm -f "$T/log/bloxminer.log"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=0, ours=1200 (nr_hugepages is 1200 now)
+recorded_before2=$(cat "$HUGEFILE")
+SYSCTL_FAIL=1
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
+SYSCTL_FAIL=0
+if sysctl_called; then ok "failed sysctl write: a restore WAS attempted (nr_hugepages still matched ours)"; else bad "failed sysctl write: a restore WAS attempted" "$(cat "$SYSCTL_LOG")"; fi
+if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before2" ]]; then ok "failed sysctl write: ownership record RETAINED, not dropped"; else bad "failed sysctl write: ownership record RETAINED" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING)"; fi
+
+# ============================================================== 7. stats never from the previous engine
 # Neither fixture engine's real API is running here, so each one falls back to its own DEFINED no-API answer
 # (see each engine's own gated h-stats.sh): verus (unchanged, gated behaviour) reports empty stats outright;
 # rx (unchanged, gated behaviour) still reports a fallback object that echoes config.json's OWN current algo.
@@ -263,7 +367,7 @@ res_rx2=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg s "$stats" "(\$s | if 
 algo_rx2=$(jq -r '.algo // "MISSING"' <<< "$res_rx2" 2>/dev/null)
 if [[ $algo_rx2 == "rx/arq" ]]; then ok "h-stats (rx active again): reflects the NEW current algo (rx/arq), not the earlier rx/wow"; else bad "h-stats (rx active again): reflects the NEW current algo (rx/arq), not the earlier rx/wow" "$res_rx2"; fi
 
-# ============================================================== 7. h-run execs the right engine binary path
+# ============================================================== 8. h-run execs the right engine binary path
 setup_pkg
 hconfig "p:1" "W" "" "" ""
 run_out=$(timeout 2 bash "$BLOX_DIR/h-run.sh" 2>&1)
