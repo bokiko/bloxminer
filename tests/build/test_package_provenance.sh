@@ -89,5 +89,51 @@ tar --owner=0 --group=0 --numeric-owner -C "$RX_EDIT" -czf "$BAD_RX2" bloxminer-
 O="$T/bad-rx-patch"; run_pkg "$VERUS_TGZ" "$VERUS_PROV" "$BAD_RX2" "$O"
 if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "donate0.patch" <<< "$out"; then ok "tampered rx provenance patch_sha256 -> package.sh refuses"; else bad "tampered rx provenance patch_sha256 -> package.sh refuses" "rc=$rc out=$out"; fi
 
+# ---- 8: bundled bloxsense SOURCE tampered by one byte (the binary and its own build.provenance are both
+#      untouched - only the source this repo is about to ship next to that binary changed) -> refuses. package.sh
+#      is run from a throwaway full copy of this repo (never the real checkout) so the tamper never touches
+#      the working tree; only bloxsense.cpp is touched, one byte, well inside the file.
+REPO_COPY="$T/repo-tamper"; rm -rf "$REPO_COPY"; mkdir -p "$REPO_COPY"
+tar -C "$ROOT" --exclude=.git --exclude=.backups -cf - . | tar -C "$REPO_COPY" -xf -
+python3 - "$REPO_COPY/bloxsense/bloxsense.cpp" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p, "r+b") as f:
+	f.seek(200)
+	b = f.read(1)
+	f.seek(200)
+	f.write(bytes([b[0] ^ 0xFF]))
+PY
+O="$T/bad-bloxsense-src"; out=$(bash "$REPO_COPY/build/package.sh" "$VERUS_TGZ" "$VERUS_PROV" "$RX_TGZ" "$O" 2>&1); rc=$?
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "bloxsense/bloxsense.cpp" <<< "$out"; then
+	ok "tampered bloxsense.cpp source (1 byte) -> package.sh refuses"
+else
+	bad "tampered bloxsense.cpp source (1 byte) -> package.sh refuses" "rc=$rc out=$out"
+fi
+# control: the SAME kind of throwaway copy, untouched, still packages successfully - proves the refusal above
+# is really about the tamper and not some artefact of running out of a copy
+REPO_COPY_CONTROL="$T/repo-tamper-control"; rm -rf "$REPO_COPY_CONTROL"; mkdir -p "$REPO_COPY_CONTROL"
+tar -C "$ROOT" --exclude=.git --exclude=.backups -cf - . | tar -C "$REPO_COPY_CONTROL" -xf -
+O="$T/ok-repo-copy"; out=$(bash "$REPO_COPY_CONTROL/build/package.sh" "$VERUS_TGZ" "$VERUS_PROV" "$RX_TGZ" "$O" 2>&1); rc=$?
+if [[ $rc == 0 && -f $O/bloxminer-3.0.0.tar.gz ]]; then ok "control: untampered repo copy -> package.sh still succeeds"; else bad "control: untampered repo copy -> package.sh still succeeds" "rc=$rc out=$out"; fi
+
+# ---- 9: build/build-rx.sh's own HELPERS list (blocker 4) - every path it records a source hash for must
+#      resolve to a real file in THIS repo layout (bloxminer/engines/rx/..., not the obsolete standalone
+#      bloxminer-x/... paths), and its own self-reference must be build/build-rx.sh, never build/build.sh (the
+#      unrelated Verus/ccminer builder) - otherwise a real build/build-rx.sh run (root, Ubuntu 22.04, network;
+#      not exercised by this suite) would abort mid-provenance on a missing file, per its own `set -euo
+#      pipefail`, and never produce a complete build.provenance at all. This is the cheap static equivalent of
+#      that check.
+missing=""
+while IFS= read -r h; do
+	[[ -f "$ROOT/$h" ]] || missing+="${missing:+, }$h"
+done < <(sed -n "/^HELPERS=(/,/)/p" "$ROOT/build/build-rx.sh" | tr -d '()' | sed 's/^HELPERS=//' | tr -s ' \t\n' '\n' | grep -v '^$')
+if [[ -z $missing ]]; then ok "build-rx.sh HELPERS: every referenced source path exists in this repo layout"; else bad "build-rx.sh HELPERS: every referenced source path exists in this repo layout" "missing: $missing"; fi
+if grep -q 'build/build-rx\.sh' "$ROOT/build/build-rx.sh" && ! grep -qE '^\s*build/build\.sh\b' "$ROOT/build/build-rx.sh"; then
+	ok "build-rx.sh HELPERS: self-referenced as build/build-rx.sh, not build/build.sh"
+else
+	bad "build-rx.sh HELPERS: self-referenced as build/build-rx.sh, not build/build.sh" "$(grep -n 'build/build' "$ROOT/build/build-rx.sh")"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

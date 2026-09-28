@@ -40,6 +40,15 @@ p_rx() { sed -n "s|^$1=||p" "$RXPROV"; }
 [[ $(p_rx bloxsense_sha256) == "$(sha256sum "$XSENSE" | cut -d' ' -f1)" ]] || { echo "bloxsense sha256 does not match $RXPROV"; exit 1; }
 [[ $(p_rx patch_sha256) == "$(sha256sum "$ROOT/build/donate0.patch" | cut -d' ' -f1)" ]] || { echo "rx provenance patch_sha256 does not match this repo's build/donate0.patch"; exit 1; }
 
+# bloxsense is compiled from these three sources (build/build-rx.sh's own HELPERS list, recorded at build
+# time as helper.bloxsense/<file>.sha256); the binary above is only verified against the bytes it actually
+# WAS built from - it says nothing about the sources THIS repo is about to ship next to it. Refuse to package
+# if any of the three has changed since that build, exactly as if the binary itself had changed.
+for BS in blox.h blox_sys.cpp bloxsense.cpp; do
+	[[ $(p_rx "helper.bloxsense/$BS.sha256") == "$(sha256sum "$ROOT/bloxsense/$BS" | cut -d' ' -f1)" ]] ||
+		{ echo "bloxsense/$BS does not match its recorded source hash in $RXPROV - refusing to package"; exit 1; }
+done
+
 REPO_COMMIT=${BLOXMINER_REPO_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}
 
 # combined provenance: the two original, already-verified provenances kept verbatim (namespaced verus./rx.),
@@ -55,6 +64,12 @@ AUGPROV="$W/build.provenance"
 	echo "rx.source_release=$(basename "$RX_TGZ")"
 	echo "rx.source_release_sha256=$(sha256sum "$RX_TGZ" | cut -d' ' -f1)"
 	sed 's/^/rx./' "$RXPROV"
+	# dispatcher.*: this integration's own new scripts (neither engine's own gated release ever shipped or
+	# recorded these - they exist only from this repo commit forward), recorded here so a later package can be
+	# checked against this one the same way the two engines' own binaries already are.
+	for D in h-common.sh h-config.sh h-run.sh h-stats.sh; do
+		echo "dispatcher.$D.sha256=$(sha256sum "$ROOT/bloxminer/$D" | cut -d' ' -f1)"
+	done
 } > "$AUGPROV"
 
 gen_source_md() {   # $1 = "binary" or "src"

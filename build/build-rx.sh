@@ -18,10 +18,13 @@ COMMIT=b2ca72480c58d197e18c885d9fc1a0c8d517e60a   # pinned tag commit; build fai
 # "helper" source files (everything BloxMiner-X adds on top of XMRig): their sha256, AS THEY EXIST RIGHT NOW
 # at build time, is recorded in build.provenance below. build/package.sh recomputes these same hashes from the
 # files it is about to ship and refuses to package if any of them changed since this build - so a package can
-# never ship helper sources that do not match the binary they are shipped next to.
+# never ship helper sources that do not match the binary they are shipped next to. Paths are relative to this
+# combined repo's layout (bloxminer/engines/rx/, not the standalone bloxminer-x repo's bloxminer-x/); this
+# script tracks its OWN file as build/build-rx.sh, never build/build.sh (that is the unrelated Verus/ccminer
+# builder).
 HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
-         bloxminer-x/h-config.sh bloxminer-x/h-run.sh bloxminer-x/h-stats.sh bloxminer-x/h-manifest.conf
-         build/build.sh build/package.sh build/donate0.patch)
+         bloxminer/engines/rx/h-config.sh bloxminer/engines/rx/h-run.sh bloxminer/engines/rx/h-stats.sh bloxminer/h-manifest.conf
+         build/build-rx.sh build/package.sh build/donate0.patch)
 
 # Dependency tarballs xmrig's own scripts/build.uv.sh, build.hwloc.sh, build.openssl3.sh fetch for this tag,
 # pinned by sha256 computed by hand from these exact URLs (upstream ships no checksums for them).

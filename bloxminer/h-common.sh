@@ -1,13 +1,12 @@
 # shellcheck shell=bash
 # Sourced by the top-level dispatcher scripts only (h-config.sh, h-run.sh, h-stats.sh) - never by the gated
 # per-engine scripts under engines/verus/ or engines/rx/, which stay unaware that a dispatcher exists.
-# Engine selection (flight-sheet CUSTOM_ALGO) and the engine state file (single source of truth for h-run and
-# h-stats, so they never re-derive the choice differently than h-config committed it) live here once.
+# Engine selection (flight-sheet CUSTOM_ALGO, used only by h-config.sh to build a fresh config.json) and the
+# huge-page ownership record (used only by h-run.sh, see below) live here once.
 BLOX_DIR=${BLOX_DIR:-/hive/miners/custom/bloxminer}
 
 STATEDIR=${BLOX_STATE_DIR:-}
 if [[ -z $STATEDIR ]]; then [[ -d /run/hive ]] && STATEDIR=/run/hive || STATEDIR=$BLOX_DIR; fi
-ENGINE_STATE_FILE="$STATEDIR/.bloxminer-engine"
 
 RX_ALGOS=(rx/0 rx/wow rx/arq rx/graft rx/sfx rx/yada)
 
@@ -30,32 +29,61 @@ select_engine() {
 	return 1
 }
 
-# write_engine_state <verus|rx> - atomic tmp+mv, exactly like every config.json write in this package. Called
-# ONLY after that engine's own h-config.sh has already succeeded (config.json rewritten first): a reader can
-# never observe a state file naming an engine whose config.json was not actually regenerated for it.
-write_engine_state() {
-	local tmp="$ENGINE_STATE_FILE.tmp.$$"
-	{ printf '%s\n' "$1" > "$tmp"; } 2>/dev/null && mv -f "$tmp" "$ENGINE_STATE_FILE" 2>/dev/null
+# engine_from_config - the ONLY source of truth for which engine is currently active, used by h-run.sh and
+# h-stats.sh. There is deliberately no separate "engine state" file to read: each engine's own h-config.sh
+# already writes $CUSTOM_CONFIG_FILENAME atomically (tmp+mv, see engines/verus/h-config.sh and
+# engines/rx/h-config.sh), so config.json is always one consistent generation - a reader can never observe a
+# half-written config, and there is no second file that could ever fall out of step with it (the race a
+# separate state file would reintroduce: config.json rewritten for the new engine but the state file not yet
+# updated, or vice versa). The rx engine's config always has a top-level "randomx" object; the verus engine's
+# always has "algo":"verus" (see both engines' h-config.sh). Prints exactly "verus" or "rx" and returns 0 on a
+# recognised config; returns 1 (prints nothing) and lets the caller decide how to fail closed otherwise -
+# config.json missing, unreadable, invalid JSON, valid JSON with neither marker, or jq itself unavailable.
+# Never guesses/defaults to either engine.
+engine_from_config() {
+	command -v jq > /dev/null 2>&1 || return 1
+	[[ -n ${CUSTOM_CONFIG_FILENAME:-} && -r $CUSTOM_CONFIG_FILENAME ]] || return 1
+	if jq -e 'has("randomx")' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1; then echo rx; return 0; fi
+	if jq -e '.algo == "verus"' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1; then echo verus; return 0; fi
+	return 1
 }
 
-# infer_engine_from_config - recovers the engine from $CUSTOM_CONFIG_FILENAME's own content when the state
-# file is missing, unreadable, or holds anything other than "verus"/"rx" (stale/corrupt). The rx engine's
-# config always has a top-level "randomx" object; the verus engine's always has "algo":"verus". Falls back to
-# verus - the safe default (backward compatible with 2.1.0, and the engine that reserves no host resources).
-infer_engine_from_config() {
-	if [[ -n ${CUSTOM_CONFIG_FILENAME:-} && -r $CUSTOM_CONFIG_FILENAME ]] && command -v jq > /dev/null 2>&1; then
-		if jq -e 'has("randomx")' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1; then echo rx; return; fi
-		if jq -e '.algo == "verus"' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1; then echo verus; return; fi
+# Huge-page ownership (h-run.sh only): the RandomX engine reserves ~1200 x 2 MB huge pages on start (Hive's own
+# `hugepages -rx` helper, see engines/rx/h-run.sh) and nothing ever releases them again - custom miners have no
+# stop hook. Rather than unconditionally resetting the host's hugepage count on every Verus start (stomping any
+# OTHER reservation on the box - another workload, or an operator's own setting), this package tracks ONLY the
+# reservation IT made, in one small ownership file under $STATEDIR (/run/hive when present - tmpfs, so a reboot
+# clears this record together with the non-persistent reservation it describes; verified live against Hive's
+# own `hugepages` tool on a rig, 2026-09-28: `-rx` computes its own target from NUMA/CPU count and writes
+# /proc/sys/vm/nr_hugepages directly - it never reads the prior value and never persists anything to
+# /etc/sysctl.conf or any boot-time setting, so a plain "put back what was there before" is the complete fix).
+HUGEPAGES_FILE="$STATEDIR/.bloxminer-hugepages"
+
+# note_rx_hugepages_start - called just before exec'ing the rx engine. Records the CURRENT vm.nr_hugepages
+# ONLY if no record already exists: an rx restart (rx -> rx, e.g. a flight-sheet edit that keeps the same
+# algo) must never overwrite an existing record with rx's own already-raised value, or that raised value would
+# become the "prior" value restored on the next Verus start. No-op (and no sysctl/proc access at all) if the
+# record already exists or the current value cannot be read.
+note_rx_hugepages_start() {
+	[[ -e $HUGEPAGES_FILE ]] && return 0
+	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" cur tmp
+	[[ -r $proc ]] || return 0
+	cur=$(<"$proc") 2>/dev/null
+	[[ $cur =~ ^[0-9]+$ ]] || return 0
+	tmp="$HUGEPAGES_FILE.tmp.$$"
+	{ printf '%s\n' "$cur" > "$tmp"; } 2>/dev/null && mv -f "$tmp" "$HUGEPAGES_FILE" 2>/dev/null
+}
+
+# restore_verus_hugepages - called just before exec'ing the verus engine. Restores vm.nr_hugepages to the
+# recorded prior value and removes the record, ONLY if a record exists - a fresh install, or a Verus start
+# that was never preceded by an rx start under this package's ownership, touches vm.nr_hugepages at all (no
+# sysctl call), so a foreign/manual reservation is left exactly as found.
+restore_verus_hugepages() {
+	[[ -e $HUGEPAGES_FILE ]] || return 0
+	local prior; prior=$(<"$HUGEPAGES_FILE") 2>/dev/null
+	if [[ $prior =~ ^[0-9]+$ ]]; then
+		{ command -v sysctl > /dev/null 2>&1 && sysctl -q -w vm.nr_hugepages="$prior"; } 2>/dev/null
 	fi
-	echo verus
-}
-
-# read_engine_state - the single source of truth h-run and h-stats both use, so they can never disagree with
-# each other or with what h-config last committed. Prints exactly "verus" or "rx", always.
-read_engine_state() {
-	local e=""
-	[[ -r $ENGINE_STATE_FILE ]] && e=$(<"$ENGINE_STATE_FILE")
-	e=$(tr -d '[:space:]' <<< "$e")
-	if [[ $e == verus || $e == rx ]]; then echo "$e"; return; fi
-	infer_engine_from_config
+	rm -f "$HUGEPAGES_FILE" 2>/dev/null
+	true
 }
