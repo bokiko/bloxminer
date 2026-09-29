@@ -236,6 +236,12 @@ threads[2]["hashrate"][0] = 5000.0
 print(json.dumps([{"type": "cpu", "threads": threads}]))
 PY
 )
+BACK_COMPLETE=$(python3 - <<'PY'
+import json
+threads = [{"affinity": c, "hashrate": [(c + 1) * 1000.0, None, None]} for c in range(4)]   # complete: no nulls
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+PY
+)
 reset_proc; listen 20002 1002 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
 stats_case "null thread rates -> incomplete, Phase A's WHOLE result stands (never a mixed payload)" 20002 "$SUM_OK" "$BACK_NULLS" \
@@ -297,24 +303,24 @@ stats_case "affinity == -1 -> per-thread rows, package temp" 20006 "$SUM_OK" "$B
 reset_proc; listen 20007 1007 "$BLOX_DIR/xmrig"
 task "t0" "0"; task "t1" "1"; task "t2" "2"   # thread for cpu 3 never shows a single-CPU mask: verification fails
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "affinity not independently confirmed -> per-thread rows, package temp" 20007 "$SUM_OK" "$BACK_NULLS" \
+stats_case "affinity not independently confirmed -> per-thread rows, package temp" 20007 "$SUM_OK" "$BACK_COMPLETE" \
 	'(.stats.hs | length) == 4 and (.stats.temp | unique) == [70]'
 
 reset_proc; listen 20008 1008 "$BLOX_DIR/xmrig"
 task "t0" "0"; task "t1" "1"; task "t2" "1"; task "t3" "3"   # cpu 1 pinned twice, cpu 2 never -> multiset mismatch
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "duplicate task pinning -> multiset mismatch -> per-thread rows" 20008 "$SUM_OK" "$BACK_NULLS" \
+stats_case "duplicate task pinning -> multiset mismatch -> per-thread rows" 20008 "$SUM_OK" "$BACK_COMPLETE" \
 	'(.stats.temp | unique) == [70]'
 
 reset_proc; listen 20009 1009 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "numeric JSON types throughout (nulls allowed only for rows a fresh rate is genuinely missing for)" 20009 "$SUM_OK" "$BACK_NULLS" \
+stats_case "numeric JSON types throughout, complete reply" 20009 "$SUM_OK" "$BACK_COMPLETE" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and
-	 (.stats.hs | map(type) | unique | sort) == ["null", "number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
+	 (.stats.hs | map(type) | unique) == ["number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
 
 reset_proc; listen 20011 1011 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4 95.5)"
-stats_case "fractional power_w (95.5) is not dropped" 20011 "$SUM_OK" "$BACK_NULLS" '.stats.cpu_power == 95.5'
+stats_case "fractional power_w (95.5) is not dropped" 20011 "$SUM_OK" "$BACK_COMPLETE" '.stats.cpu_power == 95.5'
 
 BACK_BAD_TYPES=$(python3 - <<'PY'
 import json
