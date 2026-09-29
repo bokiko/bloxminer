@@ -297,9 +297,9 @@ stats_case "duplicate task pinning -> multiset mismatch -> per-thread rows" 2000
 
 reset_proc; listen 20009 1009 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "numeric JSON types throughout" 20009 "$SUM_OK" "$BACK_NULLS" \
+stats_case "numeric JSON types throughout (nulls allowed only for rows a fresh rate is genuinely missing for)" 20009 "$SUM_OK" "$BACK_NULLS" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and
-	 (.stats.hs | map(type) | unique) == ["number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
+	 (.stats.hs | map(type) | unique | sort) == ["null", "number"] and (.khs | type) == "string" and (.khs | tonumber | type) == "number"'
 
 reset_proc; listen 20011 1011 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4 95.5)"

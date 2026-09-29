@@ -353,7 +353,7 @@ run() {
 	if (( percore )); then
 		note_state ok
 		rows=$(jq -c --argjson s "$sense" '
-			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then null else $r end;
+			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			($s.cpus | map({key: (.cpu | tostring), value: {pkg: .pkg, core: .core, temp: .temp}}) | from_entries) as $topo
 			| map(. + {pc: $topo[(.affinity | tostring)], r0: rate0})
 			| group_by([.pc.pkg, .pc.core])
@@ -364,7 +364,7 @@ run() {
 	else
 		note_state unverified
 		rows=$(jq -c --argjson pt "$pkg_temp" '
-			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then null else $r end;
+			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)' <<< "$threads")
 	fi
 
