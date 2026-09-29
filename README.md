@@ -84,21 +84,22 @@ restarting the miner:
 | `rx/wow`, `rx/arq`, `rx/graft`, `rx/sfx`, `rx/yada` | RandomX | The other RandomX-family variants XMRig supports |
 | anything else | *(refused)* | HiveOS shows an error message; the miner does not start (no restart loop) |
 
-The two engines' own mining code is otherwise **unchanged** from their previously gated selves — BloxMiner
-2.1.0's ccminer engine and BloxMiner-X 1.0.0's XMRig engine. BloxMiner 3.0.0 rebuilds both, each with one small,
-precisely scoped, proven change: the Verus engine's own `configure.ac` release number (`AC_INIT`) moves 2.1.0 →
-3.0.0 — that one line is the *entire* source diff versus the 2.1.0 patch — and every hashing function in the
-resulting binary is proven instruction-identical to the 2.1.0 binary (`tools/hashing-identity.sh`, 15/15); the
-RandomX engine gets one extra *display-only* patch, `build/branding.patch`, on top of `build/donate0.patch` —
-it adds two cosmetic log lines (a startup summary line and a periodic hashrate prefix) touching two source
-files (plus one new header) and nothing else; XMRig's own `APP_VERSION`/user-agent/API version stay exactly
-`6.26.0` for pool/API compatibility. Identity proof for the RandomX engine: rebuilding the pre-branding
-(`donate0.patch`-only) source tree with the exact same recipe/toolchain used for the shipped binary reproduces
-BloxMiner-X 1.0.0's own released xmrig binary **bit-for-bit** (sha256 `721aa3fc9a7a…`); comparing that
-reproduction against the shipped, branded binary (`44cff475d581…`) object file by object file shows 208 of 210
-`.o` files byte-identical — the only two that differ are the two touched source files' own objects, and
-`xmrig --bench=1M` produces the identical result hash on both binaries. See [Building](#building), this
-release's own `C6-BRANDING.md`, and `docs/3.0.0-engine-identity.md` for the full proof output including exact
+The two engines' own mining code is otherwise **unchanged** from their previous internal builds — BloxMiner
+2.1.0's ccminer engine, and the RandomX engine, which is **XMRig 6.26.0 with the donation level set to 0**
+(plus, as of 3.0.0, a display-only BloxMiner label — see below). BloxMiner 3.0.0 rebuilds both, each with one
+small, precisely scoped, proven change: the Verus engine's own `configure.ac` release number (`AC_INIT`) moves
+2.1.0 → 3.0.0 — that one line is the *entire* source diff versus the 2.1.0 patch — and every hashing function
+in the resulting binary is proven instruction-identical to the 2.1.0 binary (`tools/hashing-identity.sh`,
+15/15); the RandomX engine gets one extra *display-only* patch, `build/branding.patch`, on top of
+`build/donate0.patch` — it adds two cosmetic log lines (a startup summary line and a periodic hashrate prefix)
+touching two source files (plus one new header) and nothing else; XMRig's own `APP_VERSION`/user-agent/API
+version stay exactly `6.26.0` for pool/API compatibility. Identity proof for the RandomX engine: rebuilding the
+pre-branding (`donate0.patch`-only) source tree with the exact same recipe/toolchain used for the shipped
+binary reproduces this engine's own previous internal build (never separately published) **bit-for-bit**
+(sha256 `721aa3fc9a7a…`); comparing that reproduction against the shipped, branded binary (`44cff475d581…`)
+object file by object file shows 208 of 210 `.o` files byte-identical — the only two that differ are the two
+touched source files' own objects, and `xmrig --bench=1M` produces the identical result hash on both binaries.
+See [Building](#building) and `docs/3.0.0-engine-identity.md` for the full proof output including exact
 binaries compared. Only the parts that genuinely have to be shared (the package directory, the log file base,
 the engine picker itself) are new. That means:
 
@@ -108,7 +109,7 @@ the engine picker itself) are new. That means:
   autoconfig, steerable via Extra config (see [Configuration](#configuration)).
 - **"Pass" in the miner screen/API means something different per engine too**: the Verus engine's `A`/`R`
   counts and per-core table are its own (see [The miner screen](#the-miner-screen)); the RandomX engine reports
-  XMRig's own accepted/rejected counts and per-core rows the same way BloxMiner-X 1.0.0 did.
+  XMRig's own accepted/rejected counts and per-core rows, the same way it always has.
 - **Each engine keeps its own Extra config options** — the Verus ones (`threads`, `ccd-temp-map`, `dashboard`,
   …, see [Configuration](#configuration)) only apply when Hash algorithm selects the Verus engine; the RandomX
   ones (`tls`, `1gb-pages`, `cpu`, …) only apply when it selects the RandomX engine. Setting a Verus-only key
@@ -118,8 +119,10 @@ the engine picker itself) are new. That means:
   points at the Verus engine's API; it is simply dead while the RandomX engine is active (the miner screen and
   HiveOS farm stats are unaffected either way — neither depends on `WEB_PORT`).
 - **Switching engines is clean**: the previous engine is never left running (HiveOS stops it before the new one
-  starts), its config.json is fully rewritten for the new engine, and if the RandomX engine had reserved huge
-  pages, switching to the Verus engine releases them (the Verus engine never wants hugepages reserved).
+  starts), and its config.json is fully rewritten for the new engine. If the RandomX engine had reserved huge
+  pages, switching to the Verus engine releases that reservation *only* when it was confirmed ("finalized") in
+  the same boot and `vm.nr_hugepages` still matches what BloxMiner left it at — otherwise it is left untouched
+  and logged, never guessed at. See [Huge pages](#huge-pages) for the exact conditions.
 
 ---
 
@@ -172,10 +175,19 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `2.1.0` → `3.0.0`) and apply the flight sheet.
-HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same — a 2.1.0
-Verus rig keeps mining Verus (Hash algorithm was already `verushash`, or is added now for clarity); switching
-an existing rig to RandomX is just changing Hash algorithm, Pool URL and Wallet, then applying.
+**From 2.1.0**: change only the version in the Installation URL (`2.1.0` → `3.0.0`) and apply the flight sheet.
+Everything else keeps working as before — an empty Hash algorithm still means the Verus engine, so a 2.1.0
+Verus rig upgrades in place with no other field changes. HiveOS downloads the new package and restarts the
+miner.
+
+**Switching an existing rig between engines** (e.g. Verus → RandomX on the same rig): change Hash algorithm,
+Pool URL and Wallet as usual, but also **review Pass and Extra config** — both mean something different per
+engine (see [Two engines, one download](#two-engines-one-download)), so carrying either over unchanged is
+usually wrong, not just unnecessary:
+- **Pass**: a thread count `1`–`128` on the Verus engine; the pool password on the RandomX engine.
+- **Extra config**: engine-specific keys (e.g. `ccd-temp-map` vs `1gb-pages`) are simply ignored on the wrong
+  engine, but the other engine's own selector marker (a top-level `randomx` key, or `algo`) is rejected
+  outright if it ends up in Extra config — the miner refuses to start rather than produce an ambiguous config.
 
 ---
 
@@ -251,6 +263,20 @@ Captured from a Ryzen 9 5900X (80 columns) a few seconds after start:
 - `STALLED` in the header means no thread has finished work recently; the miner then reports 0 H/s (see
   [HiveOS stats](#hiveos-stats)).
 
+**RandomX engine** — the screen is XMRig 6.26.0's own, with two added BloxMiner lines: a startup summary line
+and a literal prefix on the existing periodic speed line. Captured output (colours on, as HiveOS gets by
+default; ANSI stripped here for readability):
+
+```
+ * BLOXMINER    3.0.0 (XMRig 6.26.0 engine)
+...
+BloxMiner 3.0.0  miner    speed 10s/60s/15m 8869.8 n/a n/a H/s max 9061.2 H/s
+```
+
+Everything else — the rest of the startup banner, share lines, per-thread output — is XMRig's own, unmodified.
+HiveOS reports the version as `3.0.0 (xmrig 6.26.0)` (the Verus engine reports `3.0.0 (verus)`) — see
+[HiveOS stats](#hiveos-stats).
+
 ---
 
 ## Configuration
@@ -271,6 +297,10 @@ The flight sheet is turned into `/hive/miners/custom/bloxminer/config.json` ever
   "log-file": "/var/log/miner/bloxminer/bloxminer.log"
 }
 ```
+
+Each flight sheet configures **exactly one pool, with no failover list** — if that pool goes down, the miner
+idles and retries against it rather than falling over to another one; point Pool URL at a different pool and
+re-apply the flight sheet if you need to change it.
 
 **Extra config arguments** are JSON members merged into this file (keys are the long option names), e.g.
 `"threads": 12`, `"pass": "1234"`, `"ccd-temp-map": "1"`, `"dashboard": true`, `"stats-interval": 30`.
@@ -313,8 +343,14 @@ CPU requirements are per engine (each keeps its own gated check, unchanged): the
 x86-64-v3 with AES-NI and PCLMUL (AMD Zen or newer, Intel Haswell or newer); the **RandomX engine** needs only
 AES-NI (RandomX itself requires AES acceleration) on any x86-64 CPU — see
 [Two engines, one download](#two-engines-one-download). The table below describes the Verus engine's own
-per-core stats; the RandomX engine's stats and topology detection are XMRig's own (BloxMiner-X 1.0.0, unchanged).
-Run `bloxminer --sensors` to see exactly what the Verus engine detects on your machine.
+per-core stats; the RandomX engine's stats and topology detection are XMRig's own (unchanged since this
+engine's first internal build). Run `bloxminer --sensors` to see exactly what the Verus engine detects on your
+machine.
+
+**Validated on real HiveOS rigs** (beyond the CI/toolchain checks above): **Ryzen 9 5950X** — both engines
+(RandomX: MSR `ryzen_19h` preset, dataset huge pages 100 %, live pool mining, engine switching, kill/restart,
+HiveOS agent restart; Verus: live pool mining, per-CCD temperature mapping — see the table below). **Ryzen 9
+5900X** — Verus engine, per-CCD temperature mapping.
 
 | Feature | Where it works |
 |---------|----------------|
@@ -409,26 +445,32 @@ CPU=0;KHS=1363.02;AFF=0;AGE=8;DUR=36;STATE=hashing|CPU=1;KHS=1372.25;AFF=1;AGE=8
 
 ## Huge pages
 
-The RandomX engine reserves ~1200 × 2 MB huge pages on start (Hive's own `hugepages -rx` helper, then XMRig
-itself tops that up further if it needs more - see [Troubleshooting](#troubleshooting) if you ever see this
-misbehave). Switching to the Verus engine releases exactly that reservation back to whatever it was before -
-see [Two engines, one download](#two-engines-one-download).
+The RandomX engine reserves ~1200 × 2 MB huge pages on start: Hive's own `hugepages -rx` helper sets an
+initial `vm.nr_hugepages`, then XMRig itself may raise that value further on its own (it maps one extra huge
+page for its JIT compiler that Hive's helper does not account for). BloxMiner does not trust Hive's number for
+this — it measures what XMRig actually mapped, read from the running process's own memory map
+(`/proc/<pid>/smaps_rollup`), and that measured value is what gets recorded and (conditionally) restored below.
 
 **Exclusive-ownership policy.** From the moment the dispatcher runs `hugepages -rx` for a fresh RandomX start
-until this package positively confirms ("finalizes") what XMRig itself raised `vm.nr_hugepages` to, BloxMiner
-considers itself the SOLE owner of `vm.nr_hugepages` on this rig, and treats any other write to it during that
-window as unsupported. This is deliberate, not an oversight: HiveOS runs exactly one miner at a time, and the
-only other program that ever touches `vm.nr_hugepages` on a Hive rig is Hive's own `hugepages` tool - which
-BloxMiner itself is the one invoking. If you run something else on the box that also writes
-`vm.nr_hugepages` during that short startup window (a custom script, another miner test, manual `sysctl`), a
-race is possible and this package may adopt a value it did not itself set; do not do that. The window is also
-explicitly time-bounded (see `HUGEPAGES_STARTUP_WINDOW_S` in `bloxminer/h-common.sh` - 300 s by default,
-comfortably above the ~2 s a real dataset takes to become ready on a modern CPU): if the RandomX engine's
-huge-page reservation is not confirmed within that window, this package gives up on ever finalizing that
-session's record - it is logged once, and no restore will happen on the next Verus switch (the "unsupported"
+until this package positively confirms ("finalizes") what XMRig itself raised `vm.nr_hugepages` to — bounded by
+`HUGEPAGES_STARTUP_WINDOW_S` in `bloxminer/h-common.sh`, 300 s by default (comfortably above the ~2 s a real
+dataset takes to become ready on a modern CPU — finalization happens within seconds in practice) — BloxMiner
+assumes it is the **only** thing writing `vm.nr_hugepages` on the rig, since HiveOS runs exactly one miner at a
+time. Anything else that also writes `vm.nr_hugepages` during that same window (a custom script, another miner
+test, manual `sysctl`) is unsupported and can make BloxMiner adopt a value it did not itself set; don't do
+that. If the reservation is never confirmed within the window, BloxMiner gives up on ever finalizing that
+session's record — it is logged once, and no restore will happen on the next Verus switch (the "unsupported"
 outcome above is scoped to that startup window alone, never open-ended).
 
-A finalized record is also only ever trusted within the SAME boot it was written in (`boot_id` from
+**Restore conditions, on switching to the Verus engine.** The reservation is only ever restored automatically
+when **both** are true: the RandomX engine's reservation was finalized (confirmed, as above) in the *same
+boot*, and `vm.nr_hugepages` still equals exactly the value BloxMiner left it at (nothing else changed it in
+the meantime). If either condition fails — no finalized record, a different boot, or the live value has moved
+— BloxMiner leaves `vm.nr_hugepages` untouched and logs why, rather than guessing. **1 GB pages are never
+auto-restored**, under any condition (this covers 2 MB huge pages only); if you turn on `1gb-pages` in Extra
+config, plan to manage that reservation yourself.
+
+A finalized record is only ever trusted within the SAME boot it was written in (`boot_id` from
 `/proc/sys/kernel/random/boot_id`, checked both when finalizing and again before every restore) - it lives on
 tmpfs anyway, so a reboot normally clears it outright, but this is a second, explicit guard in case that ever
 is not true (an unusual `$STATEDIR` override, for example).
@@ -457,6 +499,35 @@ BloxMiner **+0.4 %** versus Oink — equal within measurement noise — while ad
 Overall **−0.27 %**, within the run-to-run noise (about ±1 % between 10-minute slots). The hashing code of 2.1.0 is
 instruction-identical to
 2.0.0 ([`tools/hashing-identity.sh`](tools/hashing-identity.sh)); 2.1.0 adds a stats thread (sensors every 2 s).
+
+**3.0.0** — both engines are rebuilt only to show the release number; neither engine's hashing code changed
+(see [Two engines, one download](#two-engines-one-download) and `docs/3.0.0-engine-identity.md`).
+
+*Verus engine*: instruction-identical to 2.1.0 (15/15 functions, `tools/hashing-identity.sh`). Live sanity
+check on cask18 (Ryzen 9 5950X), old (2.1.0) / new (3.0.0) / new / old, 10-minute slots:
+
+| Slot | 1 (old) | 2 (new) | 3 (new) | 4 (old) |
+|---|---|---|---|---|
+| kH/s | 49 877 | 49 916 | 50 167 | 50 047 |
+
+Mean: old 49 962 kH/s, new 50 041.5 kH/s — **+0.16 %**, within the slot-to-slot noise (about ±1 %).
+
+*RandomX engine* — the shipped 3.0.0 binary reproduces the exact XMRig binary already benchmarked at the X6
+gate (bit-for-bit against the pre-branding rebuild, 208 of 210 compiled objects identical; see
+`docs/3.0.0-engine-identity.md`), plus the display-only branding patch, so that benchmark carries over without
+a re-run. Both 5950X rigs, BloxMiner (bx) vs HiveOS's stock XMRig 6.26.0, same pool, alternated slots:
+
+| Rig | bx | stock XMRig 6.26.0 |
+|---|---|---|
+| cask10 | 15 898.50 / 15 868.85 H/s | 15 906.74 / 15 879.36 H/s |
+| cask18 | 15 855.62 / 15 869.82 H/s | 15 823.32 / 15 816.05 H/s |
+
+Mean: bx 15 873.20 H/s vs stock 15 856.37 H/s — **+0.11 %** overall (cask10 −0.06 %, cask18 +0.27 %), within
+the slot-to-slot noise.
+
+*RandomX live sanity on the 3.0.0 package* (same cask18 ABBA method, to confirm the shipped package itself,
+beyond the object-identity proof above): <!-- RX ABBA 3.0.0: to be filled -->
+
 Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
@@ -473,6 +544,11 @@ Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 | `...` in a core cell | That core has not finished its first batch yet (first minute after start) |
 | Hashrate 0 and `STALLED` | No thread finished work for several minutes — usually the pool connection; check the log |
 | `Power n/a` | No readable RAPL package counter (not root, or kernel/CPU without it). `bloxminer --sensors` says which |
+| HiveOS web UI's port link is dead in RandomX mode | Expected: `WEB_PORT` is fixed at `4068`, the Verus engine's API port. The RandomX engine's own API is `4069` — see [API](#api). The miner screen and HiveOS farm stats work either way |
+| Miner idling / not switching pools on its own | Expected: each flight sheet has exactly one pool, with no failover list. If that pool is down the miner idles and retries against it; point Pool URL at a different pool and re-apply if you need one |
+| Huge pages not released after switching RandomX → Verus | Expected in some cases: restore only happens when the RandomX engine's reservation was finalized in the same boot and `vm.nr_hugepages` still matches what BloxMiner left it at; otherwise it is left untouched and logged, and 1 GB pages are never auto-restored — see [Huge pages](#huge-pages) |
+| MSR tuning still applied after `kill -9` | Expected: XMRig's own MSR register tweak (RandomX engine) persists until the next reboot even after a hard kill; restarting the miner does not undo it (same as stock XMRig) |
+| Reboot / HiveOS online-boot path | Not re-tested for 3.0.0 (owner check pending) |
 
 ---
 
@@ -516,7 +592,7 @@ number 2.1.0 → 3.0.0; the hashing code (`verus/`) is unchanged, proven with `t
 [`build/branding.patch`](build/branding.patch) (display-only: a `BLOX_DISPLAY_VERSION` constant used by exactly
 two cosmetic log lines — the startup summary and the periodic hashrate prefix; never touches `APP_VERSION`, the
 user-agent, or the API version) plus `bloxsense`, BloxMiner's own CPU/sensor helper (shared, unchanged source
-compiled identically for both engines' packaging, new code in BloxMiner-X 1.0.0).
+compiled identically for both engines' packaging).
 
 `build.sh`/`build-rx.sh` record the upstream commit, patch hash, flags and the exact version of every build
 package/static dependency in `<binary>.provenance`/`build.provenance`; each release's `SOURCE.md` is generated
@@ -525,8 +601,8 @@ GPL source bundle) before it will assemble a 3.0.0 package — see [SOURCE.md](b
 package and `bloxminer-3.0.0-src.tar.gz`.
 
 Tests (also run by CI): `tests/hive/test_dispatcher.sh` (engine selection, the state file, hugepage hygiene on
-switch), `tests/hive/test_config_diff.sh` (this package's generated configs are byte-equal to the gated
-2.1.0/X 1.0.0 ones for the same inputs), `tests/hive/test_verus_hive_scripts.sh` and
+switch), `tests/hive/test_config_diff.sh` (this package's generated configs are byte-equal to each engine's
+previous gated build, for the same inputs), `tests/hive/test_verus_hive_scripts.sh` and
 `tests/hive/test_rx_hive_scripts.sh` (each engine's own gated suite, adapted to the shared package layout),
 `tests/hive/test_rx_under_load.sh` (RandomX engine under full CPU load, including the real `xmrig`+`bloxsense`),
 `tests/build/test_package_provenance.sh` (every sha256 `package.sh` checks really is checked) and

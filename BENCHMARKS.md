@@ -76,7 +76,39 @@ because the Oink binary had lost its execute bit and produced no samples).
 (kH/s, 20 samples per slot.) BloxMiner 49 927.89 vs Oink 50 061.67 kH/s: **−0.27 %** (cask10 −0.14 %, cask18 −0.39 %),
 within the slot-to-slot noise (about ±1 %).
 
-## 4. ARM (not part of this package)
+## 4. BloxMiner 3.0.0
+
+Both engines are rebuilt only to show the release number; neither engine's hashing code changed. **Verus
+engine**: instruction-identical to 2.1.0 (`tools/hashing-identity.sh`, 15/15). **RandomX engine**: the shipped
+binary reproduces bit-for-bit against a rebuild of the pre-branding source using the same recipe/toolchain, and
+an object-by-object diff shows 208 of 210 compiled objects identical — only the two touched (branding-only)
+source files' objects differ. Full proof: `docs/3.0.0-engine-identity.md`.
+
+**Verus live sanity** (cask18, Ryzen 9 5950X, old = 2.1.0, new = 3.0.0, old/new/new/old 10-min slots):
+
+| Slot | 1 (old) | 2 (new) | 3 (new) | 4 (old) |
+|---|---|---|---|---|
+| kH/s | 49 877 | 49 916 | 50 167 | 50 047 |
+
+Mean: old 49 962 kH/s, new 50 041.5 kH/s — **+0.16 %**, within the slot-to-slot noise (about ±1 %).
+
+**RandomX engine — the X6 benchmark carries over unchanged.** 3.0.0's RandomX engine is the exact binary
+already benchmarked at the X6 gate (XMRig 6.26.0, donation level 0), plus the display-only branding patch —
+proven bit-for-bit / object-identical above, so no re-benchmark was needed. Both 5950X rigs, BloxMiner (bx) vs
+HiveOS's stock XMRig 6.26.0, same pool, alternated slots:
+
+| Rig | bx | stock XMRig 6.26.0 |
+|---|---|---|
+| cask10 | 15 898.50 / 15 868.85 H/s | 15 906.74 / 15 879.36 H/s |
+| cask18 | 15 855.62 / 15 869.82 H/s | 15 823.32 / 15 816.05 H/s |
+
+Mean: bx 15 873.20 H/s vs stock 15 856.37 H/s — **+0.11 %** overall (cask10 −0.06 %, cask18 +0.27 %), within
+the slot-to-slot noise.
+
+**RandomX live sanity on the shipped 3.0.0 package** (same cask18 ABBA method, to confirm the package itself
+beyond the object-identity proof above): <!-- RX ABBA 3.0.0: to be filled -->
+
+## 5. ARM (not part of this package)
 
 Orange Pi 5 (RK3588), 2 × 1 h each, pool-side: primo-arm-miner 1.1.0 **8.13 / 8.33 MH/s** vs Oink ARM ccminer
 7.20 / 7.26 MH/s (+13.8 % from these numbers; an earlier summary said +13.6 %). Pool numbers count only shares sent to
