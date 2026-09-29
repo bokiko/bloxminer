@@ -585,7 +585,7 @@ _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/nul
 finalize_rx_hugepages_bounded() {
 	local abs_deadline=$1 reserve=0.15   # RESERVE_S: 0.05 s TERM grace + signal-delivery/KILL/reap overhead -
 		# reserved from the deadline BEFORE any alarm duration is ever computed, never added on afterward.
-	local now alarm parent_pgid cpid pgid apid had_monitor=0
+	local now alarm parent_pgid cpid pgid had_monitor=0
 
 	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
 	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
@@ -609,18 +609,25 @@ finalize_rx_hugepages_bounded() {
 	# reusing the value computed at function entry would double-count that time on top of the reserve.
 	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
 	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
-	{ sleep "$alarm"; } > /dev/null 2>&1 &
-	apid=$!
-	wait -n "$cpid" "$apid" 2>/dev/null
+	# Poll for the child's own exit (short interval, kill -0/pgrep - no fork wasted on a real result once it's
+	# done) instead of `wait -n <cpid> <apid>`: `wait -n` given explicit pids that mix a job-control-tracked
+	# child (backgrounded under `set -m`, its own process group) with a plain one (the alarm `sleep`, started
+	# after `set +m`) was measured to BLOCK for the alarm's own full duration even when the FIRST child had
+	# already exited in ~1 ms - reproducible, and specific to how the invoking shell itself was started
+	# (`bash -c '...'` vs a script file) - not something this function can assume away. Polling has no such
+	# invocation-context dependency.
+	local poll_deadline; poll_deadline=$(awk -v n="$now" -v a="$alarm" 'BEGIN{printf "%.6f", n+a}')
+	while _hp_bounded_still_running "$cpid" "$pgid"; do
+		now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
+		awk -v n="$now" -v d="$poll_deadline" 'BEGIN{exit !(n < d)}' || break
+		sleep 0.05
+	done
 	if _hp_bounded_still_running "$cpid" "$pgid"; then
 		_hp_bounded_escalate TERM "$cpid" "$pgid"
-		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
 		sleep 0.05
 		_hp_bounded_still_running "$cpid" "$pgid" && _hp_bounded_escalate KILL "$cpid" "$pgid"
-		wait "$cpid" 2>/dev/null
-	else
-		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
 	fi
+	wait "$cpid" 2>/dev/null
 	true
 }
 

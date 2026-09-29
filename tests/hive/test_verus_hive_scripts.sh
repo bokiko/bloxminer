@@ -144,6 +144,27 @@ stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" 
 stats_case "engine VER matches package -> plain form" "${SUM_OK/VER=2.1.0/VER=3.0.0}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
 stats_case "no VER field -> ENGINE_VERSION fallback == package -> plain form" "${SUM_OK/;VER=2.1.0/}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
 
+# ---- one shell, two polls: a positive rate from poll 1 must NEVER survive as poll 2's answer just because
+# poll 2's own attempt to get fresh data fails (dead API) - $khs/$stats are plain global variables, and Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export API_PID
+# shellcheck disable=SC2016
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; poll1_khs=$khs
+	kill "$API_PID" 2>/dev/null   # poll 2: API now dead - a genuine, real failure, not a contrived parse error
+	. "$BLOX_DIR/h-stats.sh"
+	jq -nc --arg p1 "$poll1_khs" --arg p2 "$khs" "{poll1: \$p1, poll2: \$p2}"' 2>&1)
+if [[ $(jq -r '.poll1 == "11900.00" and .poll2 == "0"' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing"
+else
+	bad "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing" "$res"
+fi
+
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
 # leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
 for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done

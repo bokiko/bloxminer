@@ -70,6 +70,12 @@
 # never survive there - confirmed on a live rig (state transitions really happened, per the state file, but no
 # diagnostic line was ever found in XMRig's log or its rotated copies). The stats log is bounded to its last
 # ~200 lines once it passes 1 MiB.
+# Reset $khs/$stats UNCONDITIONALLY, before any other work - the very first thing this poll does. Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll; $khs/$stats are plain global
+# variables, so anything that leaves them untouched (rather than explicitly assigning, even to the honest 0)
+# would let a PREVIOUS poll's values silently stand as THIS poll's answer - a positive rate surviving a
+# stalled/dead poll right after it. Cleared here means the rest of this file can never "forget" to answer.
+khs=""; stats=""
 # ONE absolute deadline for the WHOLE poll, inherited from the top-level dispatcher (bloxminer/h-stats.sh),
 # which computes it at the TRUE poll entry - before even engine selection, let alone anything below. Only
 # computed here as a fallback, for when this file is sourced standalone (every test in this repo, and any
@@ -186,10 +192,14 @@ note_state() {   # $1 = ok | unverified | shallow | unavailable; logs only on a 
 	{ printf '%s' "$cur" > "$STATEFILE"; } 2>/dev/null
 }
 
-fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON number or null), default null
+fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON number or the literal "null"), default
+	# null - shell-only (printf, a builtin - no fork, no jq): this is the safety net called when things are
+	# ALREADY going wrong, so it must not itself depend on jq being installed/working (see the LIB-creation-
+	# failure path below, which uses this exact same plain-printf pattern for the same reason). $VER/$algo are
+	# both internal, jq-produced-or-constant strings, never raw external/network input - safe to interpolate.
 	khs=0
-	stats=$(jq -nc --arg ver "$VER" --arg algo "$algo" --argjson temp "${1:-null}" \
-		'{hs: [0], hs_units: "khs", temp: [$temp], ar: [0, 0], uptime: 0, ver: $ver, algo: $algo}')
+	stats=$(printf '{"hs":[0],"hs_units":"khs","temp":[%s],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' \
+		"${1:-null}" "$VER" "$algo")
 }
 
 # write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
@@ -517,15 +527,22 @@ rm -f "$LIB"
 # leave a window where the first (validate) succeeds but a later one silently returns empty, leaving $khs/
 # $stats empty rather than either the real answer or the defined fallback (observed on a slower GH runner:
 # {"khs":"","stats":null}). A single call has no such window - it either parses out both together, or neither.
-parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and has("stats")
+# khs must be a finite, non-negative NUMBER (as a JSON string) and .stats must have the expected shape (an
+# object with an "hs" array) - a nonempty-string guard alone would accept {"khs":"abc","stats":null} (both
+# "abc" and jq's own stringified "null" are nonempty strings) as if they were real, honest answers.
+parsed=$(jq -r '
+	if (type == "object") and (.khs | type) == "string" and (.khs | test("^[0-9]+(\\.[0-9]+)?$"))
+	   and (.stats | type) == "object" and ((.stats.hs | type) == "array")
 	then [.khs, (.stats | tojson)] | @tsv else empty end' <<< "$result" 2>/dev/null)
 if [[ -n $parsed ]]; then
 	IFS=$'\t' read -r khs stats <<< "$parsed"
 fi
-# Final, unconditional guard: whatever the path above did, $khs must be non-empty here (never re-verified as
-# a NUMBER beyond that - Hive only needs a valid numeric string) and $stats must be non-empty JSON - if either
-# is somehow still not, this is the same honest, defined fallback as a genuine "nothing collected" poll.
-if [[ -z ${khs:-} || -z ${stats:-} ]]; then
+# Final, unconditional bash-level guard (belt and suspenders, independent of the jq filter above): $khs must
+# match a finite non-negative number, exactly what Hive itself needs - if it does not, THIS poll's answer is
+# discarded and replaced with the same honest, defined fallback as a genuine "nothing collected" poll, never
+# an old value left standing from whatever poll ran before this one in the same shell (see the top-of-file
+# reset) and never a non-numeric string a looser guard would have let through.
+if [[ ! ${khs:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ -z ${stats:-} ]]; then
 	note_state unavailable
 	fallback ""
 fi

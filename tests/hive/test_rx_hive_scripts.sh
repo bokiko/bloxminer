@@ -351,6 +351,30 @@ bloxsense_says "$(fake_topo_json 4)"
 stats_case "negative rate clamps to 0 for that row, others unaffected" 20014 "$SUM_OK" "$BACK_NEGATIVE" \
 	'.stats.hs == [1, 0, 1, 1] and .khs == "3.00"'
 
+# ---- one shell, two polls: a positive rate from poll 1 must NEVER survive as poll 2's answer just because
+# poll 2's own attempt to get fresh data fails (dead API) - $khs/$stats are plain global variables, and Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll (see test_dispatcher.sh's own
+# "one shell" tests for the dispatcher-level version of this same property).
+reset_proc; listen 20030 1030 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+jq -n --argjson s "$SUM_POS" --argjson b "$BACK_COMPLETE" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20030 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export BLOX_API_PORT=20030
+export API_PID
+# shellcheck disable=SC2016
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; poll1_khs=$khs
+	kill "$API_PID" 2>/dev/null   # poll 2: API now dead - a genuine, real failure, not a contrived parse error
+	. "$BLOX_DIR/h-stats.sh"
+	jq -nc --arg p1 "$poll1_khs" --arg p2 "$khs" "{poll1: \$p1, poll2: \$p2}"' 2>&1)
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+if [[ $(jq -r '.poll1 == "6.00" and .poll2 == "0"' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing"
+else
+	bad "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing" "$res"
+fi
+
 BACK_NO_THREADS_KEY=$(jq -nc '[{"type": "cpu", "algo": null}]')   # legitimate: before the first pool job, no "threads" key at all
 reset_proc; listen 20025 1025 "$BLOX_DIR/xmrig"   # NOT 20015: a long-lived, unrelated fake_xmrig_api.py from
 	# another session on this shared build host squats on 127.0.0.1:20015 permanently - colliding with it here

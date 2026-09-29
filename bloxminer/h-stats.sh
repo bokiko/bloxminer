@@ -18,13 +18,18 @@ BLOX_HP_T0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}   # Round 5c: this poll'
 # no dispatcher entry point above it to have set this already).
 BLOX_HP_T0_US="${BLOX_HP_T0%%.*}${BLOX_HP_T0#*.}"
 export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))   # 2.4 s of the shared 3.0 s budget - matches both engines' BUDGET_US
+# A minimal, valid, engine-agnostic stats object - not an empty string - for the two failure points below.
+# Neither engine's own VER/algo is reliably known at this level (the manifest/config that would provide them
+# is exactly what failed to load), and this must not depend on jq (the failure could BE jq missing) - plain
+# printf, a shell builtin, matches the same jq-free convention both engines' own last-resort fallbacks use.
+DISPATCH_FALLBACK_STATS='{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0}'
 BLOX_DIR=${BLOX_DIR:-/hive/miners/custom/bloxminer}
 if ! . "$BLOX_DIR/h-manifest.conf" 2>/dev/null || ! . "$BLOX_DIR/h-common.sh" 2>/dev/null; then
-	khs=0; stats=""; return 0 2>/dev/null || exit 0
+	khs=0; stats="$DISPATCH_FALLBACK_STATS"; return 0 2>/dev/null || exit 0
 fi
 export BLOX_DIR
 
-engine=$(engine_from_config) || { khs=0; stats=""; return 0 2>/dev/null || exit 0; }
+engine=$(engine_from_config) || { khs=0; stats="$DISPATCH_FALLBACK_STATS"; return 0 2>/dev/null || exit 0; }
 
 # shellcheck disable=SC1090   # $engine is one of exactly two known, fixed values (verus|rx), never external input
 . "$BLOX_DIR/engines/$engine/h-stats.sh"

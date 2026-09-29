@@ -32,6 +32,12 @@
 # stays in the SAME process group as this whole collection (a bare `timeout` would otherwise start `nc` in a
 # NEW group of its own, which the outer group-kill below could not reach - the exact class of bug rx's own
 # bloxsense call already guards against the same way).
+# Reset $khs/$stats UNCONDITIONALLY, before any other work - the very first thing this poll does. Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll; $khs/$stats are plain global
+# variables, so anything that leaves them untouched (rather than explicitly assigning, even to the honest 0)
+# would let a PREVIOUS poll's values silently stand as THIS poll's answer - a positive rate surviving a
+# stalled/dead poll right after it. Cleared here means the rest of this file can never "forget" to answer.
+khs=""; stats=""
 # ONE absolute deadline for the WHOLE poll, inherited from the top-level dispatcher (bloxminer/h-stats.sh),
 # which computes it at the TRUE poll entry - before even engine selection, let alone anything below. Only
 # computed here as a fallback, for when this file is sourced standalone (every test in this repo, and any
@@ -318,16 +324,21 @@ rm -f "$LIB"
 # leave a window where the first (validate) succeeds but a later one silently returns empty, leaving $khs/
 # $stats empty rather than either the real answer or the defined fallback (the RandomX engine's own version of
 # this exact bug was observed on a slower GH runner: {"khs":"","stats":null}).
-parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and has("stats")
+# khs must be a finite, non-negative NUMBER (as a JSON string), not merely a nonempty one - a looser guard
+# would accept a non-numeric string (e.g. a stray error message written where khs belongs) as if it were a
+# real, honest rate.
+parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and (.khs | test("^[0-9]+(\\.[0-9]+)?$"))
+	and has("stats") and (.stats | type) == "string"
 	then [.khs, .stats] | @tsv else empty end' <<< "$result" 2>/dev/null)
 if [[ -n $parsed ]]; then
 	IFS=$'\t' read -r khs stats <<< "$parsed"
 fi
-# Final, unconditional guard: $khs must be non-empty here (a valid numeric string - Hive needs no more than
-# that) - if the path above somehow left it empty, this is the same honest, defined fallback as a genuine
-# "nothing collected" poll. $stats is allowed to be a genuinely empty string (write_result's own convention
-# for "no engine data" - the caller's engine screen falls back to the miner's own plain output), unlike RX's
-# engine, which always writes a full stats object.
-if [[ -z ${khs:-} ]]; then
+# Final, unconditional bash-level guard (belt and suspenders, independent of the jq filter above): $khs must
+# match a finite non-negative number - if it does not, THIS poll's answer is discarded and replaced with the
+# same honest, defined fallback as a genuine "nothing collected" poll, never an old value left standing from
+# whatever poll ran before this one in the same shell (see the top-of-file reset). $stats is allowed to be a
+# genuinely empty string (write_result's own convention for "no engine data" - the caller's engine screen
+# falls back to the miner's own plain output), unlike RX's engine, which always writes a full stats object.
+if [[ ! ${khs:-} =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 	khs=0; stats=""
 fi

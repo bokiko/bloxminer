@@ -199,12 +199,15 @@ run_h_run_fail_closed() {   # $1 = test label; expects: engine binaries are abse
 		bad "h-run.sh: $1 -> fails closed (exit $rc, Hive message error, no exec)" "rc=$rc msg=$(cat "$MESSAGE_LOG") out=$out"
 	fi
 }
-run_h_stats_fail_closed() {   # $1 = test label; must NEVER crash the sourcing agent: khs=0, stats="", clean return
+run_h_stats_fail_closed() {   # $1 = test label; must NEVER crash the sourcing agent: khs=0, a minimal valid
+	# stats object (never an empty string - neither engine's own VER/algo is known at this level, but a valid
+	# object beats an empty one when Hive's own handling of an empty $stats is not itself verifiable here),
+	# clean return.
 	res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; echo "rc=$? khs=[$khs] stats=[$stats]"' 2>&1); rc=$?
-	if [[ $rc == 0 && $res == "rc=0 khs=[0] stats=[]" ]]; then
-		ok "h-stats.sh: $1 -> returns cleanly (khs=0, empty stats, never crashes)"
+	if [[ $rc == 0 && $res == 'rc=0 khs=[0] stats=[{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0}]' ]]; then
+		ok "h-stats.sh: $1 -> returns cleanly (khs=0, minimal valid stats, never crashes)"
 	else
-		bad "h-stats.sh: $1 -> returns cleanly (khs=0, empty stats, never crashes)" "rc=$rc res=$res"
+		bad "h-stats.sh: $1 -> returns cleanly (khs=0, minimal valid stats, never crashes)" "rc=$rc res=$res"
 	fi
 }
 
@@ -255,10 +258,10 @@ else
 fi
 # shellcheck disable=SC1007,SC2016   # PATH="" is intentional; the single-quoted $vars expand inside the child, not here
 res=$(PATH="" "$BASHBIN" -c '. "$BLOX_DIR/h-stats.sh"; echo "rc=$? khs=[$khs] stats=[$stats]"' 2>&1); rc=$?
-if [[ $rc == 0 && $res == "rc=0 khs=[0] stats=[]" ]]; then
-	ok "h-stats.sh: jq unavailable -> returns cleanly (khs=0, empty stats, never crashes)"
+if [[ $rc == 0 && $res == 'rc=0 khs=[0] stats=[{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0}]' ]]; then
+	ok "h-stats.sh: jq unavailable -> returns cleanly (khs=0, minimal valid stats, never crashes)"
 else
-	bad "h-stats.sh: jq unavailable -> returns cleanly (khs=0, empty stats, never crashes)" "rc=$rc res=$res"
+	bad "h-stats.sh: jq unavailable -> returns cleanly (khs=0, minimal valid stats, never crashes)" "rc=$rc res=$res"
 fi
 
 # ============================================================== 6. huge-page ownership handoff: ONLY the
