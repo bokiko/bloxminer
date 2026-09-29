@@ -10,6 +10,7 @@ OUT=${1:-$PWD/out}; mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)   # absolute before
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 PATCH="$HERE/donate0.patch"
+PATCH2="$HERE/branding.patch"   # display-only BloxMiner branding on top of donate0.patch - see its own header
 
 UPSTREAM=https://github.com/xmrig/xmrig
 TAG=v6.26.0
@@ -24,7 +25,7 @@ COMMIT=b2ca72480c58d197e18c885d9fc1a0c8d517e60a   # pinned tag commit; build fai
 # builder).
 HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
          bloxminer/engines/rx/h-config.sh bloxminer/engines/rx/h-run.sh bloxminer/engines/rx/h-stats.sh bloxminer/h-manifest.conf
-         build/build-rx.sh build/package.sh build/donate0.patch)
+         build/build-rx.sh build/package.sh build/donate0.patch build/branding.patch)
 
 # Dependency tarballs xmrig's own scripts/build.uv.sh, build.hwloc.sh, build.openssl3.sh fetch for this tag,
 # pinned by sha256 computed by hand from these exact URLs (upstream ships no checksums for them).
@@ -66,9 +67,28 @@ FULL=$(git rev-parse HEAD)
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 export SOURCE_DATE_EPOCH
 patch -p1 < "$PATCH"
-# the only source change vs upstream must be donate.h
+patch -p1 < "$PATCH2"
+# the only source changes vs upstream must be donate.h (donate0.patch) plus the explicit, named branding files
+# (branding.patch: display-only BloxMiner version strings, never touches donate.h, APP_VERSION, or the user-agent).
+# `git add -A -N` marks branding.patch's new file (src/version_blox.h) as intent-to-add so `git diff --name-only`
+# below also reports it - a plain `git diff` never lists a brand-new untracked file.
+git add -A -N .
 DIFF_FILES=$(git diff --name-only)
-[[ $DIFF_FILES == "src/donate.h" ]] || { echo "patch touched more than src/donate.h: $DIFF_FILES" >&2; exit 1; }
+ALLOWED_FILES=(
+	src/donate.h
+	src/version_blox.h
+	src/base/kernel/config/BaseConfig.cpp
+	src/core/Miner.cpp
+)
+while IFS= read -r f; do
+	[[ -n $f ]] || continue
+	found=0
+	for a in "${ALLOWED_FILES[@]}"; do [[ $f == "$a" ]] && { found=1; break; }; done
+	(( found )) || { echo "patch touched a file outside the allowlist: $f" >&2; exit 1; }
+done <<< "$DIFF_FILES"
+for a in "${ALLOWED_FILES[@]}"; do
+	grep -qxF "$a" <<< "$DIFF_FILES" || { echo "expected file missing from diff: $a" >&2; exit 1; }
+done
 
 PREFIX_MAP="-ffile-prefix-map=$W=."   # strip the build tree's absolute path out of both binaries
 export CFLAGS="-O2 $PREFIX_MAP"
@@ -114,6 +134,8 @@ CMAKEV=$(cmake --version | head -1)
 	echo "upstream_tag=$TAG"
 	echo "upstream_commit=$FULL"
 	echo "patch_sha256=$(sha256sum "$PATCH" | cut -d' ' -f1)"
+	echo "branding_patch_sha256=$(sha256sum "$PATCH2" | cut -d' ' -f1)"
+	echo "blox_display_version=$(sed -n 's/^#define BLOX_DISPLAY_VERSION "\(.*\)"/\1/p' "$W/src/src/version_blox.h")"
 	echo "dep.libuv.version=$UV_VER"
 	echo "dep.libuv.url=$UV_URL"
 	echo "dep.libuv.sha256=$UV_SHA256"

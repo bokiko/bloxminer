@@ -29,6 +29,7 @@ make -j"$(nproc)" HIVE_ARCH_FLAGS="$ARCH" HIVE_OPT="$OPT" >/dev/null
 patchelf --set-rpath '$ORIGIN' ccminer   # bundled libomp.so.5 is found next to the binary
 BIN="$OUT/bloxminer${TAG:-}$OPT"
 cp ccminer "$BIN"
+cp -L /usr/lib/llvm-14/lib/libomp.so.5 "$OUT/libomp.so.5"   # the exact runtime the binary above was linked/rpathed against
 
 GLIBC=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
 {

@@ -1,0 +1,58 @@
+diff --git a/src/base/kernel/config/BaseConfig.cpp b/src/base/kernel/config/BaseConfig.cpp
+index d102a6ab..80c15c4a 100644
+--- a/src/base/kernel/config/BaseConfig.cpp
++++ b/src/base/kernel/config/BaseConfig.cpp
+@@ -25,6 +25,7 @@
+ #include "base/kernel/interfaces/IJsonReader.h"
+ #include "base/net/dns/Dns.h"
+ #include "version.h"
++#include "version_blox.h"
+ 
+ 
+ #include <algorithm>
+@@ -143,6 +144,7 @@ void xmrig::BaseConfig::printVersions()
+ #   endif
+ 
+     Log::print(GREEN_BOLD(" * ") WHITE_BOLD("%-13s") CYAN_BOLD("%s/%s") WHITE_BOLD(" %s") WHITE_BOLD(" (built for %s") WHITE_BOLD(" %s,") WHITE_BOLD(" %s)"), "ABOUT", APP_NAME, APP_VERSION, buf, APP_OS, APP_ARCH, APP_BITS);
++    Log::print(GREEN_BOLD(" * ") WHITE_BOLD("%-13s") CYAN_BOLD("%s") WHITE_BOLD(" (XMRig %s engine)"), "BLOXMINER", BLOX_DISPLAY_VERSION, APP_VERSION);
+ 
+     std::string libs;
+ 
+diff --git a/src/core/Miner.cpp b/src/core/Miner.cpp
+index 5b2cf05e..b841c576 100644
+--- a/src/core/Miner.cpp
++++ b/src/core/Miner.cpp
+@@ -22,6 +22,7 @@
+ 
+ 
+ #include "core/Miner.h"
++#include "version_blox.h"
+ #include "core/Taskbar.h"
+ #include "3rdparty/rapidjson/document.h"
+ #include "backend/common/Hashrate.h"
+@@ -340,7 +341,7 @@ public:
+         }
+ #       endif
+ 
+-        LOG_INFO("%s " WHITE_BOLD("speed") " 10s/60s/15m " CYAN_BOLD("%s") CYAN(" %s %s ") CYAN_BOLD("%s") " max " CYAN_BOLD("%s %s") "%s",
++        LOG_INFO(CYAN_BOLD("BloxMiner " BLOX_DISPLAY_VERSION " ") "%s " WHITE_BOLD("speed") " 10s/60s/15m " CYAN_BOLD("%s") CYAN(" %s %s ") CYAN_BOLD("%s") " max " CYAN_BOLD("%s %s") "%s",
+                  Tags::miner(),
+                  Hashrate::format(speed[0],                 num,          16),
+                  Hashrate::format(speed[1],                 num + 16,     16),
+diff --git a/src/version_blox.h b/src/version_blox.h
+new file mode 100644
+index 00000000..6a1a218d
+--- /dev/null
++++ b/src/version_blox.h
+@@ -0,0 +1,11 @@
++/* BloxMiner display-only branding for the RandomX (XMRig) engine.
++ * This constant is NEVER used for XMRig's own APP_VERSION, its user-agent string, or its API "version" field -
++ * those stay exactly "6.26.0" / "XMRig/6.26.0" for pool/API compatibility. It only labels two purely cosmetic
++ * log lines (the startup summary and the periodic hashrate line) with the BloxMiner PACKAGE release number.
++ */
++#ifndef XMRIG_VERSION_BLOX_H
++#define XMRIG_VERSION_BLOX_H
++
++#define BLOX_DISPLAY_VERSION "3.0.0"
++
++#endif /* XMRIG_VERSION_BLOX_H */

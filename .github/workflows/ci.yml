@@ -17,8 +17,22 @@ jobs:
         run: for f in bloxminer/*.sh build/*.sh tools/*.sh tests/*/*.sh; do bash -n "$f"; done
       - name: shellcheck
         run: shellcheck -s bash bloxminer/h-config.sh bloxminer/h-run.sh bloxminer/h-stats.sh build/*.sh tools/*.sh tests/*/*.sh
-      - name: HiveOS script tests
-        run: tests/hive/test_hive_scripts.sh
+      - name: HiveOS script tests (verus)
+        run: tests/hive/test_verus_hive_scripts.sh
+      - name: HiveOS script tests (rx)
+        run: tests/hive/test_rx_hive_scripts.sh
+      - name: HiveOS script tests (dispatcher)
+        run: tests/hive/test_dispatcher.sh
+      - name: HiveOS script tests (config-diff)
+        run: tests/hive/test_config_diff.sh
+      - name: HiveOS script tests (rx under load)
+        run: tests/hive/test_rx_under_load.sh
+      - name: HiveOS script tests (hugepage finalization)
+        run: tests/hive/test_hugepage_finalization.sh
+      - name: bloxsense tests
+        run: tests/bloxsense/run_tests.sh
+      - name: build package provenance tests
+        run: tests/build/test_package_provenance.sh
       - name: hashing-identity tool controls
         run: tests/tools/test_hashing_identity.sh
 

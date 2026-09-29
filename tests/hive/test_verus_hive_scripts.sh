@@ -131,6 +131,8 @@ stats_case "per-core duplicate CPU ids -> FRESHKHS" "$SUM_OK" "${CORES_OK/CPUS=0
 stats_case "per-core bad PKG -> FRESHKHS" "$SUM_OK" "${CORES_OK/PKG=0;CORE=1;/PKG=x;CORE=1;}" '.stats.hs == [11900]'
 stats_case "stall only in cores reply -> 0" "$SUM_OK" "${CORES_OK/STALL=0/STALL=1}" '.khs == "0" and .stats.hs == [0]'
 stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" "" '.stats.hs == [11900] and (.stats | has("cpu_power")) == false'
+stats_case "engine VER matches package -> plain form" "${SUM_OK/VER=2.1.0/VER=3.0.0}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
+stats_case "no VER field -> ENGINE_VERSION fallback == package -> plain form" "${SUM_OK/;VER=2.1.0/}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

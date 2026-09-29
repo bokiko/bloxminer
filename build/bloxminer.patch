@@ -2204,10 +2204,10 @@ diff -ruN a/ccminer.cpp b/ccminer.cpp
  }
 diff -ruN a/configure.ac b/configure.ac
 --- a/configure.ac	2026-09-26 09:25:09
-+++ b/configure.ac	2026-09-27 13:18:12
++++ b/configure.ac	2026-09-29 09:25:12
 @@ -1,4 +1,4 @@
 -AC_INIT([ccminer_CPU], [3.8.3], [], [ccminer], [http://github.com/monkins1010/ccminer])
-+AC_INIT([bloxminer], [2.1.0], [], [bloxminer], [https://github.com/bokiko/bloxminer])
++AC_INIT([bloxminer], [3.0.0], [], [bloxminer], [https://github.com/bokiko/bloxminer])
  
  AC_PREREQ([2.59c])
  AC_CANONICAL_SYSTEM

@@ -6,7 +6,7 @@
 # A stalled miner (every thread overdue, STALL=1) reports 0, never its last rate.
 # shellcheck disable=SC2034   # khs and stats are read by the Hive agent that sources this file
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
-ENGINE_VERSION=2.1.0   # the frozen ccminer engine's own release version (this file never rebuilds it)
+ENGINE_VERSION=3.0.0   # the frozen ccminer engine's own release version (this file never rebuilds it)
 
 deadline=$(( $(date +%s) + 3 ))                 # one 3 s budget for every API call together
 api() { local left=$(( deadline - $(date +%s) )); (( left < 1 )) && return 1
@@ -21,7 +21,15 @@ acc=$(field "$sum" ACC); rej=$(field "$sum" REJ); up=$(field "$sum" UPTIME); ver
 stall=$(field "$sum" STALL); fresh=$(field "$sum" FRESHKHS); power=$(field "$sum" POWER); ptemp=$(field "$sum" TEMP)
 int "$acc" || acc=0; int "$rej" || rej=0; num "$up" || up=0; [[ -n $ver ]] || ver=$ENGINE_VERSION
 int "$ptemp" || ptemp=""
-ver="$CUSTOM_VERSION (verus, engine $ver)"   # package version first: 3.0.0 (verus, engine 2.1.0)
+# The engine's own PACKAGE_VERSION (api.cpp's VER field) now tracks the package release 1:1, so the plain
+# "<version> (verus)" form is shown whenever they agree (the common, expected case); if a future package release
+# ever ships a different engine build (skipped engine rebuild, hotfix, etc.) this still shows both, honestly,
+# instead of silently collapsing to one number.
+if [[ $ver == "$CUSTOM_VERSION" ]]; then
+	ver="$CUSTOM_VERSION (verus)"
+else
+	ver="$CUSTOM_VERSION (verus, engine $ver)"
+fi
 
 hs=(); temps=(); ok=0
 if [[ $stall != 1 ]]; then

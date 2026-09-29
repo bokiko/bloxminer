@@ -84,9 +84,16 @@ restarting the miner:
 | `rx/wow`, `rx/arq`, `rx/graft`, `rx/sfx`, `rx/yada` | RandomX | The other RandomX-family variants XMRig supports |
 | anything else | *(refused)* | HiveOS shows an error message; the miner does not start (no restart loop) |
 
-The two engines are otherwise **exactly** their own already-released, independently gated selves — BloxMiner
-2.1.0's ccminer engine and BloxMiner-X 1.0.0's XMRig engine, byte-identical binaries, nothing rebuilt for this
-package. Only the parts that genuinely have to be shared (the package directory, the log file base, the engine
+The two engines' own mining code is otherwise **unchanged** from their previously gated selves — BloxMiner
+2.1.0's ccminer engine and BloxMiner-X 1.0.0's XMRig engine. BloxMiner 3.0.0 rebuilds both, each with one small,
+precisely scoped, proven change: the Verus engine's own release number (`AC_INIT`) moves 2.1.0 → 3.0.0 (every
+hashing function is instruction-identical to the 2.1.0 binary — proven with `tools/hashing-identity.sh`; only
+the version string differs); the RandomX engine gets one extra *display-only* patch, `build/branding.patch`, on
+top of `build/donate0.patch` — it adds two cosmetic log lines (a startup summary line and a periodic hashrate
+prefix) and touches nothing else; XMRig's own `APP_VERSION`/user-agent/API version stay exactly `6.26.0` for
+pool/API compatibility, and every object file outside the touched source files is byte-identical (proven by a
+per-object binary diff). See [Building](#building) and this release's own `C6-BRANDING.md` for the full proof
+output. Only the parts that genuinely have to be shared (the package directory, the log file base, the engine
 picker itself) are new. That means:
 
 - **Pass means something different per engine** (unchanged from each engine's own 1.x/2.x behaviour): on the
@@ -204,7 +211,7 @@ BloxMiner options (in addition to the usual ccminer pool options):
 table every 60 s, so the HiveOS web **Miner log** stays readable:
 
 ```
-== BloxMiner 2.1.0 | 49.80 MH/s | A 32 R 0 | 136 W | 64 C | 365 kH/W | up 0h01m ==
+== BloxMiner 3.0.0 | 49.80 MH/s | A 32 R 0 | 136 W | 64 C | 365 kH/W | up 0h01m ==
  C00 3.11M   63C  C01 3.09M   63C  C02 3.12M   63C  C03 3.05M   63C  C04 3.12M   63C  C05 3.10M   63C
  C06 3.15M   63C  C07 3.11M   63C  C08 3.11M   63C  C09 3.11M   63C  C10 3.14M   63C  C11 3.10M   63C
  C12 3.11M   63C  C13 3.11M   63C  C14 3.13M   63C  C15 3.11M   63C
@@ -218,7 +225,7 @@ Captured from a Ryzen 9 5900X (80 columns) a few seconds after start:
 
 ```
 +------------------------------------------------------------------------------+
-| BloxMiner 2.1.0  Ryzen 9 5900X  12C/24T                            up 0h00m  |
+| BloxMiner 3.0.0  Ryzen 9 5900X  12C/24T                            up 0h00m  |
 | Hashrate 32.83 MH/s   A 8  R 0   Diff 1.28e+07                               |
 | Power 89 W   Temp 45C   Eff 368 kH/W   Pool veruscoin.cedric-crispin.com:4024 |
 +------------------------------------------------------------------------------+
@@ -330,7 +337,7 @@ dispatcher: it never mixes data from the two engines — see [Two engines, one d
 | `temp` | Per row: CCD / core temperature, else package temperature |
 | `ar` | Accepted, rejected |
 | `uptime` | Miner uptime (s) |
-| `ver` | `3.0.0 (verus, engine 2.1.0)` on the Verus engine, `3.0.0 (xmrig 6.26.0)` on the RandomX engine |
+| `ver` | `3.0.0 (verus)` on the Verus engine (or `3.0.0 (verus, engine <n>)` if a future package ever ships a differently versioned engine build), `3.0.0 (xmrig 6.26.0)` on the RandomX engine |
 | `algo` | `verushash` (Verus engine) or the active RandomX variant, e.g. `rx/0`, `rx/wow` (RandomX engine) |
 | `cpu_power` | CPU package power in W (omitted when unavailable, never sent as 0). The HiveOS web (0.6-231, Sept 2026) does not show it in the CONSUMPTION tile; it is in the miner screen, log, API and `--sensors` |
 
@@ -362,7 +369,7 @@ echo -n threads | nc 127.0.0.1 4068
 `POWER` (W), `TEMP` (package °C), `CORES` (physical-core rows) and `ENGINE`. An empty value means unavailable:
 
 ```
-NAME=bloxminer;VER=2.1.0;ALGO=verus;KHS=32693.12;ACC=11;REJ=0;UPTIME=90;LASTWORK=6;STALL=0;FRESHKHS=32500.77;POWER=89;TEMP=45;CORES=12;ENGINE=ccminer-3.8.3|
+NAME=bloxminer;VER=3.0.0;ALGO=verus;KHS=32693.12;ACC=11;REJ=0;UPTIME=90;LASTWORK=6;STALL=0;FRESHKHS=32500.77;POWER=89;TEMP=45;CORES=12;ENGINE=ccminer-3.8.3|
 ```
 
 `cores` — a header, then one row per physical core (or per thread when binding/topology did not resolve):
@@ -475,32 +482,35 @@ Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Building
 
-BloxMiner 3.0.0 does **not** rebuild either engine: `build/package.sh` takes the two engines' own already-built,
-already-released, already-gated binaries (BloxMiner 2.1.0's `bloxminer`+`libomp.so.5`, BloxMiner-X 1.0.0's
-`xmrig`+`bloxsense`), verifies every one of their sha256 hashes against that release's own recorded provenance,
-and assembles the combined package deterministically — two independent runs (including a fresh network re-clone
-of both upstream engines for the source bundle below) give byte-identical output:
+BloxMiner 3.0.0 rebuilds both engines from source, each with a change proven not to touch mining code (see
+above). `build/build.sh` and `build/build-rx.sh` each clone their pinned upstream, apply their patch(es), build,
+and write their own binary + provenance; `build/package.sh` then verifies every sha256 (and, for the version
+strings, the declared version itself) against that build's own recorded provenance and assembles the combined
+package deterministically — two independent runs (including a fresh network re-clone of both upstream engines
+for the source bundle below) give byte-identical output:
 
 ```bash
-build/package.sh bloxminer-2.1.0.tar.gz bloxminer-O3.provenance bloxminer-x-1.0.0.tar.gz
+build/build.sh      # Verus engine: clang 14, -march=x86-64-v3 -mtune=znver3 -O3 -> out/bloxminer-O3 (+ .provenance, + libomp.so.5)
+build/build-rx.sh   # RandomX engine: gcc 11, cmake Release, static libuv/hwloc/OpenSSL -> out/xmrig, out/bloxsense (+ build.provenance)
+build/package.sh out out
 # -> bloxminer-3.0.0.tar.gz + bloxminer-3.0.0-src.tar.gz + SHA256SUMS
 ```
 
-To build either engine itself from source (only needed to produce new binaries, e.g. for a future release —
-3.0.0 ships the existing ones unchanged), on Ubuntu 22.04 x86-64:
-
-```bash
-build/build.sh      # Verus engine: clang 14, -march=x86-64-v3 -mtune=znver3 -O3 -> out/bloxminer-O3 (+ .provenance)
-build/build-rx.sh   # RandomX engine: gcc 11, cmake Release, static libuv/hwloc/OpenSSL -> out/xmrig, out/bloxsense (+ build.provenance)
-```
+(`build/build.sh` and `build/build-rx.sh` write to `./out` by default; pass each its own outdir if you keep them
+separate, and give `package.sh` the two matching outdirs.) Both must run on Ubuntu 22.04 x86-64: `build.sh` in a
+container/chroot with `libssl-dev` pinned to OpenSSL 3 (refuses to run on a HiveOS rig, which pins 1.1.1),
+`build-rx.sh` as root.
 
 Source: **Verus engine** — [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183`
 + [`build/bloxminer.patch`](build/bloxminer.patch) (adds the BloxMiner screen, log file, sensors and power, the
-`cores` API, stall detection and fixes for pool-input and option parsing; the hashing code (`verus/`) is
-unchanged). **RandomX engine** — [xmrig/xmrig](https://github.com/xmrig/xmrig) `v6.26.0` +
-[`build/donate0.patch`](build/donate0.patch) (one line: the built-in donation level, 1 % → 0 %) plus
-`bloxsense`, BloxMiner's own CPU/sensor helper (shared byte-identical between both engines' packaging, new code
-in BloxMiner-X 1.0.0).
+`cores` API, stall detection, fixes for pool-input and option parsing, and — for 3.0.0 — the `AC_INIT` release
+number 2.1.0 → 3.0.0; the hashing code (`verus/`) is unchanged, proven with `tools/hashing-identity.sh`).
+**RandomX engine** — [xmrig/xmrig](https://github.com/xmrig/xmrig) `v6.26.0` +
+[`build/donate0.patch`](build/donate0.patch) (one line: the built-in donation level, 1 % → 0 %) +
+[`build/branding.patch`](build/branding.patch) (display-only: a `BLOX_DISPLAY_VERSION` constant used by exactly
+two cosmetic log lines — the startup summary and the periodic hashrate prefix; never touches `APP_VERSION`, the
+user-agent, or the API version) plus `bloxsense`, BloxMiner's own CPU/sensor helper (shared, unchanged source
+compiled identically for both engines' packaging, new code in BloxMiner-X 1.0.0).
 
 `build.sh`/`build-rx.sh` record the upstream commit, patch hash, flags and the exact version of every build
 package/static dependency in `<binary>.provenance`/`build.provenance`; each release's `SOURCE.md` is generated
