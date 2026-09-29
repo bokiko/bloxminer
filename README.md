@@ -392,17 +392,23 @@ rising; mining resumes by itself when the network returns (unchanged from ccmine
 benchmark numbers below use the miner's averaged summary rate instead.
 
 **Both engines' collectors, under CPU load:** `h-stats.sh` runs in a killable child bound by ONE absolute
-deadline (a single `DEADLINE_US`, computed once before the child is even launched, threaded through launch,
-collection, enrichment and cleanup — never a fresh relative timer re-armed partway through) that keeps the whole
-poll under 3.0 s even when the miner saturates every CPU in a small cpuset. There is no cache of the hashrate: every
-poll splits into a mandatory Phase A — one cheap, bounded API call that alone yields the rate, accepted/rejected and
-stall/freshness state, validated fresh on THIS poll — written immediately, before anything else is attempted, so a
-kill later in the same poll can never lose it; and an optional Phase B (per-core rows, sensors, topology
-verification) that runs with whatever budget remains and may only ever *replace* Phase A's total with its own when
-Phase B's own data is complete (every row present, none missing/null) and consistent with Phase A (never a
-null-as-zero or a validly-empty reply quietly outvoting a positive, fresher rate) — otherwise Phase A's total stands
-and Phase B contributes detail rows only. If the fresh-rate call itself cannot complete under starvation, the poll
-reports 0, honestly, inside the same budget — never a stale positive left over from an earlier poll or a different
+deadline (a single `DEADLINE_US`, computed once at the true poll entry — the top-level dispatcher, before even
+manifest parsing or engine selection — and threaded through launch, collection, enrichment and cleanup — never
+a fresh relative timer re-armed partway through), targeting 3.0 s for the whole poll even when the miner
+saturates every CPU in a small cpuset; at the most extreme contention (1-2 CPUs pinned against many more
+competing threads) scheduling/signal-delivery delay alone can still push a poll past that target — it is a
+target enforced by one shared deadline, not a hard ceiling — but it never produces a false zero even then (see
+`tests/hive/test_verus_under_load.sh`). There is no cache of the hashrate: every poll splits into a mandatory
+Phase A — one cheap, bounded API call that alone yields the rate, accepted/rejected and stall/freshness state,
+validated fresh on THIS poll — written immediately, before anything else is attempted, so a kill later in the
+same poll can never lose it; and an optional Phase B (per-core rows, sensors, topology verification) that runs
+with whatever budget remains and may only ever *replace Phase A's WHOLE result* (both the total and its own
+stats together, never a mix of the two) with its own when Phase B's own data is complete (every row present,
+none missing/null) and consistent with Phase A (within a 10% tolerance of Phase A's own value when Phase A has
+a confident positive rate — never a null-as-zero or a near-zero reply quietly outvoting a positive, fresher
+rate) — otherwise Phase A's total AND its own stats stand, untouched. If the fresh-rate call itself cannot
+complete under starvation, the poll reports 0, honestly, inside the same budget — never a stale positive left
+over from an earlier poll or a different
 instance. RandomX's ownership check (the API port belongs to *this* `xmrig`, confirmed via `/proc`) also gates a
 small, cosmetic per-instance cache of the last real *temperature* only, bound by pid+start-time+age (never the
 hashrate). See `tests/hive/test_rx_stats_cache.sh`, `tests/hive/test_rx_under_load.sh` and
