@@ -3,10 +3,25 @@
 Config file (JSON), re-read on every request so a test can change it between calls:
   {"summary": <json object or null>, "backends": <json array or null>, "delay": <seconds, optional>}
 A null body answers with HTTP 500 (stands in for a down/erroring miner)."""
+import ctypes
 import http.server
 import json
+import signal
 import sys
 import time
+
+# Parent-death signal (Linux prctl(PR_SET_PDEATHSIG)): this process asks the kernel to SIGTERM it the instant
+# its direct parent (the bash test driver) dies for ANY reason - including a SIGKILL of that parent, which
+# bypasses that parent's own EXIT/INT/TERM trap entirely (an unmaskable signal skips shell cleanup outright, so
+# no bash-level trap can ever plug this hole; only the kernel can, right here). Belt-and-suspenders: every test
+# already kills this process by its own tracked pid too - this only catches the case where that tracking itself
+# was bypassed (an external force-kill of the driver script, not a normal test failure).
+try:
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    PR_SET_PDEATHSIG = 1
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+except OSError:
+    pass  # non-Linux / no libc.so.6 - the test's own pid-tracked cleanup still applies
 
 port, cfg_path = int(sys.argv[1]), sys.argv[2]
 
