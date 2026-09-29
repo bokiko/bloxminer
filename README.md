@@ -42,6 +42,7 @@ on any x86-64 Linux, HiveOS-ready**
 - [CPU support](#cpu-support)
 - [HiveOS stats](#hiveos-stats)
 - [API](#api)
+- [Huge pages](#huge-pages)
 - [Performance](#performance)
 - [Troubleshooting](#troubleshooting)
 - [Requirements](#requirements)
@@ -390,6 +391,34 @@ CPU=0;KHS=1363.02;AFF=0;AGE=8;DUR=36;STATE=hashing|CPU=1;KHS=1372.25;AFF=1;AGE=8
 | `AGE` | Seconds since the thread last finished or was interrupted by a new pool job |
 | `DUR` | Length of that measured batch (s) |
 | `STATE` | A freshness flag: `hashing` = finished work recently; `waiting` = overdue (2 × the thread's longest batch + 30 s, at least 5 and at most 10 min) |
+
+---
+
+## Huge pages
+
+The RandomX engine reserves ~1200 × 2 MB huge pages on start (Hive's own `hugepages -rx` helper, then XMRig
+itself tops that up further if it needs more - see [Troubleshooting](#troubleshooting) if you ever see this
+misbehave). Switching to the Verus engine releases exactly that reservation back to whatever it was before -
+see [Two engines, one download](#two-engines-one-download).
+
+**Exclusive-ownership policy.** From the moment the dispatcher runs `hugepages -rx` for a fresh RandomX start
+until this package positively confirms ("finalizes") what XMRig itself raised `vm.nr_hugepages` to, BloxMiner
+considers itself the SOLE owner of `vm.nr_hugepages` on this rig, and treats any other write to it during that
+window as unsupported. This is deliberate, not an oversight: HiveOS runs exactly one miner at a time, and the
+only other program that ever touches `vm.nr_hugepages` on a Hive rig is Hive's own `hugepages` tool - which
+BloxMiner itself is the one invoking. If you run something else on the box that also writes
+`vm.nr_hugepages` during that short startup window (a custom script, another miner test, manual `sysctl`), a
+race is possible and this package may adopt a value it did not itself set; do not do that. The window is also
+explicitly time-bounded (see `HUGEPAGES_STARTUP_WINDOW_S` in `bloxminer/h-common.sh` - 300 s by default,
+comfortably above the ~2 s a real dataset takes to become ready on a modern CPU): if the RandomX engine's
+huge-page reservation is not confirmed within that window, this package gives up on ever finalizing that
+session's record - it is logged once, and no restore will happen on the next Verus switch (the "unsupported"
+outcome above is scoped to that startup window alone, never open-ended).
+
+A finalized record is also only ever trusted within the SAME boot it was written in (`boot_id` from
+`/proc/sys/kernel/random/boot_id`, checked both when finalizing and again before every restore) - it lives on
+tmpfs anyway, so a reboot normally clears it outright, but this is a second, explicit guard in case that ever
+is not true (an unusual `$STATEDIR` override, for example).
 
 ---
 

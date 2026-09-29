@@ -194,7 +194,39 @@ reject_foreign_selector() {
 # units, and the predicted-value formula above
 # does not apply. finalize_rx_hugepages detects this from config.json itself (the same file h-config.sh wrote)
 # and refuses to finalize for that session - logged once, record kept, exactly like any other unconfirmed case.
+#
+# ROUND 5c - equality with the predicted value is not, by itself, PROOF that XMRig raised it: with prelim==free0
+# (no shortfall at all, e.g. cask18's own prior=0/prelim=1200/free0=1200), a FOREIGN write to vm.nr_hugepages
+# landing at exactly the same moment XMRig would have raised it anyway could be silently adopted as "ours" -
+# Codex's exact counterexample. There is no cheap way to make XMRig itself ATTRIBUTE its own write (it logs
+# nothing about it - confirmed by re-reading xmrig-src's LinuxMemory.cpp/VirtualMemory_unix.cpp again for this
+# round: no log line, no API field identifies the writer). Codex accepted an alternative: an EXPLICIT,
+# documented EXCLUSIVE-STARTUP POLICY instead of an attribution proof. Policy (also in README.md's "Huge
+# pages" section): from the moment this dispatcher runs `hugepages -rx` (note_rx_hugepages_start) until
+# finalize_rx_hugepages either finalizes or gives up, THIS PACKAGE is the sole SUPPORTED writer of
+# vm.nr_hugepages on the rig - HiveOS runs exactly one miner at a time, and the only other program that ever
+# writes that counter on a Hive rig is Hive's own `hugepages` tool, which is the one THIS package itself
+# invokes; anything else writing it during that window is explicitly unsupported and may be adopted. This is
+# bounded, not an open licence: the window itself is time-limited (HUGEPAGES_STARTUP_WINDOW_S below,
+# start_uptime in the record) - readiness reached outside it is never finalized regardless of whether the
+# numbers would otherwise match, closing off indefinite exposure.
 HUGEPAGES_FILE="$STATEDIR/.bloxminer-hugepages"
+
+# HUGEPAGES_STARTUP_WINDOW_S - the exclusive-ownership window's own bound, in seconds since note_rx_hugepages_
+# start's own `hugepages -rx` call (start_uptime in the record, from /proc/uptime - monotonic within a boot,
+# immune to wall-clock/date changes, and already anchored to the SAME boot via the existing boot_id gate).
+# 300 s: on cask18 (2026-09-29 live measurement) the RandomX dataset was ready ~2 s after start - even a much
+# slower or resource-starved rig is expected to finish well under a minute; 300 s leaves a generous margin for
+# a pathologically slow start while still tightly bounding how long a foreign write could ever be adopted under
+# the policy above (never "forever", which was the actual concern - not the exact number of seconds).
+# BLOX_HP_STARTUP_WINDOW_S overrides it for tests.
+HUGEPAGES_STARTUP_WINDOW_S=${BLOX_HP_STARTUP_WINDOW_S:-300}
+
+# _hp_uptime_seconds - integer seconds since boot from /proc/uptime's first field (BLOX_PROCFS_ROOT overridable
+# for tests). Prints nothing on any read failure - callers treat that exactly like any other missing
+# precondition (note_rx_hugepages_start never writes a record without it; finalize_rx_hugepages never finalizes
+# without it).
+_hp_uptime_seconds() { awk '{print int($1)}' "${BLOX_PROCFS_ROOT:-/proc}/uptime" 2>/dev/null; }
 
 # _hp_field <name> - one field from the ownership record, or empty if absent/unreadable. A tiny shared reader
 # so every gate below (note/finalize/restore) parses the same five-line key=value file the same way.
@@ -246,15 +278,17 @@ _hp_xmrig_need_pages() {
 	echo $(( (priv + shared) / hpkb ))
 }
 
-# _hp_rewrite <final> [ours] - atomically rewrites the record, keeping prior/prelim/free0/boot as they already
-# are and setting only `final` (and `ours`, when given - only ever passed on a successful finalisation).
+# _hp_rewrite <final> [ours] - atomically rewrites the record, keeping prior/prelim/free0/boot/start_uptime as
+# they already are and setting only `final` (and `ours`, when given - only ever passed on a successful finalisation).
 # tmp+mv, same atomicity convention as every other write in this file.
 _hp_rewrite() {
-	local prior prelim free0 boot tmp
+	local prior prelim free0 boot start_uptime tmp
 	prior=$(_hp_field prior); prelim=$(_hp_field prelim); free0=$(_hp_field free0); boot=$(_hp_field boot)
+	start_uptime=$(_hp_field start_uptime)
 	tmp="$HUGEPAGES_FILE.tmp.$$"
 	{
-		printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nfinal=%s\n' "$prior" "$prelim" "$free0" "$boot" "$1"
+		printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=%s\n' \
+			"$prior" "$prelim" "$free0" "$boot" "$start_uptime" "$1"
 		[[ -n ${2:-} ]] && printf 'ours=%s\n' "$2"
 		true   # the group's own exit status must never depend on the conditional printf above (which is FALSE,
 		       # i.e. failing, whenever $2 is omitted - every "conflict" call) - without this, that false status
@@ -276,17 +310,18 @@ log_hugepages_note() {
 # restart - e.g. a flight-sheet edit that keeps the same algo - must never re-derive "prior"/"prelim", or rx's
 # own already-raised value would become the "prior" restored on the next Verus start): reads the CURRENT
 # vm.nr_hugepages ("prior"), runs Hive's `hugepages -rx` if present (see the top comment for why), then reads
-# vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id. No-op entirely (no
-# record written) if the record already exists, "prior" cannot be read, "prelim" cannot be read afterwards, or
-# "free0" cannot be read - a record is only ever written when all three are known-good numbers; finalize_rx_
-# hugepages (h-stats.sh) needs every one of them to compute XMRig's own predicted total, and writing a record
-# with any of them missing would let that check never fire safely, so this function simply never produces that
-# record in the first place. `final=0` marks it not yet finalized; `ours` is deliberately NOT written here any
-# more (Round 5 - see the top-of-section comment for why "the value right after `hugepages -rx`" was wrong) -
-# it is only ever written by finalize_rx_hugepages, once XMRig's own reported numbers confirm what it is.
+# vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id and (Round 5c)
+# /proc/uptime ("start_uptime" - the exclusive-ownership window's own clock, see the top-of-section comment).
+# No-op entirely (no record written) if the record already exists, or if "prior"/"prelim"/"free0"/"start_uptime"
+# cannot each be read as a known-good number - finalize_rx_hugepages (h-stats.sh) needs every one of them to
+# compute XMRig's own predicted total and to bound the window, and writing a record with any of them missing
+# would let those checks never fire safely, so this function simply never produces that record in the first
+# place. `final=0` marks it not yet finalized; `ours` is deliberately NOT written here any more (Round 5 - see
+# the top-of-section comment for why "the value right after `hugepages -rx`" was wrong) - it is only ever
+# written by finalize_rx_hugepages, once XMRig's own reported numbers confirm what it is.
 note_rx_hugepages_start() {
 	[[ -e $HUGEPAGES_FILE ]] && return 0
-	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot tmp
+	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp
 	[[ -r $proc ]] || return 0
 	prior=$(<"$proc") 2>/dev/null
 	[[ $prior =~ ^[0-9]+$ ]] || return 0
@@ -302,9 +337,18 @@ note_rx_hugepages_start() {
 		log_hugepages_note "BloxMiner: could not read HugePages_Free after reserving for rx (/proc/meminfo unreadable/invalid) - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
 		return 0
 	fi
+	# ROUND 5c: start_uptime anchors the exclusive-ownership window's own bound (HUGEPAGES_STARTUP_WINDOW_S) -
+	# same all-or-nothing treatment as prior/prelim/free0: no record at all if it cannot be read, rather than a
+	# record finalize_rx_hugepages could never safely bound.
+	start_uptime=$(_hp_uptime_seconds)
+	if [[ ! $start_uptime =~ ^[0-9]+$ ]]; then
+		log_hugepages_note "BloxMiner: could not read /proc/uptime after reserving for rx - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
+		return 0
+	fi
 	boot=$(_hp_boot_id)
 	tmp="$HUGEPAGES_FILE.tmp.$$"
-	{ printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nfinal=0\n' "$prior" "$prelim" "$free0" "$boot" > "$tmp"; } 2>/dev/null \
+	{ printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=0\n' \
+		"$prior" "$prelim" "$free0" "$boot" "$start_uptime" > "$tmp"; } 2>/dev/null \
 		&& mv -f "$tmp" "$HUGEPAGES_FILE" 2>/dev/null
 }
 
@@ -375,9 +419,26 @@ finalize_rx_hugepages() {
 		return 0
 	fi
 
-	local prior prelim free0
-	prior=$(_hp_field prior); prelim=$(_hp_field prelim); free0=$(_hp_field free0)
-	[[ $prior =~ ^[0-9]+$ && $prelim =~ ^[0-9]+$ && $free0 =~ ^[0-9]+$ ]] || return 0   # corrupt record - never finalize
+	local prior prelim free0 start_uptime
+	prior=$(_hp_field prior); prelim=$(_hp_field prelim); free0=$(_hp_field free0); start_uptime=$(_hp_field start_uptime)
+	[[ $prior =~ ^[0-9]+$ && $prelim =~ ^[0-9]+$ && $free0 =~ ^[0-9]+$ && $start_uptime =~ ^[0-9]+$ ]] || return 0
+		# corrupt or legacy (pre-Round-5c, no start_uptime at all) record - never finalize, silent (same class of
+		# problem as any other missing field, not the distinct "window exceeded" outcome checked next)
+
+	# ---- Round 5c: the exclusive-ownership window's own bound (README.md's "Huge pages" section, Codex's
+	# counterexample: prelim==free0 means a foreign write landing at the exact moment XMRig would have raised
+	# nr_hugepages anyway is indistinguishable from XMRig's own write by value alone - this policy is what makes
+	# adopting it supported, and only for a bounded time after the dispatcher's own `hugepages -rx` call).
+	# Checked here (readiness otherwise fully proven) rather than earlier: "outside the window" is a distinct,
+	# logged-once outcome, not a silent retry - proven readiness that arrives too late is meaningfully different
+	# from "not ready yet".
+	local now_uptime; now_uptime=$(_hp_uptime_seconds)
+	if [[ ! $now_uptime =~ ^[0-9]+$ ]]; then return 0; fi   # can't measure the window right now - retry next poll
+	if (( now_uptime - start_uptime > HUGEPAGES_STARTUP_WINDOW_S )); then
+		log_hugepages_note "BloxMiner: rx's exclusive huge-page ownership window (${HUGEPAGES_STARTUP_WINDOW_S}s from the dispatcher's own \`hugepages -rx\` call) passed before readiness was confirmed - never finalizing this rx session, ownership record kept"
+		_hp_rewrite conflict
+		return 0
+	fi
 
 	# ---- Round 5b: KERNEL TRUTH of what this exact, ownership-verified xmrig process actually has mapped -
 	# never a foreign pid's smaps_rollup (owner_pid was already positively confirmed above), never the API's
@@ -405,12 +466,55 @@ finalize_rx_hugepages() {
 	_hp_rewrite 1 "$cur"   # everything XMRig itself raised, positively confirmed via its own kernel-mapped huge pages, nothing foreign involved
 }
 
+# finalize_rx_hugepages_bounded <deadline seconds> - the ONLY way the top-level h-stats.sh ever calls
+# finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no deadline of its own - it runs
+# AFTER the rx engine's own h-stats.sh, which already spends up to its own ~2.4-2.7 s budget under load, so
+# without a bound here finalize's own work (a /proc/net/tcp scan, a curl call, a /proc/<pid>/smaps_rollup read)
+# could push the WHOLE poll past whatever deadline Hive's watchdog enforces - the exact risk this package's own
+# `have_budget`/`remaining` convention (engines/rx/h-stats.sh) exists to prevent everywhere else. <deadline> is
+# the seconds LEFT in this poll's overall budget once the engine's own collection has already run (computed by
+# h-stats.sh itself, which is the only place that knows how much of the shared budget is already spent).
+# On a timeout: this poll simply defers finalization to a later one - $khs/$stats were already set by the
+# engine's own h-stats.sh BEFORE this ever runs, so they are completely unaffected either way, and a killed
+# attempt writes nothing at all (_hp_rewrite's tmp+mv is all-or-nothing: there is no partial record to leave
+# behind beyond a stray .tmp.$$ file, cleaned up best-effort on the NEXT call).
+# Backgrounding the FUNCTION CALL directly - never a `bash -c`/`setsid` re-exec into a fresh interpreter - is
+# what keeps this both simple and correct: a backgrounded job is a plain fork of THIS shell, so it sees every
+# variable ($khs, the engine's own exported PORT/PROC/PKG, HUGEPAGES_FILE, ...) and every function
+# (_hp_xmrig_need_pages, _hp_rewrite, log_hugepages_note, ...) it needs with no export/re-sourcing required.
+# The owner-pid lookup inside finalize_rx_hugepages is already the SAME O(1)-fork `find` pattern engines/rx/
+# h-stats.sh's own (load-tested, tests/hive/test_rx_under_load.sh) ownership scan uses, never a per-item loop -
+# this wrapper is what bounds that lookup's (and everything else's) TOTAL wall-clock, on top of that.
+finalize_rx_hugepages_bounded() {
+	local deadline=$1
+	awk -v r="$deadline" 'BEGIN{exit !(r>0.05)}' || return 0   # not worth even trying this poll - defer
+	rm -f "$HUGEPAGES_FILE".tmp.* 2>/dev/null   # best-effort: a leftover temp file from an earlier killed attempt
+
+	finalize_rx_hugepages > /dev/null 2>&1 &
+	local cpid=$!
+	{ sleep "$deadline"; } > /dev/null 2>&1 &
+	local apid=$!
+	wait -n "$cpid" "$apid" 2>/dev/null
+	if kill -0 "$cpid" 2>/dev/null; then
+		kill -TERM "$cpid" 2>/dev/null
+		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
+		sleep 0.05
+		kill -0 "$cpid" 2>/dev/null && kill -KILL "$cpid" 2>/dev/null
+	else
+		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
+	fi
+	wait "$cpid" 2>/dev/null
+	true
+}
+
 # restore_verus_hugepages - called just before exec'ing the verus engine. ONLY if a record exists (a fresh
 # install, or a Verus start never preceded by an rx start under this package's ownership, touches
 # vm.nr_hugepages at all) AND that record has final=1 (finalize_rx_hugepages, above, positively confirmed
 # "ours" from XMRig's own reported numbers - final=0/"conflict"/missing, including an OLD pre-Round-5 record
 # that only ever had prior=/ours= and no final= line at all, is never trusted here; see the top-of-section
-# comment on backward compatibility). Given final=1, the restore fires ONLY when ALL THREE of "prior", "ours"
+# comment on backward compatibility) AND was finalized within the CURRENT boot (Round 5c - re-checked here,
+# independently of finalize_rx_hugepages's own boot_id check, since a reboot could happen between finalization
+# and this call). Given final=1 and a matching boot_id, the restore fires ONLY when ALL THREE of "prior", "ours"
 # (both from the record) and the CURRENT value (read fresh, right now) are valid, non-negative integers AND
 # current == ours - i.e. this package can positively confirm the live value is still exactly what it itself
 # last set. Any single one of those being missing, non-numeric, or unreadable - a corrupt record, an unreadable
@@ -427,6 +531,23 @@ restore_verus_hugepages() {
 	local final; final=$(_hp_field final)
 	if [[ $final != 1 ]]; then
 		log_hugepages_note "BloxMiner: huge-page ownership record not finalized (final=${final:-<missing>}) - this package cannot positively confirm what it is entitled to restore; left vm.nr_hugepages untouched, record kept"
+		return 0
+	fi
+
+	# ---- Round 5c: a finalized record is only ever trusted within the SAME boot it was finalized in - a stale
+	# final=1 record surviving into a DIFFERENT boot (an unusual non-tmpfs $STATEDIR, or a boot_id anomaly) must
+	# never authorize a restore just because "prior"/"ours" happen to still look numerically plausible; those
+	# numbers describe a hugepage reservation from a boot that no longer exists. finalize_rx_hugepages already
+	# checks boot_id before EVER finalizing, but that was checked THEN - a reboot could still happen between
+	# finalization and this restore attempt, so it is re-checked here, independently, before any write. Decision
+	# (documented, not just enforced): KEEP the record on a mismatch, never drop it - consistent with every other
+	# gate in this function (a permanently unusable record has nowhere better to go than tmpfs until an actual
+	# reboot clears it, which is also precisely the case that makes this cross-boot scenario vanishingly rare in
+	# practice; dropping it here would only remove the one place "prior" is recorded, for no gain).
+	local rec_boot cur_boot
+	rec_boot=$(_hp_field boot); cur_boot=$(_hp_boot_id)
+	if [[ -z $rec_boot || $rec_boot != "$cur_boot" ]]; then
+		log_hugepages_note "BloxMiner: finalized huge-page ownership record is from a different boot (record=${rec_boot:-<missing>}, current=${cur_boot:-<unreadable>}) - a finalized record is only ever trusted within the SAME boot it was written in; left vm.nr_hugepages untouched, record kept"
 		return 0
 	fi
 

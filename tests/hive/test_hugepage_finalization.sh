@@ -62,6 +62,8 @@ setup_proc() {   # $1 = nr_hugepages (live) $2 = HugePages_Free $3 = boot_id str
 	echo "$1" > "$PROC/sys/vm/nr_hugepages"
 	printf 'HugePages_Free:  %8d kB\nHugepagesize:        2048 kB\n' "$2" > "$PROC/meminfo"
 	printf '%s\n' "$3" > "$PROC/sys/kernel/random/boot_id"
+	set_uptime 1010   # Round 5c: 10 s after the fixture records' own start_uptime=1000 below - comfortably
+		# inside HUGEPAGES_STARTUP_WINDOW_S's default 300 s; set_uptime overrides this per test.
 	python3 - "$PROC" "${4:-$BLOX_DIR/xmrig}" "$PORT" "$OWNER_PID" <<'PY'
 import os, sys
 root, exe_path, port, pid = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
@@ -75,6 +77,7 @@ with open(os.path.join(root, "net", "tcp"), "w") as f:
 PY
 }
 set_nr_hugepages() { echo "$1" > "$PROC/sys/vm/nr_hugepages"; }   # a "foreign" write between polls
+set_uptime() { printf '%s.00 0.00\n' "$1" > "$PROC/uptime"; }   # Round 5c: fake /proc/uptime's own first field
 
 # ---- Round 5b: /proc/<pid>/smaps_rollup - the KERNEL TRUTH source finalize_rx_hugepages now reads instead of
 #      the xmrig API's own (incomplete) "hugepages" total. write_smaps with no args writes nothing (simulates
@@ -152,7 +155,7 @@ sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-AAA
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-AAA\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-AAA\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500000 || bad "fake xmrig API startup" "$(cat "$T/api.out" 2>/dev/null)"
 poll
 poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
@@ -174,7 +177,7 @@ if [[ ! -e $HUGEFILE ]]; then ok "restore after finalization: ownership record r
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-BBB
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=1201\nprelim=1200\nfree0=1200\nboot=boot-BBB\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=1201\nprelim=1200\nfree0=1200\nboot=boot-BBB\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500 || bad "fake xmrig API startup (case 2)" "$(cat "$T/api.out" 2>/dev/null)"
 poll
 if [[ $(hp_field final) == 1 && $(hp_field ours) == 1201 ]]; then ok "cask18 nonzero baseline: finalizes (final=1, ours=1201)"; else bad "cask18 nonzero baseline: finalizes" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
@@ -187,7 +190,7 @@ if grep -q "nr_hugepages=1201" "$SYSCTL_LOG" 2>/dev/null; then ok "cask18 nonzer
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-CCC
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-CCC\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-CCC\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll   # finalizes
 before=$(cat "$HUGEFILE")
@@ -202,7 +205,7 @@ if [[ $before == "$after" ]]; then ok "second poll after finalization: record by
 #    gate must reject this BEFORE finalize_rx_hugepages ever reaches smaps_rollup.)
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-DDD
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-DDD\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-DDD\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 600 1200 500   # only half the dataset's pages allocated so far
 poll
 stop_api
@@ -216,7 +219,7 @@ fi
 #    just finished but no 10 s hashrate window has elapsed): same - silent retry, never logged
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-EEE
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-EEE\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-EEE\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 0   # fully allocated but hashrate not up yet
 poll
 stop_api
@@ -233,7 +236,7 @@ fi
 setup_pkg; write_rx_config false
 setup_proc 1400 1200 boot-FFF   # live is 1400, not the predicted 1201 - something else raised it too
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-FFF\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-FFF\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 if [[ $(hp_field final) == conflict ]] && grep -q "does not match XMRig's own predicted reservation" "$LOGFILE" 2>/dev/null; then
@@ -255,7 +258,7 @@ if ! sysctl_called; then ok "foreign change during startup: a later Verus start 
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-GGG
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-GGG\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-GGG\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll   # finalizes: final=1, ours=1201
 stop_api
@@ -270,7 +273,7 @@ if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$before" ]]; then ok "foreign chang
 #    anyway, this only guards the same-boot-but-somehow-stale-record edge case) - and never restored either.
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-CURRENT
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-OLD\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-OLD\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 stop_api
@@ -288,7 +291,7 @@ if ! sysctl_called; then ok "boot_id mismatch: never restored (final != 1)"; els
 #    needed - this guard fires before finalize_rx_hugepages ever reads smaps_rollup.)
 setup_pkg; write_rx_config true   # randomx."1gb-pages": true
 setup_proc 1201 1200 boot-HHH
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HHH\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HHH\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 n1=$(log_count "1gb-pages is enabled")
@@ -309,7 +312,7 @@ if ! sysctl_called; then ok "1gb-pages enabled: never restored (final != 1)"; el
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-III
 write_smaps "$OWNER_PID" 1201 0
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-III\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-III\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll   # finalizes: final=1, ours=1201
 stop_api
@@ -342,7 +345,7 @@ setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-KKK
 write_smaps "$OWNER_PID" 1201 0
 write_smaps 9202 90000 0   # a foreign, unrelated process - never bound to $PORT, never our xmrig
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-KKK\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-KKK\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 stop_api
@@ -359,7 +362,7 @@ fi
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-LLL "/usr/bin/some-other-process"   # owner_pid's exe does NOT match $BLOX_DIR/xmrig
 write_smaps "$OWNER_PID" 1201 0   # even a perfectly plausible smaps must not matter - ownership fails first
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-LLL\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-LLL\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 stop_api
@@ -372,7 +375,7 @@ if ! sysctl_called; then ok "exe mismatch: never restored (final != 1)"; else ba
 #    kernel/permission quirk) -> fail safe: never finalize, logged once, final=conflict, record kept.
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-MMM   # no write_smaps call at all - $PROC/$OWNER_PID/smaps_rollup does not exist
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-MMM\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-MMM\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 n1=$(log_count "could not read a complete huge-page mapping")
@@ -392,7 +395,7 @@ if ! sysctl_called; then ok "smaps_rollup missing: never restored (final != 1)";
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-NNN
 write_smaps_partial "$OWNER_PID"
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-NNN\nfinal=0\n' > "$HUGEFILE"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-NNN\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
 stop_api
@@ -401,6 +404,146 @@ if [[ $(hp_field final) == conflict ]] && grep -q "could not read a complete hug
 else
 	bad "smaps_rollup missing Hugetlb fields: fails safe, logged" "final=$(hp_field final) log=$(cat "$LOGFILE" 2>/dev/null)"
 fi
+
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]
+
+# ================================================================== 16. Round 5c: Codex's EXACT counterexample -
+#    documents the policy's accepted trade-off, not a bug. prelim==free0 (1200==1200, no shortfall by XMRig's
+#    own reserve() arithmetic) means equality with the predicted value ALONE cannot distinguish "XMRig itself
+#    raised nr_hugepages" from "a foreign writer landed at exactly 1201 in the same instant XMRig's own raise
+#    would have" - there is no cheap way to make XMRig attribute its own write (re-confirmed this round: no log
+#    line, no API field identifies the writer). Codex accepted an EXPLICIT, DOCUMENTED EXCLUSIVE-STARTUP POLICY
+#    instead of an attribution proof (README.md's "Huge pages" section; h-common.sh's top-of-section comment):
+#    within the bounded startup window, this package is the SOLE SUPPORTED writer of vm.nr_hugepages, so
+#    equality is accepted as proof UNDER THAT POLICY. This test is readiness reached WITHIN the window (see
+#    test 17 for the same numbers reached OUTSIDE it, which is never accepted regardless).
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-OOO   # live=1201: could be XMRig's own raise, or a foreign write landing on the same
+	# value in the same instant - genuinely indistinguishable by value alone, which is exactly Codex's point
+set_uptime 1005   # 5 s after start_uptime=1000 below - well within the window: readiness reached ON TIME
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-OOO\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500
+poll
+stop_api
+if [[ $(hp_field final) == 1 && $(hp_field ours) == 1201 ]]; then
+	ok "Codex's counterexample (prelim==free0==1200, live=1201, within the window): finalizes under the documented exclusive-ownership policy - accepted trade-off, not a bug"
+else
+	bad "Codex's counterexample: finalizes under the documented policy (within window)" "$(cat "$HUGEFILE" 2>/dev/null)"
+fi
+
+# ================================================================== 17. Round 5c: the SAME numbers as test 16,
+#    but readiness is reached OUTSIDE the bounded window - the policy's other half. Never finalized regardless
+#    of whether the numbers would otherwise match; logged once, final=conflict, never restored.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-PPP
+set_uptime 1400   # 400 s after start_uptime=1000 - past HUGEPAGES_STARTUP_WINDOW_S's default 300 s
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-PPP\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500
+poll
+n1=$(log_count "exclusive huge-page ownership window")
+poll
+stop_api
+n2=$(log_count "exclusive huge-page ownership window")
+if [[ $(hp_field final) == conflict && $n1 == 1 && $n2 == 1 ]]; then
+	ok "same numbers as test 16, but readiness reached OUTSIDE the 300 s window: never finalizes, logged once"
+else
+	bad "readiness outside the window: never finalizes, logged once" "final=$(hp_field final) n1=$n1 n2=$n2 log=$(cat "$LOGFILE" 2>/dev/null)"
+fi
+attempt_restore
+if ! sysctl_called; then ok "readiness outside the window: never restored (final != 1)"; else bad "readiness outside the window: never restored" "$(cat "$SYSCTL_LOG")"; fi
+
+# ================================================================== 18. Round 5c: BLOX_HP_STARTUP_WINDOW_S
+#    actually changes the bound (not hardcoded dead code) - 10 s elapsed is comfortably inside the DEFAULT 300 s
+#    window, but exceeds a 5 s one.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-QQQ
+set_uptime 1010   # 10 s elapsed since start_uptime=1000
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-QQQ\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500
+BLOX_HP_STARTUP_WINDOW_S=5 poll
+stop_api
+if [[ $(hp_field final) == conflict ]]; then
+	ok "BLOX_HP_STARTUP_WINDOW_S=5 override: 10 s elapsed exceeds it, never finalizes (default 300 s would have allowed it)"
+else
+	bad "window override actually bounds it" "$(cat "$HUGEFILE" 2>/dev/null)"
+fi
+
+# ================================================================== 19. Round 5c: restore_verus_hugepages must
+#    independently re-check boot_id before ANY write - a finalized record (final=1) surviving into a DIFFERENT
+#    boot (an unusual non-tmpfs $STATEDIR, or a reboot between finalization and this restore attempt) must never
+#    be trusted just because prior/ours still look numerically fine.
+setup_pkg; write_verus_config
+setup_proc 1201 1200 boot-CURRENT-19
+rm -f "$T/log/bloxminer.log"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-DIFFERENT-19\nstart_uptime=1000\nfinal=1\nours=1201\n' > "$HUGEFILE"
+attempt_restore
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "finalized huge-page ownership record is from a different boot" "$LOGFILE" 2>/dev/null; then
+	ok "restore: finalized record's boot_id MISMATCHES the current boot -> never restored, kept, logged"
+else
+	bad "restore: boot_id mismatch never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$LOGFILE" 2>/dev/null)"
+fi
+
+# ================================================================== 20. Round 5c: restore with the record's own
+#    boot= field MISSING entirely (empty) - must not be treated as "matches everything"; refused exactly like a
+#    mismatch.
+setup_pkg; write_verus_config
+setup_proc 1201 1200 boot-CURRENT-20
+rm -f "$T/log/bloxminer.log"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=\nstart_uptime=1000\nfinal=1\nours=1201\n' > "$HUGEFILE"
+attempt_restore
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "finalized huge-page ownership record is from a different boot" "$LOGFILE" 2>/dev/null; then
+	ok "restore: finalized record's boot= field MISSING -> never restored, kept, logged"
+else
+	bad "restore: missing boot= never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$LOGFILE" 2>/dev/null)"
+fi
+
+# ================================================================== 21. Round 5c: restore when the CURRENT
+#    boot_id is UNREADABLE (no /proc/sys/kernel/random/boot_id at all) - even though the record's own boot=
+#    field looks perfectly valid, an unreadable "now" can never be confirmed to match it; refused, never an
+#    "assume it matches" fallback.
+setup_pkg; write_verus_config
+setup_proc 1201 1200 boot-SOMETHING-21
+rm -f "$PROC/sys/kernel/random/boot_id"   # current boot_id now unreadable
+rm -f "$T/log/bloxminer.log"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-SOMETHING-21\nstart_uptime=1000\nfinal=1\nours=1201\n' > "$HUGEFILE"
+attempt_restore
+if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "finalized huge-page ownership record is from a different boot" "$LOGFILE" 2>/dev/null; then
+	ok "restore: CURRENT boot_id unreadable -> never restored, kept, logged"
+else
+	bad "restore: unreadable current boot_id never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$LOGFILE" 2>/dev/null)"
+fi
+
+# ================================================================== 22. Round 5c (Codex blocker 2): finalization
+#    must never escape the poll's own budget. A deliberately SLOW /proc/<pid>/smaps_rollup read - a FIFO with
+#    NO writer, so opening it for read blocks exactly like a hung real read would - is bounded by
+#    finalize_rx_hugepages_bounded and killed once the remaining budget runs out; $khs/$stats (already set by
+#    the engine's own h-stats.sh, before finalization ever runs) are completely unaffected, and finalization is
+#    simply deferred (final stays "0") rather than ever blocking this poll.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-RRR
+mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PROC/$OWNER_PID/smaps_rollup"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-RRR\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500000
+t0=$(date +%s.%N)
+BLOX_HP_TOTAL_BUDGET_S=1.5 poll
+t1=$(date +%s.%N)
+stop_api
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 2.5)}'; then ok "slow smaps_rollup (FIFO, never written): whole poll still bounded (${elapsed}s)"; else bad "slow smaps_rollup: whole poll still bounded" "elapsed=${elapsed}s"; fi
+if [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; then ok "slow smaps_rollup: \$khs/\$stats still valid despite the hung finalization attempt"; else bad "slow smaps_rollup: khs/stats still valid" "$out"; fi
+if [[ $(hp_field final) == 0 ]]; then ok "slow smaps_rollup: finalization deferred (final stays 0), never a partial/wrong record"; else bad "slow smaps_rollup: finalization deferred" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
+# best-effort: unblock whatever is still stuck opening the FIFO for read (an orphaned grandchild the TERM/KILL
+# above could not reach directly - killing the backgrounded function call's own pid does not reach a
+# still-running command-substitution grandchild's own blocking open()) so it does not linger for the rest of
+# this suite; bounded by `timeout` in case nothing is actually waiting any more.
+# shellcheck disable=SC2016   # $1 is the child bash's own positional parameter, not this shell's
+timeout 1 bash -c ': > "$1"' _ "$PROC/$OWNER_PID/smaps_rollup" > /dev/null 2>&1 &
+disown 2>/dev/null || true
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

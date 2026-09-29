@@ -276,6 +276,9 @@ PROCFILE="$PROCROOT/sys/vm/nr_hugepages"
 MEMINFO="$PROCROOT/meminfo"
 BOOTFILE="$PROCROOT/sys/kernel/random/boot_id"
 printf 'boot-TEST-CONSTANT\n' > "$BOOTFILE"
+printf '1000.00 0.00\n' > "$PROCROOT/uptime"   # Round 5c: note_rx_hugepages_start now also needs /proc/uptime
+	# (start_uptime) to write a record at all - a static value throughout this section is fine, since the
+	# window-bound itself is exercised end to end in tests/hive/test_hugepage_finalization.sh, not here.
 cat > "$FAKEBIN/sysctl" <<'SH'
 #!/bin/sh
 echo "sysctl $*" >> "$SYSCTL_LOG"
@@ -304,10 +307,12 @@ run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGE
 # poll (real end-to-end finalization behaviour, including the exact xmrig-src-derived formula, is covered in
 # tests/hive/test_hugepage_finalization.sh) so this section can test restore_verus_hugepages's OWN logic.
 finalize_record_for_test() {
-	local prior prelim free0 boot
+	local prior prelim free0 boot start_uptime
 	prior=$(sed -n 's/^prior=//p' "$HUGEFILE" 2>/dev/null); prelim=$(sed -n 's/^prelim=//p' "$HUGEFILE" 2>/dev/null)
 	free0=$(sed -n 's/^free0=//p' "$HUGEFILE" 2>/dev/null); boot=$(sed -n 's/^boot=//p' "$HUGEFILE" 2>/dev/null)
-	printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nfinal=1\nours=%s\n' "$prior" "$prelim" "$free0" "$boot" "$(cat "$PROCFILE")" > "$HUGEFILE"
+	start_uptime=$(sed -n 's/^start_uptime=//p' "$HUGEFILE" 2>/dev/null)
+	printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=1\nours=%s\n' \
+		"$prior" "$prelim" "$free0" "$boot" "$start_uptime" "$(cat "$PROCFILE")" > "$HUGEFILE"
 }
 
 # ---- fresh verus start, a foreign reservation already on the box (512), no ownership record -> untouched
@@ -406,19 +411,19 @@ if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$recorded_before2" ]]; then ok "fai
 #      and a log line explains why. (final=1 is included in every fixture below - these test the NEXT gate
 #      down, not the final=1 gate itself, which section 6's earlier "verus with final=0" case already covers.)
 hconfig "p:1" "W" "" "" ""   # a valid verus config throughout this block - only the hugepage record is corrupted
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= missing entirely
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nboot=boot-TEST-CONSTANT\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= missing entirely
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "missing ours (final=1) -> no sysctl call, record retained, logged"; else bad "missing ours (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=banana\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= non-numeric
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=banana\nboot=boot-TEST-CONSTANT\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # ours= non-numeric
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt ours (non-numeric, final=1) -> no sysctl call, record retained, logged"; else bad "corrupt ours (non-numeric, final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=banana\nours=512\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # prior= non-numeric
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=banana\nours=512\nboot=boot-TEST-CONSTANT\nfinal=1\n' > "$HUGEFILE"; echo 512 > "$PROCFILE"   # prior= non-numeric
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "invalid or corrupt" "$T/log/bloxminer.log" 2>/dev/null; then ok "corrupt prior (final=1) -> no sysctl call, record retained, logged"; else bad "corrupt prior (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 
-rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\nfinal=1\n' > "$HUGEFILE"; rm -f "$PROCFILE"   # current value unreadable
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\nboot=boot-TEST-CONSTANT\nfinal=1\n' > "$HUGEFILE"; rm -f "$PROCFILE"   # current value unreadable
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "could not read the current" "$T/log/bloxminer.log" 2>/dev/null; then ok "unreadable current value (final=1) -> no sysctl call, record retained, logged"; else bad "unreadable current value (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 echo 512 > "$PROCFILE"
