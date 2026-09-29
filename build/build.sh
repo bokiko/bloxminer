@@ -14,6 +14,11 @@ PATCH=${PATCH:-$HERE/bloxminer.patch}
 DEPS=(clang-14 libomp-14-dev libomp5-14 libstdc++-12-dev libc6-dev binutils autoconf automake autotools-dev make patchelf
       libcurl4-openssl-dev libssl-dev libjansson-dev zlib1g-dev git)
 
+for i in 1 2 3; do
+	sudo apt-get update -qq && break
+	echo "apt-get update failed (attempt $i/3), retrying..." >&2
+	sleep 5
+done
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${DEPS[@]}" build-essential >/dev/null
 SSLDEV=$(dpkg-query -W -f='${Version}' libssl-dev)
 [[ $SSLDEV == 3.* ]] || { echo "libssl-dev $SSLDEV is not OpenSSL 3 (HiveOS rig?) - build in a stock Ubuntu 22.04 chroot/container" >&2; exit 1; }

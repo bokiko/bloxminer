@@ -313,9 +313,21 @@ rm -f "$LIB"
 # because there is nothing here that was not collected THIS poll. Nothing written at all (killed too early, or
 # the LIB/OUTFILE/HANDSHAKE temp files themselves could not even be created) is the only case that falls back
 # to the defined, honest 0.
-if jq -e 'type == "object" and (.khs | type) == "string" and has("stats")' > /dev/null 2>&1 <<< "$result"; then
-	khs=$(jq -r '.khs' <<< "$result")
-	stats=$(jq -r '.stats' <<< "$result")
-else
+# ONE jq call, not three (validate + extract $khs + extract $stats together): under heavy, GH-CI-runner-scale
+# resource pressure a jq PROCESS SPAWN itself (not just a parse) can transiently fail - three separate calls
+# leave a window where the first (validate) succeeds but a later one silently returns empty, leaving $khs/
+# $stats empty rather than either the real answer or the defined fallback (the RandomX engine's own version of
+# this exact bug was observed on a slower GH runner: {"khs":"","stats":null}).
+parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and has("stats")
+	then [.khs, .stats] | @tsv else empty end' <<< "$result" 2>/dev/null)
+if [[ -n $parsed ]]; then
+	IFS=$'\t' read -r khs stats <<< "$parsed"
+fi
+# Final, unconditional guard: $khs must be non-empty here (a valid numeric string - Hive needs no more than
+# that) - if the path above somehow left it empty, this is the same honest, defined fallback as a genuine
+# "nothing collected" poll. $stats is allowed to be a genuinely empty string (write_result's own convention
+# for "no engine data" - the caller's engine screen falls back to the miner's own plain output), unlike RX's
+# engine, which always writes a full stats object.
+if [[ -z ${khs:-} ]]; then
 	khs=0; stats=""
 fi

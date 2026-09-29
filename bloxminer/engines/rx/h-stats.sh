@@ -512,10 +512,20 @@ rm -f "$LIB"
 # the rate itself, because there is nothing here that was not collected THIS poll (only the single row's
 # temperature, inside Phase A's own result, may already reflect ENRICHFILE - see run()). Nothing written at
 # all is the only case that falls back to the defined, honest 0.
-if jq -e 'type == "object" and (.khs | type) == "string" and has("stats")' > /dev/null 2>&1 <<< "$result"; then
-	khs=$(jq -r '.khs' <<< "$result")
-	stats=$(jq -c '.stats' <<< "$result")
-else
+# ONE jq call, not three (validate + extract $khs + extract $stats together): under heavy, GH-CI-runner-scale
+# resource pressure a jq PROCESS SPAWN itself (not just a parse) can transiently fail - three separate calls
+# leave a window where the first (validate) succeeds but a later one silently returns empty, leaving $khs/
+# $stats empty rather than either the real answer or the defined fallback (observed on a slower GH runner:
+# {"khs":"","stats":null}). A single call has no such window - it either parses out both together, or neither.
+parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and has("stats")
+	then [.khs, (.stats | tojson)] | @tsv else empty end' <<< "$result" 2>/dev/null)
+if [[ -n $parsed ]]; then
+	IFS=$'\t' read -r khs stats <<< "$parsed"
+fi
+# Final, unconditional guard: whatever the path above did, $khs must be non-empty here (never re-verified as
+# a NUMBER beyond that - Hive only needs a valid numeric string) and $stats must be non-empty JSON - if either
+# is somehow still not, this is the same honest, defined fallback as a genuine "nothing collected" poll.
+if [[ -z ${khs:-} || -z ${stats:-} ]]; then
 	note_state unavailable
 	fallback ""
 fi

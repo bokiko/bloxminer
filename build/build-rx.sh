@@ -46,7 +46,11 @@ id -u >/dev/null 2>&1   # sanity: a shell exists
 [[ -f /etc/os-release ]] && grep -q '^VERSION_ID="22.04"' /etc/os-release || echo "warning: not detected as Ubuntu 22.04; proceeding anyway" >&2
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+for i in 1 2 3; do
+	apt-get update -qq && break
+	echo "apt-get update failed (attempt $i/3), retrying..." >&2
+	sleep 5
+done
 DEPS=(build-essential cmake git wget ca-certificates pkg-config autoconf automake libtool perl python3 file binutils)
 apt-get install -y -qq "${DEPS[@]}" >/dev/null
 

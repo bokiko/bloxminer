@@ -369,6 +369,14 @@ run_hstats_timed() {   # -> sets $res $elapsed (wall time, seconds)
 	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
 	b=$(date +%s.%N)
 	elapsed=$(awk -v x="$a" -v y="$b" 'BEGIN{printf "%.2f", y - x}')
+	# Every single timeout/cleanup path must leave Hive with a valid numeric $khs and a valid $stats object -
+	# NEVER an empty khs or null stats, whatever else does or doesn't complete in time (a real bug, once seen
+	# on a slower GH CI runner under this exact budget-exhaustion scenario: {"khs":"","stats":null}).
+	if [[ $(jq -r '(.khs | test("^[0-9]+(\\.[0-9]+)?$")) and (.stats | type) == "object"' <<< "$res" 2>/dev/null) == true ]]; then
+		ok "port $BLOX_API_PORT poll: numeric khs + valid stats object (never empty/null)"
+	else
+		bad "port $BLOX_API_PORT poll: numeric khs + valid stats object" "$res"
+	fi
 }
 under_budget() { awk -v e="$1" 'BEGIN{exit !(e < 3.2)}'; }
 
