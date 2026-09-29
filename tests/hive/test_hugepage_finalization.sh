@@ -517,12 +517,22 @@ else
 	bad "restore: unreadable current boot_id never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$LOGFILE" 2>/dev/null)"
 fi
 
+# ---- fifo_has_no_reader_left <fifo path> - Round 5d: PROVES no descendant is left blocked reading a FIFO,
+#      using the FIFO's own open() semantics rather than fragile ps/pgrep pid-matching across poll()'s own
+#      bash -c boundary (already exited by the time we could inspect it from out here): opening the SAME path
+#      for WRITING blocks until a reader appears, so it times out if and only if nothing is still waiting to
+#      read it; a surviving orphaned reader instead pairs with this write attempt (near-)instantly.
+# shellcheck disable=SC2016   # $1 is the child bash's own positional parameter, not this shell's
+fifo_has_no_reader_left() { timeout 0.3 bash -c ': > "$1"' _ "$1" > /dev/null 2>&1; [[ $? == 124 ]]; }
+
 # ================================================================== 22. Round 5c (Codex blocker 2): finalization
 #    must never escape the poll's own budget. A deliberately SLOW /proc/<pid>/smaps_rollup read - a FIFO with
 #    NO writer, so opening it for read blocks exactly like a hung real read would - is bounded by
 #    finalize_rx_hugepages_bounded and killed once the remaining budget runs out; $khs/$stats (already set by
 #    the engine's own h-stats.sh, before finalization ever runs) are completely unaffected, and finalization is
-#    simply deferred (final stays "0") rather than ever blocking this poll.
+#    simply deferred (final stays "0") rather than ever blocking this poll. Round 5d: also proves the KILL
+#    reaches the WHOLE process group, not just the top-level backgrounded job - Round 5c's own version of this
+#    test could only acknowledge an orphaned grandchild and unblock it manually; this asserts none survives.
 setup_pkg; write_rx_config false
 setup_proc 1201 1200 boot-RRR
 mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PROC/$OWNER_PID/smaps_rollup"
@@ -537,13 +547,41 @@ poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
 if awk -v e="$elapsed" 'BEGIN{exit !(e < 2.5)}'; then ok "slow smaps_rollup (FIFO, never written): whole poll still bounded (${elapsed}s)"; else bad "slow smaps_rollup: whole poll still bounded" "elapsed=${elapsed}s"; fi
 if [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; then ok "slow smaps_rollup: \$khs/\$stats still valid despite the hung finalization attempt"; else bad "slow smaps_rollup: khs/stats still valid" "$out"; fi
 if [[ $(hp_field final) == 0 ]]; then ok "slow smaps_rollup: finalization deferred (final stays 0), never a partial/wrong record"; else bad "slow smaps_rollup: finalization deferred" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
-# best-effort: unblock whatever is still stuck opening the FIFO for read (an orphaned grandchild the TERM/KILL
-# above could not reach directly - killing the backgrounded function call's own pid does not reach a
-# still-running command-substitution grandchild's own blocking open()) so it does not linger for the rest of
-# this suite; bounded by `timeout` in case nothing is actually waiting any more.
-# shellcheck disable=SC2016   # $1 is the child bash's own positional parameter, not this shell's
-timeout 1 bash -c ': > "$1"' _ "$PROC/$OWNER_PID/smaps_rollup" > /dev/null 2>&1 &
-disown 2>/dev/null || true
+if fifo_has_no_reader_left "$PROC/$OWNER_PID/smaps_rollup"; then ok "slow smaps_rollup: the GROUP-kill reached the blocked read too - no orphaned descendant left waiting on the FIFO"; else bad "slow smaps_rollup: no orphaned descendant left" "a reader is still blocked on the FIFO"; fi
+rm -f "$PROC/$OWNER_PID/smaps_rollup"
+
+# ================================================================== 23. Round 5d (Codex): REPEATED timeouts (5
+#    consecutive polls, each with a FRESH hung smaps_rollup FIFO) must never accumulate stuck descendants, and
+#    each killed attempt must leave the record completely untouched - not just "final stays 0" but BYTE-
+#    IDENTICAL to before that poll ran, even once the FIFO is later unblocked (proving there is no late/delayed
+#    write racing the kill).
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-SSS
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-SSS\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500000
+n_over=0; n_zero_khs=0; n_wrong_final=0; n_record_changed=0; n_survivor=0
+for _ in 1 2 3 4 5; do
+	mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PROC/$OWNER_PID/smaps_rollup"
+	before_record=$(cat "$HUGEFILE" 2>/dev/null)
+	t0=$(date +%s.%N)
+	BLOX_HP_TOTAL_BUDGET_S=1.5 poll
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+	awk -v e="$elapsed" 'BEGIN{exit !(e < 2.5)}' || n_over=$((n_over+1))
+	poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
+	{ [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; } || n_zero_khs=$((n_zero_khs+1))
+	[[ $(hp_field final) == 0 ]] || n_wrong_final=$((n_wrong_final+1))
+	after_record=$(cat "$HUGEFILE" 2>/dev/null)
+	[[ "$before_record" == "$after_record" ]] || n_record_changed=$((n_record_changed+1))
+	fifo_has_no_reader_left "$PROC/$OWNER_PID/smaps_rollup" || n_survivor=$((n_survivor+1))
+	rm -f "$PROC/$OWNER_PID/smaps_rollup"
+done
+stop_api
+if [[ $n_over == 0 ]]; then ok "repeated timeouts (5 polls, fresh hung FIFO each time): every poll stayed within budget"; else bad "repeated timeouts: every poll within budget" "n_over=$n_over of 5"; fi
+if [[ $n_zero_khs == 0 ]]; then ok "repeated timeouts: \$khs stayed valid every single time"; else bad "repeated timeouts: khs stayed valid" "n_zero_khs=$n_zero_khs of 5"; fi
+if [[ $n_wrong_final == 0 ]]; then ok "repeated timeouts: final stayed 0 every single time (never a partial finalize)"; else bad "repeated timeouts: final stayed 0" "n_wrong_final=$n_wrong_final of 5"; fi
+if [[ $n_record_changed == 0 ]]; then ok "repeated timeouts: record byte-identical after every killed attempt - no late write, even once the FIFO is later unblocked"; else bad "repeated timeouts: record byte-identical after every killed attempt" "n_record_changed=$n_record_changed of 5"; fi
+if [[ $n_survivor == 0 ]]; then ok "repeated timeouts: NO surviving descendant left blocked on the FIFO after ANY of the 5 polls - none accumulate"; else bad "repeated timeouts: no surviving descendants accumulate" "n_survivor=$n_survivor of 5"; fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

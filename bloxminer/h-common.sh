@@ -222,29 +222,66 @@ HUGEPAGES_FILE="$STATEDIR/.bloxminer-hugepages"
 # BLOX_HP_STARTUP_WINDOW_S overrides it for tests.
 HUGEPAGES_STARTUP_WINDOW_S=${BLOX_HP_STARTUP_WINDOW_S:-300}
 
+# _hp_kv_field <prefix (no trailing colon)> <file> - ROUND 5d: a tiny shared, builtin-only "key: value" line
+# scanner for /proc's own colon-separated files (meminfo, smaps_rollup) - one `while read` loop, no fork at all
+# (unlike the awk this replaces): matches a line starting with "<prefix>:", strips the prefix, any trailing
+# "kB" unit, and all embedded spaces via pure parameter expansion, and prints the remaining digits. Prints
+# nothing on no match/unreadable file - callers treat that exactly like any other missing precondition.
+_hp_kv_field() {
+	local prefix=$1 file=$2 line val
+	[[ -r $file ]] || return 0
+	while IFS= read -r line; do
+		case $line in
+			"$prefix":*)
+				val=${line#"$prefix":}; val=${val%kB}; val=${val// /}
+				printf '%s' "$val"; return 0 ;;
+		esac
+	done < "$file" 2>/dev/null
+}
+
 # _hp_uptime_seconds - integer seconds since boot from /proc/uptime's first field (BLOX_PROCFS_ROOT overridable
 # for tests). Prints nothing on any read failure - callers treat that exactly like any other missing
 # precondition (note_rx_hugepages_start never writes a record without it; finalize_rx_hugepages never finalizes
-# without it).
-_hp_uptime_seconds() { awk '{print int($1)}' "${BLOX_PROCFS_ROOT:-/proc}/uptime" 2>/dev/null; }
+# without it). ROUND 5d: builtin `read` + parameter expansion, no fork (was `awk`).
+_hp_uptime_seconds() {
+	local first _rest
+	read -r first _rest < "${BLOX_PROCFS_ROOT:-/proc}/uptime" 2>/dev/null || return 0
+	printf '%s' "${first%%.*}"
+}
 
 # _hp_field <name> - one field from the ownership record, or empty if absent/unreadable. A tiny shared reader
-# so every gate below (note/finalize/restore) parses the same five-line key=value file the same way.
-_hp_field() { [[ -r $HUGEPAGES_FILE ]] && sed -n "s/^$1=//p" "$HUGEPAGES_FILE" 2>/dev/null | tail -n1; }
+# so every gate below (note/finalize/restore) parses the same key=value file the same way. ROUND 5d: builtin
+# `while read` (IFS='=' so "key=value" lines split cleanly, even if value itself is empty), no fork (was
+# `sed`+`tail`) - the LAST matching line wins, same as the sed+tail it replaces, for a key ever written twice.
+_hp_field() {
+	local key=$1 k v val=""
+	[[ -r $HUGEPAGES_FILE ]] || return 0
+	while IFS='=' read -r k v; do
+		[[ $k == "$key" ]] && val=$v
+	done < "$HUGEPAGES_FILE" 2>/dev/null
+	printf '%s' "$val"
+}
 
 # _hp_boot_id - current /proc/sys/kernel/random/boot_id (BLOX_PROCFS_ROOT overridable for tests), or empty if
 # unreadable. Empty never matches a recorded boot (also possibly empty) unless a test deliberately makes both
-# sides empty to exercise that path - see finalize_rx_hugepages's boot-id gate.
-_hp_boot_id() { local f="${BLOX_PROCFS_ROOT:-/proc}/sys/kernel/random/boot_id"; [[ -r $f ]] && cat "$f" 2>/dev/null; }
+# sides empty to exercise that path - see finalize_rx_hugepages's boot-id gate. ROUND 5d: builtin `read`, no
+# fork (was `cat`).
+_hp_boot_id() {
+	local f="${BLOX_PROCFS_ROOT:-/proc}/sys/kernel/random/boot_id" val
+	read -r val < "$f" 2>/dev/null || return 0
+	printf '%s' "$val"
+}
 
 # _hp_free_hugepages - HugePages_Free from /proc/meminfo (BLOX_PROCFS_ROOT overridable for tests). Empty/absent
 # on any read failure - callers treat that exactly like any other missing precondition (never finalize).
-_hp_free_hugepages() { awk '/^HugePages_Free:/{print $2; exit}' "${BLOX_PROCFS_ROOT:-/proc}/meminfo" 2>/dev/null; }
+# ROUND 5d: via _hp_kv_field, no fork (was `awk`).
+_hp_free_hugepages() { _hp_kv_field HugePages_Free "${BLOX_PROCFS_ROOT:-/proc}/meminfo"; }
 
 # _hp_hugepage_size_kb - Hugepagesize (kB) from /proc/meminfo (BLOX_PROCFS_ROOT overridable for tests). Round
 # 5b: this is what /proc/sys/vm/nr_hugepages AND /proc/<pid>/smaps_rollup's Hugetlb fields are both denominated
 # in - never hardcoded to 2048, even though that is every observed rig's actual value, since nothing forces it.
-_hp_hugepage_size_kb() { awk '/^Hugepagesize:/{print $2; exit}' "${BLOX_PROCFS_ROOT:-/proc}/meminfo" 2>/dev/null; }
+# ROUND 5d: via _hp_kv_field, no fork (was `awk`).
+_hp_hugepage_size_kb() { _hp_kv_field Hugepagesize "${BLOX_PROCFS_ROOT:-/proc}/meminfo"; }
 
 # _hp_xmrig_need_pages <owner pid> - KERNEL TRUTH of how many huge pages that ownership-verified xmrig process
 # actually has mapped right now (Private_Hugetlb + Shared_Hugetlb from ITS OWN /proc/<pid>/smaps_rollup, never
@@ -266,11 +303,17 @@ _hp_hugepage_size_kb() { awk '/^Hugepagesize:/{print $2; exit}' "${BLOX_PROCFS_R
 # kernel what is ACTUALLY mapped, not what XMRig's own (incomplete) accounting claims - it cannot miss this or
 # any other future untracked allocation the same way. The xmrig HTTP API's hugepages field is kept ONLY as a
 # readiness signal (allocated==total, in finalize_rx_hugepages) - never again as the source of the "need" value.
+# ROUND 5d: via _hp_kv_field (builtin `read`, no EXTERNAL process forked - was two `awk` calls, each its own
+# exec'd process). The `$(...)` around each call still forks a plain bash subshell to capture its output, but
+# that subshell is never exec'd into anything else and always inherits THIS process's pgid - always reachable
+# by finalize_rx_hugepages_bounded's group-kill, unlike a separately exec'd `awk` would be. The one place this
+# reads a /proc file a test can make deliberately slow (a FIFO) now blocks on a builtin `read` inside that
+# subshell, never inside a further, harder-to-reach exec'd grandchild.
 _hp_xmrig_need_pages() {
 	local f="${BLOX_PROCFS_ROOT:-/proc}/$1/smaps_rollup" priv shared hpkb
 	[[ -r $f ]] || return 0
-	priv=$(awk '/^Private_Hugetlb:/{print $2; exit}' "$f" 2>/dev/null)
-	shared=$(awk '/^Shared_Hugetlb:/{print $2; exit}' "$f" 2>/dev/null)
+	priv=$(_hp_kv_field Private_Hugetlb "$f")
+	shared=$(_hp_kv_field Shared_Hugetlb "$f")
 	[[ $priv =~ ^[0-9]+$ && $shared =~ ^[0-9]+$ ]] || return 0
 	hpkb=$(_hp_hugepage_size_kb)
 	[[ $hpkb =~ ^[0-9]+$ && $hpkb -gt 0 ]] || return 0
@@ -466,44 +509,88 @@ finalize_rx_hugepages() {
 	_hp_rewrite 1 "$cur"   # everything XMRig itself raised, positively confirmed via its own kernel-mapped huge pages, nothing foreign involved
 }
 
+# _hp_bounded_still_running <cpid> <verified pgid, or empty> - true if anything remains: the WHOLE verified
+# group (pgrep -g), or else just <cpid> alone when no group was ever confirmed. Shared by
+# finalize_rx_hugepages_bounded's own timeout/escalation logic below.
+_hp_bounded_still_running() { if [[ -n ${2:-} ]]; then pgrep -g "$2" > /dev/null 2>&1; else kill -0 "$1" 2>/dev/null; fi; }
+
+# _hp_bounded_escalate <signal> <cpid> <verified pgid, or empty> - signals the WHOLE verified group when one
+# was confirmed (reaching every descendant: curl, find, and any subshell finalize_rx_hugepages forks - see
+# finalize_rx_hugepages_bounded), else just <cpid> alone - NEVER a guessed/unconfirmed group, and never the
+# caller's own group (finalize_rx_hugepages_bounded only ever passes a pgid that already failed unless it
+# differs from the caller's own).
+_hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/null; else kill -"$1" "$2" 2>/dev/null; fi; }
+
 # finalize_rx_hugepages_bounded <deadline seconds> - the ONLY way the top-level h-stats.sh ever calls
 # finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no deadline of its own - it runs
 # AFTER the rx engine's own h-stats.sh, which already spends up to its own ~2.4-2.7 s budget under load, so
 # without a bound here finalize's own work (a /proc/net/tcp scan, a curl call, a /proc/<pid>/smaps_rollup read)
-# could push the WHOLE poll past whatever deadline Hive's watchdog enforces - the exact risk this package's own
-# `have_budget`/`remaining` convention (engines/rx/h-stats.sh) exists to prevent everywhere else. <deadline> is
-# the seconds LEFT in this poll's overall budget once the engine's own collection has already run (computed by
-# h-stats.sh itself, which is the only place that knows how much of the shared budget is already spent).
+# could push the WHOLE poll past whatever deadline Hive's watchdog enforces. <deadline> is the seconds LEFT in
+# this poll's overall budget once the engine's own collection has already run (computed by h-stats.sh itself,
+# the only place that knows how much of the shared budget is already spent).
+# ROUND 5d (Codex): Round 5c's own `kill -TERM "$cpid"` only ever signalled the TOP-LEVEL backgrounded job, not
+# any of ITS OWN descendants (a subshell from a `$(...)` command substitution, curl, find, ...) - a genuinely
+# hung step (proven live by this file's own FIFO test) left an ORPHANED grandchild behind every time, and
+# repeated timeouts could accumulate them indefinitely. Fixed with a VERIFIED process group instead of a bare
+# pid: `set -m` (monitor mode) makes bash itself put the VERY NEXT backgrounded job into its OWN NEW process
+# group (pgid == that job's own pid) as part of the SAME fork() bash performs to launch it - synchronous with
+# the fork, not something the child has to arrange for itself moments later (unlike `setsid`, which needs a
+# fresh exec'd command and would lose every shell function/variable finalize_rx_hugepages needs, forcing an
+# export -f/export of all of them - engines/rx/h-stats.sh's own collector uses `setsid bash -c '...'` for
+# exactly that reason, since it never needs to call back into shell functions). Every later fork this job makes
+# (a curl process, a find process, a subshell for a `$(...)` capturing _hp_xmrig_need_pages's own output)
+# inherits that SAME pgid, so ONE signal to the group (`kill -- -$pgid`) reaches all of them, including a
+# blocked-forever read/open on a hung /proc/<pid>/smaps_rollup (this file's own FIFO test proves the WHOLE group
+# is gone afterward, not just the top-level job). The pgid is VERIFIED before ever being used to signal anything
+# - it must equal the job's own pid (confirms `set -m` really isolated it) and differ from THIS shell's own pgid
+# (never signal the caller's own group); anything else falls back to signalling the bare pid alone, exactly
+# like Round 5c did, never a guessed group. `set -m` is restored to whatever it was before this call, never
+# left on beyond it, and is toggled only around the exact statement that launches the job.
 # On a timeout: this poll simply defers finalization to a later one - $khs/$stats were already set by the
 # engine's own h-stats.sh BEFORE this ever runs, so they are completely unaffected either way, and a killed
 # attempt writes nothing at all (_hp_rewrite's tmp+mv is all-or-nothing: there is no partial record to leave
-# behind beyond a stray .tmp.$$ file, cleaned up best-effort on the NEXT call).
-# Backgrounding the FUNCTION CALL directly - never a `bash -c`/`setsid` re-exec into a fresh interpreter - is
-# what keeps this both simple and correct: a backgrounded job is a plain fork of THIS shell, so it sees every
-# variable ($khs, the engine's own exported PORT/PROC/PKG, HUGEPAGES_FILE, ...) and every function
-# (_hp_xmrig_need_pages, _hp_rewrite, log_hugepages_note, ...) it needs with no export/re-sourcing required.
-# The owner-pid lookup inside finalize_rx_hugepages is already the SAME O(1)-fork `find` pattern engines/rx/
-# h-stats.sh's own (load-tested, tests/hive/test_rx_under_load.sh) ownership scan uses, never a per-item loop -
-# this wrapper is what bounds that lookup's (and everything else's) TOTAL wall-clock, on top of that.
+# behind beyond a stray .tmp.$$ file, cleaned up best-effort on the NEXT call) - proven by this file's own test:
+# the record is BYTE-IDENTICAL after a killed attempt even once the hung read is later unblocked.
+# Backgrounding the FUNCTION CALL directly - never a `bash -c` re-exec into a fresh interpreter - is what keeps
+# this both simple and correct: a backgrounded job is a plain fork of THIS shell, so it sees every variable
+# ($khs, the engine's own exported PORT/PROC/PKG, HUGEPAGES_FILE, ...) and every function (_hp_xmrig_need_pages,
+# _hp_rewrite, log_hugepages_note, ...) it needs with no export/re-sourcing required.
+# ROUND 5d also minimises external children in finalize_rx_hugepages's own read path (_hp_field, _hp_boot_id,
+# _hp_free_hugepages, _hp_hugepage_size_kb, _hp_uptime_seconds, _hp_xmrig_need_pages all now use bash's own
+# builtin `read`/parameter expansion instead of forking sed/cat/awk per call) - less to ever leave orphaned in
+# the first place, on top of the group-kill above, not instead of it. The owner-pid lookup's own `find` call is
+# already the SAME O(1)-fork pattern engines/rx/h-stats.sh's own (load-tested) ownership scan uses, never a
+# per-item loop - left as is (replacing it would reintroduce exactly the per-item-fork class of bug this
+# codebase already fixed once); the group-kill above is what bounds it, and everything else, on top of that.
 finalize_rx_hugepages_bounded() {
 	local deadline=$1
 	awk -v r="$deadline" 'BEGIN{exit !(r>0.05)}' || return 0   # not worth even trying this poll - defer
 	rm -f "$HUGEPAGES_FILE".tmp.* 2>/dev/null   # best-effort: a leftover temp file from an earlier killed attempt
 
+	local parent_pgid cpid pgid apid had_monitor=0
+	case $- in *m*) had_monitor=1 ;; esac
+	parent_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+
+	set -m
 	finalize_rx_hugepages > /dev/null 2>&1 &
-	local cpid=$!
+	cpid=$!
+	(( had_monitor )) || set +m
+
+	pgid=$(ps -o pgid= -p "$cpid" 2>/dev/null | tr -d '[:space:]')
+	[[ $pgid =~ ^[0-9]+$ && $pgid == "$cpid" && $pgid != "$parent_pgid" && $pgid -gt 1 ]] || pgid=""
+
 	{ sleep "$deadline"; } > /dev/null 2>&1 &
-	local apid=$!
+	apid=$!
 	wait -n "$cpid" "$apid" 2>/dev/null
-	if kill -0 "$cpid" 2>/dev/null; then
-		kill -TERM "$cpid" 2>/dev/null
+	if _hp_bounded_still_running "$cpid" "$pgid"; then
+		_hp_bounded_escalate TERM "$cpid" "$pgid"
 		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
 		sleep 0.05
-		kill -0 "$cpid" 2>/dev/null && kill -KILL "$cpid" 2>/dev/null
+		_hp_bounded_still_running "$cpid" "$pgid" && _hp_bounded_escalate KILL "$cpid" "$pgid"
+		wait "$cpid" 2>/dev/null
 	else
 		kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
 	fi
-	wait "$cpid" 2>/dev/null
 	true
 }
 
