@@ -521,13 +521,16 @@ _hp_bounded_still_running() { if [[ -n ${2:-} ]]; then pgrep -g "$2" > /dev/null
 # differs from the caller's own).
 _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/null; else kill -"$1" "$2" 2>/dev/null; fi; }
 
-# finalize_rx_hugepages_bounded <deadline seconds> - the ONLY way the top-level h-stats.sh ever calls
-# finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no deadline of its own - it runs
-# AFTER the rx engine's own h-stats.sh, which already spends up to its own ~2.4-2.7 s budget under load, so
-# without a bound here finalize's own work (a /proc/net/tcp scan, a curl call, a /proc/<pid>/smaps_rollup read)
-# could push the WHOLE poll past whatever deadline Hive's watchdog enforces. <deadline> is the seconds LEFT in
-# this poll's overall budget once the engine's own collection has already run (computed by h-stats.sh itself,
-# the only place that knows how much of the shared budget is already spent).
+# finalize_rx_hugepages_bounded <absolute deadline, EPOCHREALTIME-style seconds.fraction> - the ONLY way the
+# top-level h-stats.sh ever calls finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no
+# deadline of its own - it runs AFTER the rx engine's own h-stats.sh, which already spends up to its own
+# ~2.4-2.7 s budget under load, so without a bound here finalize's own work (a /proc/net/tcp scan, a curl call,
+# a /proc/<pid>/smaps_rollup read) could push the WHOLE poll past whatever deadline Hive's watchdog enforces.
+# <deadline> is an ABSOLUTE point in time (h-stats.sh's own start time + its total poll budget, computed ONCE
+# at h-stats.sh's own entry - see there) - ROUND 5e (Codex) changed this from a "seconds remaining" SNAPSHOT to
+# an absolute deadline specifically because a snapshot goes stale the moment ANY time passes after it was
+# computed (Round 5c's own bug, below); an absolute deadline never does - "how long is left" is always
+# `deadline - now`, recomputed fresh at the moment it is actually needed, never reused from an earlier instant.
 # ROUND 5d (Codex): Round 5c's own `kill -TERM "$cpid"` only ever signalled the TOP-LEVEL backgrounded job, not
 # any of ITS OWN descendants (a subshell from a `$(...)` command substitution, curl, find, ...) - a genuinely
 # hung step (proven live by this file's own FIFO test) left an ORPHANED grandchild behind every time, and
@@ -562,12 +565,34 @@ _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/nul
 # already the SAME O(1)-fork pattern engines/rx/h-stats.sh's own (load-tested) ownership scan uses, never a
 # per-item loop - left as is (replacing it would reintroduce exactly the per-item-fork class of bug this
 # codebase already fixed once); the group-kill above is what bounds it, and everything else, on top of that.
+#
+# ROUND 5e (Codex) - Round 5d's OWN escalation still overran the deadline: the alarm slept for the FULL
+# "remaining" value it was handed, THEN, only once that already elapsed, sent TERM, waited another fixed 0.05 s
+# grace, then possibly KILL and a reap - none of that follow-up time was ever subtracted from anything, so the
+# true worst-case wall time was "remaining + 0.05 s + signal/reap overhead", not "remaining". Worse, by the
+# time the alarm actually started (after backgrounding the job and deriving/verifying its pgid via `ps`, both
+# real elapsed time), "remaining" itself was already stale - using it as-is for the alarm double-counts that
+# setup time on top. Fixed by working against the ABSOLUTE deadline throughout, and by reserving cleanup time
+# BEFORE ever computing an alarm duration, recomputed fresh (fresh `now`) at the LAST possible moment - right
+# before the alarm actually starts, after all setup work is already done - rather than once, early, and reused:
+# `alarm = deadline - now - RESERVE_S`, where RESERVE_S (0.15 s: the 0.05 s TERM grace plus signal-delivery/
+# reap overhead) is subtracted from the budget the alarm itself sleeps for, not added on top of it afterward.
+# If that leaves less than 0.05 s to even try, this defers to a later poll without doing any of the setup work
+# at all (cheap - one arithmetic check, no fork, no backgrounding). `EPOCHREALTIME` (bash 5's own builtin
+# high-resolution clock, no fork) is used for "now" wherever available, falling back to `date +%s.%N` only if
+# it is unset (an older bash) - consistent with minimising external children, on top of bounding the deadline
+# correctly.
 finalize_rx_hugepages_bounded() {
-	local deadline=$1
-	awk -v r="$deadline" 'BEGIN{exit !(r>0.05)}' || return 0   # not worth even trying this poll - defer
+	local abs_deadline=$1 reserve=0.15   # RESERVE_S: 0.05 s TERM grace + signal-delivery/KILL/reap overhead -
+		# reserved from the deadline BEFORE any alarm duration is ever computed, never added on afterward.
+	local now alarm parent_pgid cpid pgid apid had_monitor=0
+
+	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
+	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
+	awk -v a="$alarm" 'BEGIN{exit !(a>0.05)}' || return 0   # not enough of the budget left to even attempt this poll
+
 	rm -f "$HUGEPAGES_FILE".tmp.* 2>/dev/null   # best-effort: a leftover temp file from an earlier killed attempt
 
-	local parent_pgid cpid pgid apid had_monitor=0
 	case $- in *m*) had_monitor=1 ;; esac
 	parent_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
 
@@ -579,7 +604,12 @@ finalize_rx_hugepages_bounded() {
 	pgid=$(ps -o pgid= -p "$cpid" 2>/dev/null | tr -d '[:space:]')
 	[[ $pgid =~ ^[0-9]+$ && $pgid == "$cpid" && $pgid != "$parent_pgid" && $pgid -gt 1 ]] || pgid=""
 
-	{ sleep "$deadline"; } > /dev/null 2>&1 &
+	# Recompute the alarm duration ONE LAST TIME, right here, right before it actually starts: backgrounding
+	# the job and deriving/verifying its pgid above (a real `ps` fork) already consumed some of the budget -
+	# reusing the value computed at function entry would double-count that time on top of the reserve.
+	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
+	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
+	{ sleep "$alarm"; } > /dev/null 2>&1 &
 	apid=$!
 	wait -n "$cpid" "$apid" 2>/dev/null
 	if _hp_bounded_still_running "$cpid" "$pgid"; then

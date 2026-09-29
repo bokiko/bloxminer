@@ -34,6 +34,14 @@ HUGEFILE="$T/state/.bloxminer-hugepages"
 LOGFILE="$T/log/bloxminer.log"
 PORT=4069
 OWNER_PID=9101   # the ownership-verified xmrig pid throughout (bound to $PORT, exe == $BLOX_DIR/xmrig)
+# Round 5e: the hung-FIFO cases below use a SHORTENED test budget (not the real 3.0 s default) so the suite
+# doesn't have to wait out a real poll's worth of time to prove the bound - TEST_HP_BUDGET_S is that shortened
+# budget, and SCHED_TOLERANCE_S is an explicit, STATED allowance on top of it for real scheduling/signal-
+# delivery/reap latency (process wake-up jitter under load, `ps`/`kill`/`wait` syscall overhead) - never a
+# vague/generous margin: MAX_ELAPSED_S is the one number every timing assertion below is held to.
+TEST_HP_BUDGET_S=1.5
+SCHED_TOLERANCE_S=0.15
+MAX_ELAPSED_S=$(awk -v b="$TEST_HP_BUDGET_S" -v t="$SCHED_TOLERANCE_S" 'BEGIN{printf "%.2f", b+t}')
 
 setup_pkg() {
 	rm -rf "$BLOX_DIR" "$T/log" "$T/state"; mkdir -p "$BLOX_DIR" "$T/log" "$T/state"
@@ -539,12 +547,12 @@ mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PRO
 mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-RRR\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500000
 t0=$(date +%s.%N)
-BLOX_HP_TOTAL_BUDGET_S=1.5 poll
+BLOX_HP_TOTAL_BUDGET_S=$TEST_HP_BUDGET_S poll
 t1=$(date +%s.%N)
 stop_api
 elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
 poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
-if awk -v e="$elapsed" 'BEGIN{exit !(e < 2.5)}'; then ok "slow smaps_rollup (FIFO, never written): whole poll still bounded (${elapsed}s)"; else bad "slow smaps_rollup: whole poll still bounded" "elapsed=${elapsed}s"; fi
+if awk -v e="$elapsed" -v m="$MAX_ELAPSED_S" 'BEGIN{exit !(e < m)}'; then ok "slow smaps_rollup (FIFO, never written): whole poll still bounded to budget+tolerance (${elapsed}s < ${MAX_ELAPSED_S}s = ${TEST_HP_BUDGET_S}s budget + ${SCHED_TOLERANCE_S}s tolerance)"; else bad "slow smaps_rollup: whole poll still bounded to budget+tolerance" "elapsed=${elapsed}s max=${MAX_ELAPSED_S}s"; fi
 if [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; then ok "slow smaps_rollup: \$khs/\$stats still valid despite the hung finalization attempt"; else bad "slow smaps_rollup: khs/stats still valid" "$out"; fi
 if [[ $(hp_field final) == 0 ]]; then ok "slow smaps_rollup: finalization deferred (final stays 0), never a partial/wrong record"; else bad "slow smaps_rollup: finalization deferred" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
 if fifo_has_no_reader_left "$PROC/$OWNER_PID/smaps_rollup"; then ok "slow smaps_rollup: the GROUP-kill reached the blocked read too - no orphaned descendant left waiting on the FIFO"; else bad "slow smaps_rollup: no orphaned descendant left" "a reader is still blocked on the FIFO"; fi
@@ -564,10 +572,10 @@ for _ in 1 2 3 4 5; do
 	mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PROC/$OWNER_PID/smaps_rollup"
 	before_record=$(cat "$HUGEFILE" 2>/dev/null)
 	t0=$(date +%s.%N)
-	BLOX_HP_TOTAL_BUDGET_S=1.5 poll
+	BLOX_HP_TOTAL_BUDGET_S=$TEST_HP_BUDGET_S poll
 	t1=$(date +%s.%N)
 	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-	awk -v e="$elapsed" 'BEGIN{exit !(e < 2.5)}' || n_over=$((n_over+1))
+	awk -v e="$elapsed" -v m="$MAX_ELAPSED_S" 'BEGIN{exit !(e < m)}' || n_over=$((n_over+1))
 	poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
 	{ [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; } || n_zero_khs=$((n_zero_khs+1))
 	[[ $(hp_field final) == 0 ]] || n_wrong_final=$((n_wrong_final+1))
@@ -577,7 +585,7 @@ for _ in 1 2 3 4 5; do
 	rm -f "$PROC/$OWNER_PID/smaps_rollup"
 done
 stop_api
-if [[ $n_over == 0 ]]; then ok "repeated timeouts (5 polls, fresh hung FIFO each time): every poll stayed within budget"; else bad "repeated timeouts: every poll within budget" "n_over=$n_over of 5"; fi
+if [[ $n_over == 0 ]]; then ok "repeated timeouts (5 polls, fresh hung FIFO each time): every poll stayed within budget+tolerance (< ${MAX_ELAPSED_S}s)"; else bad "repeated timeouts: every poll within budget+tolerance" "n_over=$n_over of 5 (max ${MAX_ELAPSED_S}s)"; fi
 if [[ $n_zero_khs == 0 ]]; then ok "repeated timeouts: \$khs stayed valid every single time"; else bad "repeated timeouts: khs stayed valid" "n_zero_khs=$n_zero_khs of 5"; fi
 if [[ $n_wrong_final == 0 ]]; then ok "repeated timeouts: final stayed 0 every single time (never a partial finalize)"; else bad "repeated timeouts: final stayed 0" "n_wrong_final=$n_wrong_final of 5"; fi
 if [[ $n_record_changed == 0 ]]; then ok "repeated timeouts: record byte-identical after every killed attempt - no late write, even once the FIFO is later unblocked"; else bad "repeated timeouts: record byte-identical after every killed attempt" "n_record_changed=$n_record_changed of 5"; fi
