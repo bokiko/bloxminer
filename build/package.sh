@@ -75,14 +75,19 @@ BloxMiner $VER - corresponding source (GPL-3.0)
 BloxMiner $VER mines both VerusHash (Verus engine) and RandomX (RandomX engine); the flight-sheet algorithm
 picks which one runs (see README.md). BOTH engines are rebuilt for this release, from their own previously
 gated sources (2.1.0 / X 1.0.0) plus one small, precisely scoped change each - not "byte-identical" claims but
-verified, narrower ones: the Verus engine's own AC_INIT release number moves 2.1.0 -> 3.0.0 (every hashing
-function - verus/haraka/clhash/scanhash - is instruction-identical to the 2.1.0 binary; only the version string
-differs; libomp.so.5 is untouched); the RandomX engine gets one extra display-only patch, build/branding.patch,
-on top of build/donate0.patch (two cosmetic log lines only - XMRig's own APP_VERSION/user-agent/API version stay
-"6.26.0" for pool/API compatibility; every object outside the touched source files is byte-identical). Full
-proof output (hashing-identity tool, per-object binary diff, xmrig --bench=1M) is in this release's own
-C6-BRANDING.md, kept with the repo. Both binaries are verified against their own recorded provenance below
-before packaging.
+verified, narrower ones: the Verus engine's own configure.ac AC_INIT release number moves 2.1.0 -> 3.0.0 - that
+one line is the entire SOURCE diff versus the 2.1.0 patch - and every hashing function in the resulting BINARY
+(verus/haraka/clhash/scanhash) is proven instruction-identical to the 2.1.0 binary (tools/hashing-identity.sh,
+15/15); libomp.so.5 is untouched (same sha256 as 2.1.0's). The RandomX engine gets one extra display-only
+patch, build/branding.patch, on top of build/donate0.patch (two cosmetic log lines, touching two source files
+plus one new header - XMRig's own APP_VERSION/user-agent/API version stay "6.26.0" for pool/API compatibility).
+Rebuilding the pre-branding (donate0.patch-only) tree with the exact same recipe/toolchain used for the shipped
+binary reproduces BloxMiner-X 1.0.0's own released xmrig binary bit-for-bit (sha256 721aa3fc9a7a...); a
+per-object comparison of that reproduction against the shipped binary shows 208 of 210 .o files byte-identical
+- only the two touched source files' own objects differ - and xmrig --bench=1M gives the identical result hash
+on both binaries. Full proof output, with the exact binaries compared, is in this release's own C6-BRANDING.md
+and docs/3.0.0-engine-identity.md, kept with the repo. Both binaries are verified against their own recorded
+provenance below before packaging.
 
 Verus engine (bloxminer binary): monkins1010/ccminer at commit $(p_verus upstream_commit)
 with build/bloxminer.patch applied (version bump 2.1.0 -> 3.0.0 only vs the 2.1.0 patch; see git history):

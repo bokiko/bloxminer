@@ -86,15 +86,21 @@ restarting the miner:
 
 The two engines' own mining code is otherwise **unchanged** from their previously gated selves — BloxMiner
 2.1.0's ccminer engine and BloxMiner-X 1.0.0's XMRig engine. BloxMiner 3.0.0 rebuilds both, each with one small,
-precisely scoped, proven change: the Verus engine's own release number (`AC_INIT`) moves 2.1.0 → 3.0.0 (every
-hashing function is instruction-identical to the 2.1.0 binary — proven with `tools/hashing-identity.sh`; only
-the version string differs); the RandomX engine gets one extra *display-only* patch, `build/branding.patch`, on
-top of `build/donate0.patch` — it adds two cosmetic log lines (a startup summary line and a periodic hashrate
-prefix) and touches nothing else; XMRig's own `APP_VERSION`/user-agent/API version stay exactly `6.26.0` for
-pool/API compatibility, and every object file outside the touched source files is byte-identical (proven by a
-per-object binary diff). See [Building](#building) and this release's own `C6-BRANDING.md` for the full proof
-output. Only the parts that genuinely have to be shared (the package directory, the log file base, the engine
-picker itself) are new. That means:
+precisely scoped, proven change: the Verus engine's own `configure.ac` release number (`AC_INIT`) moves 2.1.0 →
+3.0.0 — that one line is the *entire* source diff versus the 2.1.0 patch — and every hashing function in the
+resulting binary is proven instruction-identical to the 2.1.0 binary (`tools/hashing-identity.sh`, 15/15); the
+RandomX engine gets one extra *display-only* patch, `build/branding.patch`, on top of `build/donate0.patch` —
+it adds two cosmetic log lines (a startup summary line and a periodic hashrate prefix) touching two source
+files (plus one new header) and nothing else; XMRig's own `APP_VERSION`/user-agent/API version stay exactly
+`6.26.0` for pool/API compatibility. Identity proof for the RandomX engine: rebuilding the pre-branding
+(`donate0.patch`-only) source tree with the exact same recipe/toolchain used for the shipped binary reproduces
+BloxMiner-X 1.0.0's own released xmrig binary **bit-for-bit** (sha256 `721aa3fc9a7a…`); comparing that
+reproduction against the shipped, branded binary (`44cff475d581…`) object file by object file shows 208 of 210
+`.o` files byte-identical — the only two that differ are the two touched source files' own objects, and
+`xmrig --bench=1M` produces the identical result hash on both binaries. See [Building](#building), this
+release's own `C6-BRANDING.md`, and `docs/3.0.0-engine-identity.md` for the full proof output including exact
+binaries compared. Only the parts that genuinely have to be shared (the package directory, the log file base,
+the engine picker itself) are new. That means:
 
 - **Pass means something different per engine** (unchanged from each engine's own 1.x/2.x behaviour): on the
   Verus engine, Pass is a **thread count** (`1`–`128`, or empty for every CPU); on the RandomX engine, Pass is
