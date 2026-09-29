@@ -526,7 +526,18 @@ Mean: bx 15 873.20 H/s vs stock 15 856.37 H/s — **+0.11 %** overall (cask10 �
 the slot-to-slot noise.
 
 *RandomX live sanity on the 3.0.0 package* (same cask18 ABBA method, to confirm the shipped package itself,
-beyond the object-identity proof above): <!-- RX ABBA 3.0.0: to be filled -->
+beyond the object-identity proof above):
+
+| Slot (10 min, cask18 5950X) | Package | Hive hashrate | Shares (acc/rej) |
+|---|---|---|---|
+| 1 | previous 3.0.0 candidate (unlabelled engine) | 15.58 kH/s | 51 / 0 |
+| 2 | **3.0.0** (labelled engine) | **15.54 kH/s** | 56 / 0 |
+| 3 | **3.0.0** (labelled engine) | **15.53 kH/s** | 56 / 0 |
+| 4 | previous 3.0.0 candidate (unlabelled engine) | 15.55 kH/s | 54 / 0 |
+
+Averages 15.565 vs 15.535 kH/s (−0.19 %). HiveOS reports this value with two decimals (0.01 kH/s ≈ 0.06 % here), so
+the difference is at the resolution limit and within the slot-to-slot noise; zero false-zero readings in all four
+slots.
 
 Full method, diagnosis and all runs: [BENCHMARKS.md](BENCHMARKS.md).
 

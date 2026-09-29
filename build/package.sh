@@ -3,7 +3,7 @@
 # plus the GPL "Corresponding Source" bundle bloxminer-<version>-src.tar.gz. BloxMiner 3.0.0 REBUILDS both
 # engines (Verus: AC_INIT version bump only; RandomX: a second, display-only patch on top of donate0.patch) -
 # this script consumes their freshly built outdirs directly and checks every binary's sha256 against that
-# build's OWN recorded provenance (see README/SOURCE.md and C6-BRANDING.md for the hashing/object-identity
+# build's OWN recorded provenance (see README/SOURCE.md and docs/3.0.0-engine-identity.md for the hashing/object-identity
 # proofs that neither engine's actual mining code changed).
 # Usage: build/package.sh <verus-build-outdir> <rx-build-outdir> [outdir]
 #   <verus-build-outdir>  output of build/build.sh   (bloxminer-O3, bloxminer-O3.provenance, libomp.so.5)
@@ -85,8 +85,8 @@ Rebuilding the pre-branding (donate0.patch-only) tree with the exact same recipe
 binary reproduces BloxMiner-X 1.0.0's own released xmrig binary bit-for-bit (sha256 721aa3fc9a7a...); a
 per-object comparison of that reproduction against the shipped binary shows 208 of 210 .o files byte-identical
 - only the two touched source files' own objects differ - and xmrig --bench=1M gives the identical result hash
-on both binaries. Full proof output, with the exact binaries compared, is in this release's own C6-BRANDING.md
-and docs/3.0.0-engine-identity.md, kept with the repo. Both binaries are verified against their own recorded
+on both binaries. Full proof output, with the exact binaries compared, is in docs/3.0.0-engine-identity.md
+in the bloxminer repository. Both binaries are verified against their own recorded
 provenance below before packaging.
 
 Verus engine (bloxminer binary): monkins1010/ccminer at commit $(p_verus upstream_commit)
