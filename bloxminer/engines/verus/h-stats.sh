@@ -53,9 +53,13 @@ now_us() {   # sets $REPLY = now, integer microseconds since epoch
 	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
 	REPLY="${t%%.*}${t#*.}"
 }
-remaining_us() {   # sets $REPLY = microseconds left of $BUDGET_US since $t0_us, floored at 0
+remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEADLINE_US, floored at 0 -
+	# DEADLINE_US is computed exactly once, by the PARENT, before the child is even launched (process
+	# setup/exec time counts against the budget, not just the child's own post-launch work), and passed
+	# through launch/collection/enrichment/cleanup as a single shared value - never re-derived from a fresh
+	# "now" partway through, which would silently grant extra time on top of what was already spent.
 	local n; now_us; n=$REPLY
-	REPLY=$(( BUDGET_US - (n - t0_us) ))
+	REPLY=$(( DEADLINE_US - n ))
 	(( REPLY < 0 )) && REPLY=0
 }
 have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
@@ -137,6 +141,9 @@ run() {
 		 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
 	write_result "$khs" "$stats"
 	(( stall == 1 )) && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
+	local khs_a=$khs   # Phase A's own total, kept aside - Phase B may add detail rows but may only ever
+		# REPLACE this with its own total when that total is complete AND consistent with it (never a
+		# validly-formatted-but-zero cores reply quietly outvoting a positive, fresher summary rate)
 
 	# ---- Phase B (optional): per-core breakdown, whatever budget remains. Only ever OVERWRITES Phase A's
 	# answer with a richer one built from data collected THIS SAME poll - never a substitute for it.
@@ -192,7 +199,16 @@ run() {
 	fi
 	(( ok )) || return 0   # Phase B did not validate - Phase A's answer (already written) stands, unchanged
 
-	khs=$(printf '%s\n' "${hs[@]}" | awk '{s+=$1} END{printf "%.2f", s}')
+	local khs_b; khs_b=$(printf '%s\n' "${hs[@]}" | awk '{s+=$1} END{printf "%.2f", s}')
+	# consistent := not (Phase B's total is 0 while Phase A's, from the SAME poll, was positive) - a complete,
+	# validly-formatted cores reply summing to exactly 0 right after summary reported a positive FRESHKHS is
+	# the false-zero this review caught, not a fresher answer, so Phase A's total stands; the per-core rows are
+	# still shown (they are structurally valid), just not trusted to override the top-level rate.
+	if awk -v b="$khs_b" -v a="$khs_a" 'BEGIN{ exit !(b+0 == 0 && a+0 > 0) }'; then
+		khs=$khs_a
+	else
+		khs=$khs_b
+	fi
 	n=${#hs[@]}
 	stats=$(jq -nc \
 		--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
@@ -210,9 +226,13 @@ LIBEOF
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"
 
-CHILD_BUDGET=2.4   # of the shared 3.0 s deadline - fractional seconds, for the outer `sleep` alarm below
-BUDGET_US=2400000  # the SAME value, integer microseconds, for the in-child forkless budget arithmetic (run())
+BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for the forkless budget arithmetic
+                    # both this parent and the child (run(), via remaining_us) derive every timer from
 KILL_GRACE=0.3
+# ONE absolute deadline, computed HERE, before the child is even launched - process setup (setsid, exec, LIB
+# sourcing) counts against the budget, not just the child's own post-launch work, and the parent's own alarm
+# below derives its sleep from the SAME value, not a second, independently-drifting 2.4 s timer of its own.
+now_us; DEADLINE_US=$(( REPLY + BUDGET_US ))
 
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at least once after Phase A and
 # again after Phase B if that also completes - never captured from the child's stdout (collect()/a single
@@ -224,12 +244,10 @@ export OUTFILE
 
 if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
-	BUDGET_US="$BUDGET_US" setsid bash -c '
+	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
 		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
-		t=${EPOCHREALTIME:-}; [[ -n $t ]] || t=$(date +%s.%N)
-		t0_us="${t%%.*}${t#*.}"
 		run
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>&1 &
 	CPID=$!
@@ -251,7 +269,10 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
 	}
 
-	{ sleep "$CHILD_BUDGET"; } > /dev/null 2>&1 & ALARM=$!
+	# Sleep duration is whatever remains of the SAME $DEADLINE_US right now, not a fresh $BUDGET_US - the
+	# setsid+exec above already spent some of the shared budget, and this alarm must not hand it back.
+	remaining_us; us_to_secstr "$REPLY"; ALARM_SLEEP=$REPLY
+	{ sleep "$ALARM_SLEEP"; } > /dev/null 2>&1 & ALARM=$!
 	wait -n "$CPID" "$ALARM" 2>/dev/null
 	if still_running; then
 		escalate TERM

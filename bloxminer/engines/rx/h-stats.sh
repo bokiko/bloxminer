@@ -106,9 +106,13 @@ now_us() {   # sets $REPLY = now, integer microseconds since epoch
 	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
 	REPLY="${t%%.*}${t#*.}"
 }
-remaining_us() {   # sets $REPLY = microseconds left of $BUDGET_US since $t0_us, floored at 0
+remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEADLINE_US, floored at 0 -
+	# DEADLINE_US is computed exactly once, by the PARENT, before the child is even launched (process
+	# setup/exec time counts against the budget, not just the child's own post-launch work), and passed
+	# through launch/collection/enrichment/cleanup as a single shared value - never re-derived from a fresh
+	# "now" partway through, which would silently grant extra time on top of what was already spent.
 	local n; now_us; n=$REPLY
-	REPLY=$(( BUDGET_US - (n - t0_us) ))
+	REPLY=$(( DEADLINE_US - n ))
 	(( REPLY < 0 )) && REPLY=0
 }
 have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
@@ -340,22 +344,39 @@ run() {
 		jq -e -n --argjson t "$task_set" --argjson a "$api_set" '$t == $a' > /dev/null 2>&1 && percore=1
 	fi
 
+	# rate0 is null (never a fabricated 0) for any thread whose own hashrate[0] is missing/invalid - a row
+	# built from such a thread is INCOMPLETE, and its own khs is null too, never a summed-in-a-zero number.
+	# Phase B's total may only ever replace Phase A's khs_fresh when EVERY row is complete (no null anywhere)
+	# AND the two totals agree on hashing-or-not: a complete-but-zero Phase B total contradicting a positive
+	# Phase A total is exactly the false-zero this review caught (null-as-0 rows quietly outvoting a real,
+	# fresh, positive summary rate) - so it is treated as inconsistent, not as a fresher answer.
 	if (( percore )); then
 		note_state ok
 		rows=$(jq -c --argjson s "$sense" '
-			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then 0 else $r end;
+			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then null else $r end;
 			($s.cpus | map({key: (.cpu | tostring), value: {pkg: .pkg, core: .core, temp: .temp}}) | from_entries) as $topo
 			| map(. + {pc: $topo[(.affinity | tostring)], r0: rate0})
 			| group_by([.pc.pkg, .pc.core])
-			| map({khs: ((map(.r0 / 1000) | add) * 100 | round / 100), temp: .[0].pc.temp})' <<< "$threads")
+			| map(
+				(map(.r0)) as $rates
+				| if any($rates[]; . == null) then {khs: null, temp: .[0].pc.temp}
+				  else {khs: ((map(.r0 / 1000) | add) * 100 | round / 100), temp: .[0].pc.temp} end)' <<< "$threads")
 	else
 		note_state unverified
 		rows=$(jq -c --argjson pt "$pkg_temp" '
-			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then 0 else $r end;
-			map({khs: ((rate0 / 1000) * 100 | round / 100), temp: $pt})' <<< "$threads")
+			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite) or $r < 0) then null else $r end;
+			map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)' <<< "$threads")
 	fi
 
-	khs=$(jq -r '[.[].khs] | add // 0' <<< "$rows" | awk '{printf "%.2f", $1}')
+	complete=$(jq -r 'all(.[]; .khs != null)' <<< "$rows")
+	phaseb_total=$(jq -r '[.[].khs] | map(select(. != null)) | add // 0' <<< "$rows" | awk '{printf "%.2f", $1}')
+	consistent=1
+	awk -v pb="$phaseb_total" -v pa="$khs_fresh" 'BEGIN{ exit !(pb+0 == 0 && pa+0 > 0) }' && consistent=0
+	if [[ $complete == true && $consistent == 1 ]]; then
+		khs=$phaseb_total
+	else
+		khs=$khs_fresh
+	fi
 	stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
 		--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
 		--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
@@ -376,11 +397,15 @@ LIBEOF
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"   # the parent also gets fallback()/note_state()/write_result() from here, for the LIB-creation-failure path
 
-CHILD_BUDGET=2.4   # of the shared 3.0 s deadline - fractional seconds, for the outer `sleep` alarm below
-BUDGET_US=2400000  # the SAME value, integer microseconds, for the in-child forkless budget arithmetic (run())
+BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for the forkless budget arithmetic
+                    # both this parent and the child (run(), via remaining_us) derive every timer from
 KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.7 s, leaving 0.3 s of
                     # slack for this wrapper, so the whole run stays under 3.0 s even in the worst case
                     # (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
+# ONE absolute deadline, computed HERE, before the child is even launched - process setup (setsid, exec, LIB
+# sourcing) counts against the budget, not just the child's own post-launch work, and the parent's own alarm
+# below derives its sleep from the SAME value, not a second, independently-drifting 2.4 s timer of its own.
+now_us; DEADLINE_US=$(( REPLY + BUDGET_US ))
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at each phase boundary - never
 # captured from the child's stdout. Never a pipe: a command-substitution pipe only reaches EOF once every
 # process that ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a
@@ -398,12 +423,10 @@ export OUTFILE
 
 if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
-	BUDGET_US="$BUDGET_US" setsid bash -c '
+	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
 		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
-		t=${EPOCHREALTIME:-}; [[ -n $t ]] || t=$(date +%s.%N)
-		t0_us="${t%%.*}${t#*.}"
 		run
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>&1 &
 	CPID=$!
@@ -435,7 +458,10 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# that still holds that pipe's write end open blocks the CALLER waiting on it, even after everything else
 	# has finished - regardless of how carefully it is killed/reaped below. Redirecting away from the start
 	# closes that hole outright, and was needed in practice (an un-redirected alarm reproduced exactly this).
-	{ sleep "$CHILD_BUDGET"; } > /dev/null 2>&1 & ALARM=$!
+	# The sleep duration is whatever remains of the SAME $DEADLINE_US right now, not a fresh $BUDGET_US - the
+	# setsid+exec above already spent some of the shared budget, and this alarm must not hand it back.
+	remaining_us; us_to_secstr "$REPLY"; ALARM_SLEEP=$REPLY
+	{ sleep "$ALARM_SLEEP"; } > /dev/null 2>&1 & ALARM=$!
 	wait -n "$CPID" "$ALARM" 2>/dev/null
 	# Checked by whether ANYTHING remains (in the validated group, or else just $CPID), not just whether
 	# $CPID itself is still alive: $CPID is a plain bash process that dies immediately from a TERM, even when

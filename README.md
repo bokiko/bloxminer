@@ -391,27 +391,24 @@ detected by ccminer: the threads keep hashing the last job, so the rate stays an
 rising; mining resumes by itself when the network returns (unchanged from ccminer and BloxMiner 2.0.0). The
 benchmark numbers below use the miner's averaged summary rate instead.
 
-**RandomX engine collector, under CPU load:** `h-stats.sh` reads XMRig's own API in a 3.0 s-budgeted child process
-(curl, sensors, `/proc` binding checks, JSON assembly). On a rig where the miner saturates every CPU in a small
-cpuset, that collection work can itself occasionally miss its own budget — not because XMRig stopped mining, but
-because the *collector* could not finish in time. Rather than report a hard 0 on every such miss (which repeated
-often enough to trip HiveOS's own zero-hashrate watchdog on a real rig), a poll that misses its deadline answers
-with the last successfully collected sample instead, as long as it is no more than 90 s old *and* it is
-re-confirmed, fresh, to still belong to the exact same running XMRig process (its `/proc` start time, not just its
-pid, which gets reused) — never a value left over from a previous instance after a restart or an engine switch.
-This never masks a genuine problem: a real stall (XMRig itself reporting 0 across every thread) or a dead/unreachable
-miner is detected and reported inside that same 3.0 s budget, well before this fallback would ever apply, and that
-honest 0 becomes the new cached value going forward. See `tests/hive/test_rx_stats_cache.sh` and
-`tests/hive/test_rx_under_load.sh`.
-
-**Verus engine collector, under CPU load:** the same 3.0 s-budgeted, killable-child design applies to the Verus
-engine's own `h-stats.sh`, which previously had no overall time bound at all. It gets the same bounded (90 s)
-last-known-good fallback, gated by a short, cheap liveness re-check of the API instead of the RandomX engine's
-pid/start check (Verus's own API has no independent ownership verification to build on — the fallback's trust
-bar matches that existing design, never a stronger one). Its field parser was also rewritten to use plain shell
-parameter expansion instead of forking `tr`/`grep`/`cut` for every field of every `cores` row — on a many-core
-rig that per-field forking was, on its own, measured to be slow enough under a saturated small cpuset to matter.
-See `tests/hive/test_verus_under_load.sh`.
+**Both engines' collectors, under CPU load:** `h-stats.sh` runs in a killable child bound by ONE absolute
+deadline (a single `DEADLINE_US`, computed once before the child is even launched, threaded through launch,
+collection, enrichment and cleanup — never a fresh relative timer re-armed partway through) that keeps the whole
+poll under 3.0 s even when the miner saturates every CPU in a small cpuset. There is no cache of the hashrate: every
+poll splits into a mandatory Phase A — one cheap, bounded API call that alone yields the rate, accepted/rejected and
+stall/freshness state, validated fresh on THIS poll — written immediately, before anything else is attempted, so a
+kill later in the same poll can never lose it; and an optional Phase B (per-core rows, sensors, topology
+verification) that runs with whatever budget remains and may only ever *replace* Phase A's total with its own when
+Phase B's own data is complete (every row present, none missing/null) and consistent with Phase A (never a
+null-as-zero or a validly-empty reply quietly outvoting a positive, fresher rate) — otherwise Phase A's total stands
+and Phase B contributes detail rows only. If the fresh-rate call itself cannot complete under starvation, the poll
+reports 0, honestly, inside the same budget — never a stale positive left over from an earlier poll or a different
+instance. RandomX's ownership check (the API port belongs to *this* `xmrig`, confirmed via `/proc`) also gates a
+small, cosmetic per-instance cache of the last real *temperature* only, bound by pid+start-time+age (never the
+hashrate). See `tests/hive/test_rx_stats_cache.sh`, `tests/hive/test_rx_under_load.sh` and
+`tests/hive/test_verus_under_load.sh`. The Verus engine's field parser also uses plain shell parameter expansion
+instead of forking `tr`/`grep`/`cut` for every field of every `cores` row — on a many-core rig that per-field
+forking was, on its own, measured to be slow enough under a saturated small cpuset to matter.
 
 ---
 

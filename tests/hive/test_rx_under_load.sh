@@ -174,6 +174,28 @@ CFG
 
 	export BLOX_DIR="$REAL_DIR" BLOX_API_PORT=4070
 	unset BLOX_PROCFS_ROOT   # the REAL /proc this time - whatever this box's real process table looks like
+
+	# ---- cold start, 1 CPU, real contention: the ENTIRE sourced call (exactly how Hive's agent - and every
+	# other case in this file - invokes it), pinned via taskset to the SAME single CPU the real xmrig --bench
+	# above is also fighting for, as the VERY FIRST poll against this instance (nothing warmed up, no prior
+	# successful poll, no cache of any kind post-redesign). Proves the single-absolute-deadline budget holds
+	# end-to-end, not just inside the collector's own child. Real-Hive cask18 evidence (32-thread 5950X) showed
+	# 2.86 s EVERY poll before the redesign; the target since is < 1.5 s.
+	if command -v taskset > /dev/null 2>&1; then
+		t0=$(date +%s.%N)
+		# shellcheck disable=SC2016
+		cold_res=$(timeout 5 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "$khs"' 2>&1)
+		t1=$(date +%s.%N)
+		cold_elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
+		if awk -v e="$cold_elapsed" 'BEGIN{exit !(e < 1.5)}' && awk -v k="${cold_res:-0}" 'BEGIN{exit !(k > 0)}'; then
+			ok "cold start, taskset -c 0, REAL xmrig --bench saturating every CPU: khs=$cold_res, < 1.5 s (${cold_elapsed}s)"
+		else
+			bad "cold start, taskset -c 0, REAL xmrig --bench: khs > 0, < 1.5 s" "elapsed=${cold_elapsed}s khs=$cold_res"
+		fi
+	else
+		echo "SKIP: taskset not available - cold-start 1-CPU case skipped"
+	fi
+
 	t0=$(date +%s.%N)
 	# shellcheck disable=SC2016
 	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
