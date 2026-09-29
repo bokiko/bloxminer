@@ -18,12 +18,17 @@ MANIFEST_SRC="$TOPSRC/h-manifest.conf"   # shared top-level manifest (3.0.0)
 T=$(mktemp -d)
 BUSY_PIDS=()
 XMRIG_PID=""
+API_PID=""; API3_PID=""   # backstop only - both are already killed inline right after their own case finishes;
+	# the trap exists so an abnormal exit mid-case can never leave either running (pids only, never a pattern -
+	# 127.0.0.1:20015 is permanently held by another, lead-owned process on shared build hosts)
 cleanup() {
 	for p in "${BUSY_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
 	[[ -n $XMRIG_PID ]] && kill -9 "$XMRIG_PID" 2>/dev/null
+	[[ -n $API_PID ]] && kill -9 "$API_PID" 2>/dev/null
+	[[ -n $API3_PID ]] && kill -9 "$API3_PID" 2>/dev/null
 	rm -rf "$T"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-70s ok\n' "$1"; }
@@ -95,7 +100,10 @@ with open(os.path.join(root, "net", "tcp"), "w") as f:
 	f.write("   0: 0100007F:%s 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0\n" % (hexport, TARGET_INODE))
 PY
 
-SUM_OK=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0"}')
+# hashrate.total matches BACK_OK's per-thread sum exactly (sum(500+c) for c in 0..31 = 16496 H/s = 16.50 kH/s)
+# so Phase A's own summary-only answer (bloxminer/engines/rx/h-stats.sh's mandatory, cheap tier) is ALSO a
+# real, correct total - not just Phase B's (the per-core /2/backends enrichment) job to be right.
+SUM_OK=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hashrate: {total: [16496, null, null]}}')
 BACK_OK=$(python3 -c '
 import json
 threads = [{"affinity": c, "hashrate": [500.0 + c, None, None]} for c in range(32)]
@@ -251,7 +259,7 @@ PY
 mkdir -p "$T/state3"
 printf 'prior=0\nprelim=1200\nfree0=1200\nboot=case3-boot\nstart_uptime=1000\nfinal=0\n' > "$T/state3/.bloxminer-hugepages"
 
-SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hugepages: [1200, 1200]}')
+SUM3=$(jq -nc '{uptime: 100, connection: {accepted: 5, rejected: 0}, algo: "rx/0", version: "6.26.0", hugepages: [1200, 1200], hashrate: {total: [16496, null, null]}}')
 BACK3=$(python3 -c '
 import json
 threads = [{"affinity": c, "hashrate": [500.0 + c, None, None]} for c in range(32)]
@@ -294,6 +302,15 @@ if [[ $final3 == 1 && $ours3 == 1201 ]]; then
 	ok "sustained polling: finalize_rx_hugepages finalized during the run (final=1, ours=1201) and never regressed across $N_POLLS polls"
 else
 	bad "sustained polling: finalized during the run, stable across all polls" "final=$final3 ours=$ours3"
+fi
+
+leaked=()
+for p in "$API_PID" "$API3_PID"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+if [[ ${#leaked[@]} -eq 0 ]]; then
+	ok "no leaked fake-API child processes at suite end"
+else
+	bad "no leaked fake-API child processes at suite end" "still alive: ${leaked[*]}"
+	for p in "${leaked[@]}"; do kill -9 "$p" 2>/dev/null; done
 fi
 
 echo "$pass passed, $fail failed"

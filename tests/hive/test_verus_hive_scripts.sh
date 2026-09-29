@@ -6,7 +6,11 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKG=$(cd "$HERE/../../bloxminer/engines/verus" && pwd)
 MANIFEST_SRC=$(cd "$HERE/../../bloxminer" && pwd)/h-manifest.conf   # shared top-level manifest (3.0.0)
-T=$(mktemp -d); trap 'kill "$API_PID" 2>/dev/null; rm -rf "$T"' EXIT
+T=$(mktemp -d)
+declare -a ALL_API_PIDS=()   # every fake-API pid THIS script ever started - killed exactly by pid, never by
+	# pattern (127.0.0.1:20015 is permanently held by another, lead-owned process on shared build hosts)
+cleanup_apis() { local p; for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done; wait "${ALL_API_PIDS[@]:-}" 2>/dev/null || true; }
+trap 'cleanup_apis; rm -rf "$T"' EXIT INT TERM
 pass=0; fail=0; API_PID=
 ok()  { pass=$((pass+1)); printf '%-52s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-52s FAIL: %s\n' "$1" "$2"; }
@@ -97,7 +101,7 @@ stats_case() {  # name summary cores jq-assertion
 	PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT       # a fresh port per case: no rebind races
 	jq -n --arg s "$2" --arg c "$3" '{summary: $s, cores: $c}' > "$T/replies.json"
 	: > "$T/api.out"
-	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 	grep -q ready "$T/api.out" || { bad "$1" "fake API did not start: $(cat "$T/api.out")"; return; }
 	local res; res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
@@ -133,6 +137,19 @@ stats_case "stall only in cores reply -> 0" "$SUM_OK" "${CORES_OK/STALL=0/STALL=
 stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" "" '.stats.hs == [11900] and (.stats | has("cpu_power")) == false'
 stats_case "engine VER matches package -> plain form" "${SUM_OK/VER=2.1.0/VER=3.0.0}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
 stats_case "no VER field -> ENGINE_VERSION fallback == package -> plain form" "${SUM_OK/;VER=2.1.0/}" "$CORES_OK" '.stats.ver == "3.0.0 (verus)"'
+
+# SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
+# leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
+leaked=()
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+if [[ ${#leaked[@]} -eq 0 ]]; then
+	ok "no leaked fake-API child processes at suite end"
+else
+	bad "no leaked fake-API child processes at suite end" "still alive: ${leaked[*]}"
+	cleanup_apis
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

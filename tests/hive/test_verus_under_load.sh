@@ -18,8 +18,16 @@ TOPSRC=$(cd "$HERE/../../bloxminer" && pwd)
 MANIFEST_SRC="$TOPSRC/h-manifest.conf"
 T=$(mktemp -d)
 BUSY_PIDS=()
-cleanup() { for p in "${BUSY_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done; rm -rf "$T"; }
-trap cleanup EXIT
+API_PID=""; API3_PID=""   # backstop only - both are already killed inline right after their own case finishes;
+	# the trap exists so an abnormal exit mid-case can never leave either running (pids only, never a pattern -
+	# 127.0.0.1:20015 is permanently held by another, lead-owned process on shared build hosts)
+cleanup() {
+	for p in "${BUSY_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
+	[[ -n $API_PID ]] && kill -9 "$API_PID" 2>/dev/null
+	[[ -n $API3_PID ]] && kill -9 "$API3_PID" 2>/dev/null
+	rm -rf "$T"
+}
+trap cleanup EXIT INT TERM
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-70s ok\n' "$1"; }
@@ -55,8 +63,10 @@ for c in $(seq 0 15); do
 	CORES_OK+="ROW=$c;PKG=0;CORE=$c;CPUS=$((c*2)),$((c*2+1));KHS=50000.00;TEMP=61;SRC=ccd|"
 done
 
-run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls, $4 enforce_budget (1/0, default 1)
-	local label=$1 cpuset=$2 n=$3 enforce_budget=${4:-1}
+run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls, $4 enforce_budget (1/0, default 1),
+               # $5 min_duration_s (0 = poll-count-bounded, default; >0 = keep polling past $3 until this many
+               # seconds of WALL time have elapsed since saturation started - for a genuinely sustained run)
+	local label=$1 cpuset=$2 n=$3 enforce_budget=${4:-1} min_duration=${5:-0}
 	kill "${API_PID:-}" 2>/dev/null; wait "${API_PID:-}" 2>/dev/null
 	PORT=$((20000 + RANDOM % 20000)); export BLOX_API_PORT=$PORT
 	jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
@@ -65,13 +75,10 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 	grep -q ready "$T/api.out" || { bad "$label: fake API startup" "$(cat "$T/api.out" 2>/dev/null)"; return; }
 
-	# a FRESH BLOX_DIR (and so a fresh, empty last-known-good cache) per case - never the outer, case-1
-	# fixture's shared one: back-to-back cases sharing one cache/state dir let an EARLIER case's cached sample
-	# age past CACHE_MAX_AGE_S while THIS case's own polls are still timing out, which is a real (if honest -
-	# a 90 s-stale sample really should stop being trusted) but ARTIFACTUAL failure of the "no false zeros"
-	# assertion below - a side effect of concatenating several cpuset cases back to back in one test run, not
-	# of anything a real Hive agent poll cycle would ever do (this same isolation is why
-	# tests/hive/test_rx_under_load.sh gives each of its own cases a separate package dir, $T/pkg, $T/pkg2, ...).
+	# a FRESH BLOX_DIR per case - not load-bearing for correctness any more (verus/h-stats.sh keeps no
+	# cross-poll state at all post-redesign), but kept for the same isolation tests/hive/test_rx_under_load.sh
+	# uses ($T/pkg, $T/pkg2, ...): each case gets its own log dir so concurrent/back-to-back cases never trip
+	# over each other's log files.
 	local case_dir
 	case_dir="$T/case-$(tr -c 'a-zA-Z0-9' '_' <<< "$label")"
 	mkdir -p "$case_dir"
@@ -80,18 +87,17 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	local BLOX_DIR=$case_dir
 	export BLOX_DIR
 
-	# One warm-up poll BEFORE the CPUs are saturated, seeding a real last-known-good sample - a rig reaches a
-	# genuinely extreme, sustained squeeze (this test's own worst case: 24 competing loops on 1-2 CPUs) starting
-	# from an established mining session with plenty of prior successful polls, never from a cold start with
-	# zero history; testing the cache's actual job (surviving a squeeze that begins AFTER a healthy baseline)
-	# needs that same baseline, or a case whose every single poll times out has no sample to fall back to by
-	# construction, independent of anything the cache logic itself does right or wrong.
-	# shellcheck disable=SC2016
-	bash -c '. "$BLOX_DIR/h-stats.sh"' > /dev/null 2>&1
-
+	# No warm-up poll: the redesign (Codex blocker #4) removed verus's positive-khs cache entirely - Phase A
+	# does one bounded `nc` round-trip to the SAME summary/cores API every single poll, fresh, with no
+	# cross-poll state of any kind. There is nothing left to "seed", so every poll below - including the very
+	# first one, saturated from the start - is a genuine cold start by construction. A prior version of this
+	# test ran one warm-up poll before saturating, to seed a last-known-good cache sample; that hid exactly the
+	# cold-start-under-load failure mode Codex's review called out, so it is gone, not merely disabled.
 	saturate_cpus "$cpuset"; sleep 0.3
-	local n_zero=0 n_over=0 max_elapsed=0 i t0 t1 elapsed res khs
-	for i in $(seq 1 "$n"); do
+	local n_zero=0 n_over=0 max_elapsed=0 i=0 t0 t1 elapsed res khs run_start
+	run_start=$(date +%s.%N)
+	while :; do
+		i=$((i+1))
 		t0=$(date +%s.%N)
 		if [[ -n $cpuset && $HAVE_TASKSET == 1 ]]; then
 			# shellcheck disable=SC2016
@@ -106,19 +112,27 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 		awk -v k="${khs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  $label poll $i: ZERO khs ($res)"; }
 		awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over=$((n_over+1)); echo "  $label poll $i: OVER BUDGET (${elapsed}s)"; }
 		awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
+		(( i >= n )) || continue
+		(( min_duration == 0 )) && break
+		awk -v s="$run_start" -v now="$(date +%s.%N)" -v d="$min_duration" 'BEGIN{exit !(now - s >= d)}' && break
 	done
 	stop_saturating
 	# The hard safety requirement (PR #2 finding 1) is NO FALSE ZEROS - a real Hive watchdog reboots a rig on
-	# repeated zero-hashrate polls, never on a slow-but-honest one. Staying under the nominal 3.0 s budget is
+	# repeated zero-hashrate polls, never on a single slow-but-honest one. The documented triggers on a real
+	# rig (cask10, see the project ledger) are WD_MINER=10 min (miner restart) and WD_REBOOT=21 min (reboot) of
+	# SUSTAINED zero hashrate - an occasional poll running a couple of seconds past its own internal budget,
+	# under this test's deliberately extreme 1-2 CPU vs. 24-competing-loop squeeze, is not in the same universe
+	# as either trigger as long as it is never a false zero. Staying under the nominal 3.0 s budget is
 	# additionally enforced from 3 CPUs up (Codex's own reported reproduction, and a realistic floor for a rig
-	# actually mining many threads); at 1-2 CPUs against 24 fully-saturated competing busy loops (deliberately
-	# the most extreme oversubscription this suite tries, 12x-24x) the collector plus the cache-fallback's own
-	# small bounded work can still occasionally run past 3.0 s under signal-delivery/scheduling delay alone -
-	# it never produces a false zero even there, which is what actually protects the rig from a reboot.
+	# actually mining many threads); at 1-2 CPUs the collector's own bounded work (now ONE absolute deadline,
+	# no cache/probe path left to escape it) can still occasionally run past 3.0 s under signal-delivery/
+	# scheduling delay alone - it never produces a false zero even there, which is what actually protects the
+	# rig from a reboot.
+	local wall; wall=$(awk -v s="$run_start" -v now="$(date +%s.%N)" 'BEGIN{printf "%.0f", now - s}')
 	if [[ $n_zero == 0 && ( $enforce_budget == 0 || $n_over == 0 ) ]]; then
-		ok "$label ($n polls, 16-row/32-thread reply): no false zeros$( ((enforce_budget)) && echo ", all under 3.0 s" ) (max ${max_elapsed}s, n_over=$n_over)"
+		ok "$label ($i polls over ${wall}s, 16-row/32-thread reply): no false zeros$( ((enforce_budget)) && echo ", all under 3.0 s" ) (max ${max_elapsed}s, n_over=$n_over)"
 	else
-		bad "$label ($n polls): no false zeros$( ((enforce_budget)) && echo ", all under budget" )" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
+		bad "$label ($i polls over ${wall}s): no false zeros$( ((enforce_budget)) && echo ", all under budget" )" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
 	fi
 }
 
@@ -131,6 +145,13 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		eb=1; (( want < 3 )) && eb=0   # budget enforced from 3 CPUs up - see run_case's own comment
 		run_case "verus engine h-stats.sh, taskset 0-$hi ($want CPU(s))" "0-$hi" 10 "$eb"
 	done
+	# ---- sustained: Codex blocker #4 asked for a >90 s run, not just a handful of polls, to guard against a
+	# failure mode that only shows up over time (a leak, a slow state drift) that a 10-poll burst could miss.
+	# 2 CPUs against 24 competing busy loops (the same squeeze as the taskset-0-1 case above, budget not
+	# enforced there either) run continuously for at least 90 s of wall time - well past both real Hive
+	# watchdog triggers' own polling cadence, with zero cross-poll state to drift in the first place post-
+	# redesign, so this is really proving "no false zero, ever, however long this runs", not "state survives".
+	(( NPROC >= 2 )) && run_case "verus engine h-stats.sh, taskset 0-1 (2 CPU(s), sustained)" "0-1" 1 0 95
 else
 	echo "SKIP: taskset not available - only the unconstrained case above ran"
 fi
@@ -181,6 +202,15 @@ if [[ $n_zero == 0 && $n_over == 0 ]]; then
 	ok "top-level dispatcher h-stats.sh (verus engine, $n_dispatcher_polls polls${cpuset:+, taskset $cpuset}): no false zeros, all under 3.0 s (max ${max_elapsed}s)"
 else
 	bad "top-level dispatcher h-stats.sh (verus engine): no false zeros, all under budget" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
+fi
+
+leaked=()
+for p in "$API_PID" "$API3_PID"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+if [[ ${#leaked[@]} -eq 0 ]]; then
+	ok "no leaked fake-API child processes at suite end"
+else
+	bad "no leaked fake-API child processes at suite end" "still alive: ${leaked[*]}"
+	for p in "${leaked[@]}"; do kill -9 "$p" 2>/dev/null; done
 fi
 
 echo "$pass passed, $fail failed"

@@ -4,17 +4,42 @@
 # any one of them refuses to write a package - never a silent, mismatched artefact. BloxMiner 3.0.0 REBUILDS
 # both engines, so package.sh's inputs are the two engines' own build/build.sh and build/build-rx.sh OUTDIRS
 # (binary + its own fresh provenance), not previously released tarballs - this suite tampers copies of those
-# outdirs the same way the old suite tampered tarball copies: never the frozen originals.
+# outdirs the same way the old suite tampered tarball copies: never the originals.
 # Usage: tests/build/test_package_provenance.sh <verus-build-outdir> <rx-build-outdir>
-#   (defaults to ~/c3work/verus-out and ~/c3work/rx-out - the frozen, gated build outputs - when run with no
-#   arguments; SKIPs cleanly if they are not found, exactly like the old suite did for its frozen tarballs)
+#   (or set BLOX_VERUS_OUT/BLOX_RX_OUT). HERMETIC - there is deliberately NO default/fallback location: a
+#   previous version of this test defaulted to a shared, mutable ~/c3work/{verus-out,rx-out} and kept passing
+#   its "baseline"/"control" cases against binaries built from an OLDER commit while the tree under test had
+#   already moved on (a real, observed failure - a stale rx-out made those two cases fail with a confusing
+#   "does not match its recorded source hash" instead of a clean skip). Outdirs are REQUIRED, and are proven to
+#   actually match $ROOT (the tree this test script itself lives in) before anything else runs - see below;
+#   never silently tested against a mismatching pair.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
-FROZEN=$HOME/c3work
-VERUS_OUT=${1:-$FROZEN/verus-out}
-RX_OUT=${2:-$FROZEN/rx-out}
+VERUS_OUT=${1:-${BLOX_VERUS_OUT:-}}
+RX_OUT=${2:-${BLOX_RX_OUT:-}}
+if [[ -z $VERUS_OUT || -z $RX_OUT ]]; then
+	echo "SKIP: no build outdirs given - pass <verus-out> <rx-out> as arguments, or set BLOX_VERUS_OUT/BLOX_RX_OUT. This test needs build/build.sh and build/build-rx.sh output for the EXACT commit/tree under test; it never falls back to a shared or previously-built default location."
+	exit 0
+fi
 [[ -f $VERUS_OUT/bloxminer-O3 && -f $VERUS_OUT/bloxminer-O3.provenance && -f $VERUS_OUT/libomp.so.5 && -f $RX_OUT/xmrig && -f $RX_OUT/bloxsense && -f $RX_OUT/build.provenance ]] || {
-	echo "SKIP: frozen build outdirs not found ($VERUS_OUT / $RX_OUT) - pass them as arguments"; exit 0; }
+	echo "SKIP: build outdirs not found or incomplete ($VERUS_OUT / $RX_OUT)"; exit 0; }
+
+# Hermetic check: prove these outdirs actually match $ROOT (the tree under test) BEFORE using them as the
+# "known good" baseline for every tamper case below. The cheapest, always-in-sync way to prove this is to
+# literally run build/package.sh once here - its own first act is exactly this verification (every helper
+# hash, both binaries, against $ROOT's current bytes), refusing on any mismatch - reusing it, rather than
+# re-implementing the same comparison a second time, means this check can never drift out of sync with what
+# package.sh actually enforces. A refusal here SKIPs the whole suite with package.sh's own exact reason,
+# instead of every tamper case below silently running against a provenance that describes different bytes
+# than what is actually in $ROOT right now.
+HERMCHECK_DIR=$(mktemp -d)
+if ! HERMCHECK_OUT=$(bash "$ROOT/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$HERMCHECK_DIR" 2>&1); then
+	rm -rf "$HERMCHECK_DIR"
+	echo "SKIP: $VERUS_OUT / $RX_OUT do not match the tree under test ($ROOT) - build/package.sh refused:"
+	echo "$HERMCHECK_OUT"
+	exit 0
+fi
+rm -rf "$HERMCHECK_DIR"
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 pass=0; fail=0

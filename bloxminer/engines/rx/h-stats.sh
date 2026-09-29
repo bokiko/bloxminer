@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
 # Sourced by the Hive agent: must set $khs (total kH/s) and $stats (JSON). ONE shared 3.0 s deadline for the
-# whole run, enforced by running the ENTIRE collection (the /proc ownership scan, both API calls, the /proc
-# task-mask scan, bloxsense, and the jq row assembly) inside a single child process, not just individual
-# steps: a /proc scan on a rig with an unusually large process table, or any other step, can never make this
-# script overrun its budget, because the whole child is killed outright if it does not finish in time. Both
-# /proc scans (ownership, task-mask) do ONE fork total each, regardless of how many fds/tasks exist: `find
-# -lname` and a single `awk` do their own comparisons in-process instead of forking readlink/sed per item - a
-# per-item loop here previously cost a real rig a hard fallback (~870 fds, all 32 threads mining, budget blown
-# mid-scan under that fork load; an idle dev box never showed it).
+# whole run.
+#
+# PR #2 review (round 2): an earlier version of this file cached the last positive $khs and served it on a
+# missed deadline, keyed by the owning process's pid + its own /proc start time. Codex correctly rejected that:
+# process identity proves the SAME xmrig instance is still running, never that it is still HASHING - seed a
+# positive sample, then let the miner stall or the API go unreachable while the collector keeps missing its
+# deadline (contention alone can do that), and the same pid/start/exe would go on serving a stale positive rate
+# for up to the cache's own age bound. Redesign: the hashrate is NEVER cached. Each poll is split into
+#   Phase A (mandatory, cheap): ownership check (unchanged) + ONE curl to /2/summary alone. XMRig's own
+#     `hashrate.total[0]` there is already the aggregate rate, `connection.accepted/rejected` and `uptime` are
+#     right there too - no need for /2/backends just to answer "how fast, right now, honestly". Written to
+#     $OUTFILE the moment it is ready, as a single row.
+#   Phase B (optional, whatever budget remains): /2/backends + bloxsense + per-core binding verification - a
+#     richer per-core (or per-thread) breakdown, still recomputed from data collected THIS SAME poll, never a
+#     substitute for Phase A's answer if it does not finish in time. Only a display detail is allowed to age:
+#     the single row's temperature, when Phase B does not run this poll, may reuse the last real temperature
+#     Phase B measured for this exact xmrig instance (pid + /proc start time), bounded to ENRICH_MAX_AGE_S -
+#     never the rate, which is either fresh this poll or 0.
+# So a poll's answer is always either genuinely fresh (this exact API call, this exact poll) or the defined 0 -
+# there is no cache of the number that actually matters left to reason about an age bound for.
+#
+# The whole collection still runs inside a single, ONE-absolute-deadline, killable child: a /proc scan on a rig
+# with an unusually large process table, or any other step, can never make this script overrun its budget,
+# because the whole child is killed outright if it does not finish in time. Both /proc scans (ownership,
+# task-mask) do ONE fork total each, regardless of how many fds/tasks exist: `find -lname` and a single `awk`
+# do their own comparisons in-process instead of forking readlink/sed per item - a per-item loop here
+# previously cost a real rig a hard fallback (~870 fds, all 32 threads mining, budget blown mid-scan under that
+# fork load; an idle dev box never showed it).
 # That child runs via `setsid`, its own dedicated session/process group, with an explicit TERM-then-KILL
 # escalation below targeting that whole group (SIGTERM at 2.4 s, SIGKILL at 2.7 s if that is ignored -
 # unmaskable, so nothing outlives it) - plain `timeout` was tried first and found NOT reliable here: when the
@@ -21,7 +41,8 @@
 # only after its setsid has taken effect; a kill is only ever sent to a group when that handshake has arrived
 # and reads back exactly the child's own pid, and differs from our own pgid and from 0/1 - anything else,
 # including the handshake simply not having arrived yet, signals the child's own pid alone, never a group.
-# The parent (this file) always has a defined answer ready (the fallback below) for when the child is killed,
+# $OUTFILE is written to DIRECTLY by run() (atomically, tmp+rename) at each phase boundary - never captured
+# from the child's stdout - so a kill mid-Phase-B can never erase Phase A's already-written, honest answer;
 # read back from a temp file rather than a pipe, so a would-be survivor holding a pipe open can never hang it.
 # Inside the child, the remaining time is still recomputed before every step, and each step is additionally
 # capped at its own nominal ceiling (curl 0.5 s, bloxsense 1.0 s) so a slow but not-yet-killed step cannot
@@ -34,10 +55,11 @@
 # Rows: one per physical core (SMT threads summed from /2/backends' per-thread affinity + hashrate[0], 10 s
 # window) when every thread reports a real affinity to a CPU bloxsense's topology also knows, AND the xmrig
 # process's own task list (/proc/<pid>/task/*/status) shows that exact multiset of single-CPU-pinned tasks -
-# i.e. the binding is independently confirmed, not just asserted by the API. Otherwise one row per thread with
-# the package temperature (the core mapping is "unbound"). A row's rate is XMRig's own 10 s average; it drops
-# to 0 within ~10-20 s of hashing stopping - this is not a "completed work" stamp. khs is always the sum of rows.
-# State changes (API unavailable / affinity not verified / recovered) get one timestamped line in this
+# i.e. the binding is independently confirmed, not just asserted by the API. Otherwise one row per thread
+# (Phase B, unverified binding) or one row = the total (Phase A only, no per-core breakdown collected this
+# poll) with the package temperature. A row's rate is XMRig's own 10 s average; it drops to 0 within ~10-20 s
+# of hashing stopping - this is not a "completed work" stamp. khs is always the sum of rows.
+# State changes (unavailable / shallow / affinity not verified / recovered) get one timestamped line in this
 # package's OWN log, $CUSTOM_LOG_BASENAME.stats.log - never in XMRig's own log file, and never on stdout (this
 # file is sourced by Hive's agent, not run as a standalone script). XMRig's FileLogWriter opens its log with
 # O_CREAT|O_WRONLY (no O_APPEND) and tracks its own write offset from the size at open time: anything else
@@ -57,61 +79,82 @@ algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null); [
 STATEDIR=${BLOX_STATE_DIR:-}
 if [[ -z $STATEDIR ]]; then [[ -d /run/hive ]] && STATEDIR=/run/hive || STATEDIR=$PKG; fi
 STATEFILE="$STATEDIR/.bloxminer-rx-hstats-state"
-# CACHEFILE: the rx engine's own last-known-good sample (this file's path alone keys it to "rx" - the verus
-# engine has an entirely separate state directory/file, so an engine switch can never read the other engine's
-# cache by accident; see the pid+start check below for protection against a NEW rx miner instance reusing the
-# same file). Written only on a real, freshly collected sample (see run()'s tail); read only when the timed
-# child below misses its deadline (see the rc!=0 branch at the bottom of this file).
-CACHEFILE="$STATEDIR/.bloxminer-rx-hstats-cache"
-export PROC PKG PORT VER algo STATEFILE CACHEFILE CUSTOM_LOG_BASENAME
+# ENRICHFILE: the last real TEMPERATURE Phase B measured for a given xmrig instance (pid + /proc start time) -
+# never a hashrate. Read by Phase A only to fill in a single row's temperature when Phase B does not run this
+# poll; a wrong-by-a-poll-or-two cached temperature has no watchdog-reboot consequence, unlike a cached rate.
+ENRICHFILE="$STATEDIR/.bloxminer-rx-hstats-enrich"
+export PROC PKG PORT VER algo STATEFILE ENRICHFILE CUSTOM_LOG_BASENAME
 
-# The whole collection lives in one function library file so the parent (for its own fallback-on-timeout path)
-# and the timed child (for the real work) run the exact same code - nothing is duplicated or re-typed.
+# The whole collection lives in one function library file so the parent's own fallback path (used only when
+# the LIB/OUTFILE/HANDSHAKE temp files themselves cannot be created) and the timed child (the real work) run
+# the exact same code - nothing is duplicated or re-typed.
 LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-lib.XXXXXX") || {
 	khs=0; stats=$(printf '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo")
 	return 0 2>/dev/null || exit 0
 }
 cat > "$LIB" <<'LIBEOF'
-now() { date +%s.%N; }
-remaining() { awk -v s="$t0" -v n="$(now)" -v b="$BUDGET" 'BEGIN{r=b-(n-s); if (r<0) r=0; printf "%.2f", r}'; }
+# Budget arithmetic below is pure bash - NO FORK AT ALL (was `date` + `awk`, forked on every single check).
+# Real-Hive evidence (cask18, 5950X, all 32 threads saturating the one CPU the collector itself was pinned to
+# alongside them): the OLD design's per-check date+awk forks were themselves a meaningful share of why the
+# whole collection could not finish in time - every fork here is scheduling latency spent finding out how much
+# time is left, on the exact box where scheduling latency is what is actually scarce. EPOCHREALTIME (bash 5
+# builtin, "SECONDS.ffffff") turns into a plain integer microsecond count via string slicing; every subsequent
+# check is `$(( ))` arithmetic. Out-parameter convention ($REPLY), never `$(...)` - a command substitution
+# forks a subshell regardless of whether the function body itself does.
+now_us() {   # sets $REPLY = now, integer microseconds since epoch
+	local t=${EPOCHREALTIME:-}
+	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
+	REPLY="${t%%.*}${t#*.}"
+}
+remaining_us() {   # sets $REPLY = microseconds left of $BUDGET_US since $t0_us, floored at 0
+	local n; now_us; n=$REPLY
+	REPLY=$(( BUDGET_US - (n - t0_us) ))
+	(( REPLY < 0 )) && REPLY=0
+}
+have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
+cap_us() { (( $1 < $2 )) && REPLY=$1 || REPLY=$2; }   # min(remaining, nominal per-step ceiling), both in us
+us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for curl --max-time / timeout - no fork
+	local us=$1 f
+	printf -v f '%06d' $(( us % 1000000 ))
+	REPLY="$(( us / 1000000 )).$f"
+}
 
-# CACHE_MAX_AGE_S: how old a last-known-good sample (see CACHEFILE below) may be before it is no longer used to
-# answer a poll whose own fresh collection missed the deadline. 90 s: comfortably smooths over a CPU-load blip
-# (Hive's own zero-hashrate watchdog acts on the order of minutes, not seconds - see README's stall section)
-# while still bounding how long a truly wedged collector or a dead miner (once it stops even reaching the fast,
-# honest 0 path near the top of run()) can go on showing a stale positive rate.
-CACHE_MAX_AGE_S=90
+# ENRICH_MAX_AGE_S: how old a cached TEMPERATURE (see ENRICHFILE) may be before Phase A stops using it and
+# shows null instead. This bounds a cosmetic detail only - see the file header for why khs is never bounded
+# this way at all (there is no cached khs to bound).
+ENRICH_MAX_AGE_S=90
 
-# _rx_pid_start <pid> - that pid's own starttime field (22nd field of /proc/<pid>/stat, robust to spaces or
-# parens inside the comm field by scanning from the LAST ')'), or empty if unreadable. No fork: `read` is a
-# builtin and the here-string does not exec anything either. Used to tell a genuinely still-running xmrig
-# instance apart from a DIFFERENT process that later reused the same pid (a real occurrence on a long-running
-# rig) - a plain pid match alone would not be enough to trust a cached sample against.
+# _rx_pid_start <pid> - sets $REPLY to that pid's own starttime field (22nd field of /proc/<pid>/stat, robust
+# to spaces or parens inside the comm field by scanning from the LAST ')'), or empty if unreadable. No fork:
+# `read` is a builtin, the here-string does not exec anything either, and (out-parameter via $REPLY, not
+# stdout) neither does the caller capturing it. Used to tell a genuinely still-running xmrig instance apart
+# from a DIFFERENT process that later reused the same pid (a real occurrence on a long-running rig) - a plain
+# pid match alone would not be enough to trust a cached temperature against.
 _rx_pid_start() {
 	local f="$PROC/$1/stat" line rest arr
+	REPLY=""
 	[[ -r $f ]] || return 0
 	read -r line < "$f" 2>/dev/null || return 0
 	rest=${line##*) }
 	read -r -a arr <<< "$rest"
-	printf '%s' "${arr[19]:-}"
+	REPLY="${arr[19]:-}"
 }
-have_budget() { awk -v r="$1" 'BEGIN{exit !(r > 0.05)}'; }   # < 50 ms left is not worth attempting
-cap() { awk -v r="$1" -v c="$2" 'BEGIN{print (r<c)?r:c}'; }   # min(remaining, nominal per-step ceiling)
 
 int() { [[ $1 =~ ^[0-9]+$ ]]; }
 
-note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition, never to stdout, and never
-                 # into XMRig's own log file (see the top comment: XMRig writes it at its own tracked offset
-                 # with no O_APPEND, so anything else appended there is silently overwritten by XMRig's next
-                 # write). Own file instead: $CUSTOM_LOG_BASENAME.stats.log, timestamped, bounded to ~200 lines.
+note_state() {   # $1 = ok | unverified | shallow | unavailable; logs only on a transition, never to stdout,
+                 # and never into XMRig's own log file (see the top comment: XMRig writes it at its own
+                 # tracked offset with no O_APPEND, so anything else appended there is silently overwritten by
+                 # XMRig's next write). Own file instead: $CUSTOM_LOG_BASENAME.stats.log, timestamped, bounded
+                 # to ~200 lines.
 	local prev="" cur=$1 msg="" statslog="$CUSTOM_LOG_BASENAME.stats.log" sz
 	[[ -f $STATEFILE ]] && prev=$(<"$STATEFILE")
 	[[ $prev == "$cur" ]] && return 0
 	case $cur in
 		unavailable) msg="bloxminer-x: stats API unavailable" ;;
 		unverified)  msg="bloxminer-x: affinity not verified, showing per-thread rows" ;;
+		shallow)     msg="bloxminer-x: showing total only this poll (no per-core breakdown collected in time)" ;;
 		ok)          [[ -n $prev ]] && msg="bloxminer-x: recovered" ;;
-		cached)      msg="bloxminer-x: stats collector missed its deadline under CPU load - showing the last known-good sample (${2:-?}s old) until a fresh one is collected" ;;
 	esac
 	if [[ -n $msg ]]; then
 		{
@@ -131,6 +174,17 @@ fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON numbe
 		'{hs: [0], hs_units: "khs", temp: [$temp], ar: [0, 0], uptime: 0, ver: $ver, algo: $algo}')
 }
 
+# write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
+# after Phase A and again after Phase B if it improves on it - see the file header. No fork: every caller
+# passes a khs that is already a plain, validated numeric string (never attacker/API-controlled text - it is
+# always the output of `%.2f`-style awk formatting or a jq `round`), so the wrapper JSON is built with `printf`
+# instead of forking jq a second time to do only string interpolation jq would do anyway; $2 is always already
+# valid JSON text produced by this same file's own jq calls.
+write_result() {
+	local tmp="$OUTFILE.w.$$"
+	{ printf '{"khs":"%s","stats":%s}' "$1" "$2" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
+}
+
 # schema validators: a reply that parses as JSON but does not look like XMRig's own shape is not used
 valid_summary() { jq -e 'type == "object" and (.version | type == "string")' > /dev/null 2>&1 <<< "$1"; }
 valid_backends() {
@@ -144,13 +198,14 @@ valid_backends() {
 	' > /dev/null 2>&1 <<< "$1"
 }
 
-# Collects everything and sets $khs/$stats. Every early exit is a plain `return 0` (this always runs as a
-# function, whether called directly by the parent's own fallback path or, normally, inside the timed child).
+# Collects everything and sets $khs/$stats, writing $OUTFILE at each phase boundary. Every early exit writes
+# an honest result first (via write_result, or fallback()+write_result) - this always runs as a function,
+# whether called directly (LIB creation failure path) or, normally, inside the timed child.
 run() {
-	local r port_hex inode owner_pid owned fd_dir sum back uptime acc rej threads naff sense pkg_temp power_raw
-	local percore task_set api_set rows pidstart
+	local port_hex inode owner_pid owned fd_dir sum uptime acc rej khs_fresh pidstart enrich_temp
+	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
 
-	r=$(remaining); have_budget "$r" || { note_state unavailable; fallback ""; return 0; }
+	remaining_us; have_budget_us "$REPLY" || { note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
 
 	# ---- API ownership: /proc/net/tcp -> inode -> pid -> exe (the whole scan is inside the timed child)
 	port_hex=$(printf '%04X' "$PORT")
@@ -159,10 +214,7 @@ run() {
 	owner_pid=""
 	if [[ -n $inode ]]; then
 		# ONE fork total, whatever the size of the process table: `find -lname` compares every fd's symlink
-		# target internally (no readlink child process per fd). A per-fd `readlink` loop here previously forked
-		# once per fd - on a busy rig with hundreds of processes and thousands of fds, and every CPU already
-		# saturated by mining, those forks alone were slow enough to blow the whole child's budget outright
-		# (seen for real on a 5950X mining on all 32 threads: ~870 fds, budget expired mid-scan, hard fallback).
+		# target internally (no readlink child process per fd).
 		fd_dir=$(find "$PROC" -mindepth 3 -maxdepth 3 -path "$PROC/[0-9]*/fd/*" -lname "socket:\[$inode\]" \
 			-printf '%h\n' 2>/dev/null | head -n1)
 		if [[ -n $fd_dir ]]; then
@@ -171,37 +223,81 @@ run() {
 	fi
 	owned=0
 	if [[ -n $owner_pid ]] && [[ $(readlink "$PROC/$owner_pid/exe" 2>/dev/null) == "$PKG/xmrig" ]]; then owned=1; fi
-	if (( ! owned )); then note_state unavailable; fallback ""; return 0; fi
+	if (( ! owned )); then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
 
-	# ---- the two API calls, each capped at min(remaining, 0.5 s)
-	r=$(remaining); have_budget "$r" || { note_state unavailable; fallback ""; return 0; }
-	sum=$(curl -fsS --max-time "$(cap "$r" 0.5)" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null)
+	# ================================================================ PHASE A (mandatory, cheap, this poll)
+	# The ONLY network call and the ONLY jq invocation this phase needs: one GET (parse+validate+extract are a
+	# SINGLE jq call, not three) to /2/summary, which already carries the aggregate hashrate, accepted/rejected
+	# and uptime - real-Hive evidence (1 CPU, 32 threads all saturating it) is that every avoided fork here
+	# matters, so this phase forks only what curl/find/awk/readlink/jq themselves cannot be done without.
+	remaining_us; have_budget_us "$REPLY" || { note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
+	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"   # 0.5 s ceiling
+	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null)
 
-	r=$(remaining); have_budget "$r" || { note_state unavailable; fallback ""; return 0; }
-	back=$(curl -fsS --max-time "$(cap "$r" 0.5)" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null)
+	local parsed
+	parsed=$(jq -r '
+		if (type == "object") and (.version | type == "string") then
+			def n0: if (type == "number") and (isnan | not) and (isinfinite | not) and (. >= 0) then . else 0 end;
+			[ ((.uptime // 0) | n0), ((.connection.accepted // 0) | n0), ((.connection.rejected // 0) | n0),
+			  ((((.hashrate.total[0]?) // 0) | n0) / 1000 * 100 | round / 100) ] | @tsv
+		else empty end
+	' <<< "$sum" 2>/dev/null)
+	if [[ -z $parsed ]]; then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
+	IFS=$'\t' read -r uptime acc rej khs_fresh <<< "$parsed"
+	int "$uptime" || uptime=${uptime%%.*}; int "$uptime" || uptime=0
+	int "$acc" || acc=0
+	int "$rej" || rej=0
+	[[ $khs_fresh =~ ^[0-9]+(\.[0-9]+)?$ ]] || khs_fresh=0
+	printf -v khs_fresh '%.2f' "$khs_fresh"   # jq's own number formatting drops trailing/all zeros ("1.6", "1")
+		# - always exactly 2 decimals here, matching Phase B's `awk '%.2f'` convention elsewhere in this file.
+		# `printf` is a bash builtin: no fork.
 
-	if ! jq -e . > /dev/null 2>&1 <<< "$sum" || ! valid_summary "$sum" || ! jq -e . > /dev/null 2>&1 <<< "$back" || ! valid_backends "$back"; then
-		note_state unavailable; fallback ""; return 0
+	_rx_pid_start "$owner_pid"; pidstart=$REPLY
+	enrich_temp="null"
+	if [[ -n $pidstart && -f $ENRICHFILE ]]; then
+		local e_ts="" e_pid="" e_start="" e_temp="" e_age
+		while IFS='=' read -r ek ev; do
+			case $ek in ts) e_ts=$ev ;; pid) e_pid=$ev ;; start) e_start=$ev ;; temp) e_temp=$ev ;; esac
+		done < "$ENRICHFILE" 2>/dev/null
+		if [[ -n $e_ts && $e_pid == "$owner_pid" && $e_start == "$pidstart" ]]; then
+			now_us; e_age=$(( (REPLY - e_ts) / 1000000 )); (( e_age < 0 )) && e_age=0
+			[[ -n $e_temp && $e_age -le $ENRICH_MAX_AGE_S ]] && enrich_temp=$e_temp
+		fi
 	fi
 
-	uptime=$(jq -r '.uptime // 0' <<< "$sum"); int "$uptime" || uptime=0
-	acc=$(jq -r '.connection.accepted // 0' <<< "$sum"); int "$acc" || acc=0
-	rej=$(jq -r '.connection.rejected // 0' <<< "$sum"); int "$rej" || rej=0
+	khs=$khs_fresh
+	stats=$(jq -nc --argjson k "$khs_fresh" --argjson t "$enrich_temp" --argjson a "$acc" --argjson r "$rej" \
+		--argjson up "$uptime" --arg ver "$VER" --arg algo "$algo" \
+		'{hs: [$k], hs_units: "khs", temp: [$t], ar: [$a, $r], uptime: $up, ver: $ver, algo: $algo}')
+	write_result "$khs" "$stats"
+	# note_state is NOT called here: Phase A's write is provisional (Phase B usually improves on it in the
+	# very same poll), and logging "shallow" unconditionally on every poll - even ones where Phase B goes on to
+	# succeed exactly as it did last poll too - would turn "logs only on a real transition" into "logs twice a
+	# poll" (shallow, then ok/unverified again) even in a fully steady state. Every exit below that settles for
+	# Phase A's answer calls note_state shallow explicitly, once, at the point that becomes final for real.
+
+	# ================================================================ PHASE B (optional enrichment)
+	[[ -n ${BLOX_HSTATS_TEST_PHASEB_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_PHASEB_DELAY"   # tests only
+	remaining_us; have_budget_us "$REPLY" || { note_state shallow; return 0; }
+	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"
+	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null)
+	jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back" || { note_state shallow; return 0; }
 
 	threads=$(jq -c '[.[] | select(.type == "cpu") | .threads[]?] // []' <<< "$back" 2>/dev/null)
 	[[ -n $threads ]] || threads='[]'
 	naff=$(jq 'length' <<< "$threads" 2>/dev/null); int "$naff" || naff=0
-	if (( naff == 0 )); then fallback ""; return 0; fi   # legitimate: no pool job yet, benign, not logged
+	if (( naff == 0 )); then note_state shallow; return 0; fi   # legitimate: no pool job yet, benign - Phase A's total stands
 
 	# ---- sensors: whatever is left, capped at min(remaining, 1.0 s) - bloxsense's own RAPL sample is ~0.55 s
-	r=$(remaining)
-	if have_budget "$r"; then
+	remaining_us
+	if have_budget_us "$REPLY"; then
 		# --foreground: keep bloxsense in the SAME process group as this script (and the outer timeout wrapping
 		# the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores SIGTERM
 		# could end up in a process group the outer timeout's kill never reaches, and survive as an orphan.
-		sense=$(timeout --foreground "$(cap "$r" 1.0)" "$PKG/bloxsense" --json 2>/dev/null)
+		cap_us "$REPLY" 1000000; us_to_secstr "$REPLY"
+		sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>/dev/null)
 	else
-		sense=""
+		note_state shallow; return 0
 	fi
 	jq -e . > /dev/null 2>&1 <<< "$sense" || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
 	pkg_temp=$(jq -c '.pkg_temp' <<< "$sense")
@@ -209,14 +305,10 @@ run() {
 
 	# ---- binding verification, budget permitting (the /proc task scan is also inside the timed child)
 	percore=0
-	r=$(remaining)
-	if have_budget "$r" && jq -e --argjson s "$sense" 'all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all)' \
+	remaining_us
+	if have_budget_us "$REPLY" && jq -e --argjson s "$sense" 'all(.affinity >= 0) and (map(.affinity as $a | ($s.cpus | any(.cpu == $a))) | all)' \
 		<<< "$threads" > /dev/null 2>&1
 	then
-		# ONE awk fork over every task's status file, whatever their count: a task is "single-CPU" when its
-		# Cpus_allowed_list expands to exactly one CPU. (Previously a per-task loop forked sed+tr+a subshell
-		# for every task - the same class of bug as the fd scan above, fixed the same way: one process reads
-		# every file instead of one process per file.)
 		task_set='[]'
 		if [[ -d $PROC/$owner_pid/task ]]; then
 			task_set=$(awk '
@@ -269,41 +361,30 @@ run() {
 		--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
 		'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
 		 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
+	write_result "$khs" "$stats"
 
-	# last-known-good cache: written ONLY here - the single place in run() reflecting a real, freshly
-	# collected sample (this line is only ever reached after a verified-owned xmrig answered both API calls
-	# with schema-valid, non-empty thread data). $khs may itself legitimately be 0 here (e.g. every thread's
-	# hashrate[0] is genuinely 0 during a real stall) - that honest value is exactly what gets cached, so a
-	# later poll that both misses its own deadline AND finds this cache can never show a stale POSITIVE number
-	# over a real stall. Every earlier `fallback ""` return in run() above (no owner, API unreachable/invalid,
-	# no pool job yet) never reaches this line, so none of those - genuinely benign or genuinely dead - can
-	# ever overwrite a good cached sample with a placeholder. Keyed by this xmrig instance's pid AND its own
-	# /proc start time (never pid alone - pids get reused) so a later restart or an engine switch back to rx
-	# can never have its own first poll answered from a previous, unrelated instance's numbers.
-	pidstart=$(_rx_pid_start "$owner_pid")
+	# enrichment cache: TEMPERATURE only, keyed by this xmrig instance (pid + its own /proc start time) - see
+	# the file header. Never khs.
 	if [[ -n $pidstart ]]; then
-		{ printf 'ts=%s\npid=%s\nstart=%s\nkhs=%s\nstats=%s\n' "$(now)" "$owner_pid" "$pidstart" "$khs" "$stats" \
-			> "$CACHEFILE.tmp" && mv -f "$CACHEFILE.tmp" "$CACHEFILE"; } 2>/dev/null
+		now_us   # $REPLY = integer microseconds, the SAME unit the read-back age check (above) expects
+		{ printf 'ts=%s\npid=%s\nstart=%s\ntemp=%s\n' "$REPLY" "$owner_pid" "$pidstart" "$pkg_temp" \
+			> "$ENRICHFILE.tmp" && mv -f "$ENRICHFILE.tmp" "$ENRICHFILE"; } 2>/dev/null
 	fi
-}
-
-# The only stdout this whole library ever produces: one JSON line, printed once run() has set $khs/$stats.
-collect() {
-	run
-	printf '%s' "$(jq -nc --arg k "$khs" --argjson s "$stats" '{khs: $k, stats: $s}')"
 }
 LIBEOF
 
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
-. "$LIB"   # the parent also gets fallback()/note_state() from here, for when the timed child below is killed
+. "$LIB"   # the parent also gets fallback()/note_state()/write_result() from here, for the LIB-creation-failure path
 
-CHILD_BUDGET=2.4   # of the shared 3.0 s deadline
+CHILD_BUDGET=2.4   # of the shared 3.0 s deadline - fractional seconds, for the outer `sleep` alarm below
+BUDGET_US=2400000  # the SAME value, integer microseconds, for the in-child forkless budget arithmetic (run())
 KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.7 s, leaving 0.3 s of
-                    # slack for this wrapper + jq parsing, so the whole run stays under 3.0 s even in the worst
-                    # case (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
-# Captured via a temp file, never a pipe: a command-substitution pipe only reaches EOF once every process that
-# ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a survivor
-# could hang this parent forever. Reading a plain file back never blocks on a stale writer.
+                    # slack for this wrapper, so the whole run stays under 3.0 s even in the worst case
+                    # (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
+# $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at each phase boundary - never
+# captured from the child's stdout. Never a pipe: a command-substitution pipe only reaches EOF once every
+# process that ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a
+# survivor could hang this parent forever. Reading a plain file back never blocks on a stale writer.
 OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-out.XXXXXX") || OUTFILE=""
 # The child reports its OWN pgid, AFTER its setsid has taken effect, into this handshake file - this script
 # never reads the child's pgid via `ps` itself. Right after backgrounding, the new process may still be
@@ -313,14 +394,18 @@ OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-out.XXXXXX") || OUTFILE=""
 # itself reports, once it truly is isolated, is ever trusted for a group-wide signal.
 HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-hs.XXXXXX") || HANDSHAKE=""
 PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+export OUTFILE
 
 if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
-	BUDGET="$CHILD_BUDGET" setsid bash -c '
+	BUDGET_US="$BUDGET_US" setsid bash -c '
 		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
-		. "$1"; t0=$(date +%s.%N); collect
-	' _ "$LIB" "$HANDSHAKE" > "$OUTFILE" 2>/dev/null &
+		. "$1"
+		t=${EPOCHREALTIME:-}; [[ -n $t ]] || t=$(date +%s.%N)
+		t0_us="${t%%.*}${t#*.}"
+		run
+	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>&1 &
 	CPID=$!
 
 	# A group-kill is only ever attempted against a pgid that: came from the handshake (so it is what the
@@ -352,7 +437,6 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# closes that hole outright, and was needed in practice (an un-redirected alarm reproduced exactly this).
 	{ sleep "$CHILD_BUDGET"; } > /dev/null 2>&1 & ALARM=$!
 	wait -n "$CPID" "$ALARM" 2>/dev/null
-	rc=$?
 	# Checked by whether ANYTHING remains (in the validated group, or else just $CPID), not just whether
 	# $CPID itself is still alive: $CPID is a plain bash process that dies immediately from a TERM, even when
 	# a SIGTERM-ignoring descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look
@@ -365,53 +449,26 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 		sleep "$KILL_GRACE"
 		still_running && escalate KILL
-		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it, get its real exit status
-		rc=$?
+		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it
 	else
-		# $CPID (not $ALARM) is what the first wait -n above reaped: $rc already holds its real exit status
 		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 	fi
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
 else
-	rc=1; result=""
+	result=""
 fi
 rm -f "$LIB"
 
-if [[ $rc == 0 ]] && jq -e 'type == "object" and (.khs | type) == "string" and has("stats")' > /dev/null 2>&1 <<< "$result"; then
+# Whatever $OUTFILE holds - Phase A's answer, or Phase B's richer one, or nothing at all if the child was
+# killed before Phase A even finished writing - is used as-is: no cache, no age bound, no re-verification for
+# the rate itself, because there is nothing here that was not collected THIS poll (only the single row's
+# temperature, inside Phase A's own result, may already reflect ENRICHFILE - see run()). Nothing written at
+# all is the only case that falls back to the defined, honest 0.
+if jq -e 'type == "object" and (.khs | type) == "string" and has("stats")' > /dev/null 2>&1 <<< "$result"; then
 	khs=$(jq -r '.khs' <<< "$result")
 	stats=$(jq -c '.stats' <<< "$result")
 else
-	# The timed child was killed, crashed, or produced garbage. This is almost always the collector itself
-	# (curl/bloxsense/jq/the /proc scans) failing to finish inside its own budget under heavy CPU contention on
-	# a small cpuset (see the file header comment and tests/hive/test_rx_under_load.sh) - NOT xmrig being down:
-	# a genuinely unowned API port, a refused connection, or a real 0 hashrate all resolve INSIDE the child,
-	# fast, well within budget, and land in the `rc == 0` branch above with an honest, immediate 0 - none of
-	# those ever reach this branch. So it is safe to answer from the last REAL sample this exact xmrig instance
-	# produced (see run()'s cache write), bounded to CACHE_MAX_AGE_S seconds old, and only after re-confirming,
-	# fresh, right here - never from a stale variable - that the cached pid is still running, is still the same
-	# instance (its own /proc start time still matches what was cached, not just its pid, which gets reused),
-	# and still owns this package's xmrig binary. Every check below is a builtin, a single cheap `readlink`, or
-	# one `awk` for the age subtraction - deliberately minimal, since this path only runs when the system is
-	# already struggling to keep up with the 3.0 s budget.
-	cache_used=0
-	if [[ -f $CACHEFILE ]]; then
-		c_ts="" c_pid="" c_start="" c_khs="" c_stats=""
-		while IFS='=' read -r ck cv; do
-			case $ck in ts) c_ts=$cv ;; pid) c_pid=$cv ;; start) c_start=$cv ;; khs) c_khs=$cv ;; stats) c_stats=$cv ;; esac
-		done < "$CACHEFILE" 2>/dev/null
-		if [[ -n $c_ts && -n $c_pid && -n $c_start && -n $c_khs && -n $c_stats ]]; then
-			age=$(awk -v t="$c_ts" -v n="$(now)" 'BEGIN{a=n-t; if (a<0) a=0; printf "%.0f", a}')
-			live_start=$(_rx_pid_start "$c_pid")
-			if [[ -n $live_start && $live_start == "$c_start" && $age -le $CACHE_MAX_AGE_S ]] &&
-			   [[ $(readlink "$PROC/$c_pid/exe" 2>/dev/null) == "$PKG/xmrig" ]]; then
-				khs=$c_khs; stats=$c_stats; cache_used=1
-				note_state cached "$age"
-			fi
-		fi
-	fi
-	if (( ! cache_used )); then
-		note_state unavailable   # no usable cache either - land on the defined fallback, exactly as before
-		fallback ""
-	fi
+	note_state unavailable
+	fallback ""
 fi

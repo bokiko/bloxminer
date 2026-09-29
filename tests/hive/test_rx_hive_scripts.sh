@@ -6,7 +6,11 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKGSRC=$(cd "$HERE/../../bloxminer/engines/rx" && pwd)
 MANIFEST_SRC=$(cd "$HERE/../../bloxminer" && pwd)/h-manifest.conf   # shared top-level manifest (3.0.0)
-T=$(mktemp -d); trap 'kill "$API_PID" 2>/dev/null; rm -rf "$T"' EXIT
+T=$(mktemp -d)
+declare -a ALL_API_PIDS=()   # every fake-API pid THIS script ever started (kill -9 -o exactly these, never a
+	# pattern-kill: 127.0.0.1:20015 is permanently held by another, lead-owned process on shared build hosts)
+cleanup_apis() { local p; for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done; wait "${ALL_API_PIDS[@]:-}" 2>/dev/null || true; }
+trap 'cleanup_apis; rm -rf "$T"' EXIT INT TERM
 pass=0; fail=0; API_PID=
 ok()  { pass=$((pass+1)); printf '%-58s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-58s FAIL: %s\n' "$1" "$2"; }
@@ -190,9 +194,14 @@ stats_case() {   # name port summary-json backends-json-or-empty jq-assertion
 	if [[ -n $3 ]]; then
 		jq -n --argjson s "$3" --argjson b "${4:-[]}" '{summary: $s, backends: $b}' > "$T/replies.json"
 		: > "$T/api.out"
-		python3 "$HERE/fake_xmrig_api.py" "$port" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+		python3 "$HERE/fake_xmrig_api.py" "$port" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 		grep -q ready "$T/api.out" || { bad "$1" "fake API did not start: $(cat "$T/api.out")"; return; }
+		# "ready" only confirms bind()+listen() succeeded, not that the server's accept loop is actually
+		# spun up yet - a curl that lands in that gap gets "Empty reply from server" (observed, reproducible,
+		# purely a fake-server startup race, nothing to do with h-stats.sh). Confirm a REAL round-trip before
+		# handing control to h-stats.sh, so every stats_case exercises the fixture, not this race.
+		for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:$port/2/summary" && break; sleep 0.05; done
 	fi
 	export BLOX_API_PORT=$port
 	local res t0 t1
@@ -292,14 +301,14 @@ PY
 )
 reset_proc; listen 20012 1012 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "malformed JSON types (affinity as string) -> full fallback" 20012 "$SUM_OK" "$BACK_BAD_TYPES" \
-	'.khs == "0" and .stats.hs == [0]'
+stats_case "malformed JSON types (affinity as string) -> Phase A total stands, no per-core rows" 20012 "$SUM_OK" "$BACK_BAD_TYPES" \
+	'.khs == "0.00" and .stats.hs == [0.00]'
 
 BACK_NO_HASHRATE_ARRAY=$(jq -nc '[{"type": "cpu", "threads": [{"affinity": 0, "hashrate": "not-an-array"}]}]')
 reset_proc; listen 20013 1013 "$BLOX_DIR/xmrig"; task "t0" "0"
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "malformed JSON types (hashrate not an array) -> full fallback" 20013 "$SUM_OK" "$BACK_NO_HASHRATE_ARRAY" \
-	'.khs == "0" and .stats.hs == [0]'
+stats_case "malformed JSON types (hashrate not an array) -> Phase A total stands, no per-core rows" 20013 "$SUM_OK" "$BACK_NO_HASHRATE_ARRAY" \
+	'.khs == "0.00" and .stats.hs == [0.00]'
 
 BACK_NEGATIVE=$(python3 - <<'PY'
 import json
@@ -314,10 +323,13 @@ stats_case "negative rate clamps to 0 for that row, others unaffected" 20014 "$S
 	'.stats.hs == [1, 0, 1, 1] and .khs == "3.00"'
 
 BACK_NO_THREADS_KEY=$(jq -nc '[{"type": "cpu", "algo": null}]')   # legitimate: before the first pool job, no "threads" key at all
-reset_proc; listen 20015 1015 "$BLOX_DIR/xmrig"
+reset_proc; listen 20025 1025 "$BLOX_DIR/xmrig"   # NOT 20015: a long-lived, unrelated fake_xmrig_api.py from
+	# another session on this shared build host squats on 127.0.0.1:20015 permanently - colliding with it here
+	# made our own instance's bind() fail, silently masking this case as a false pass (h-stats.sh's real Phase
+	# A never even ran; observed live via `ss -ltnp` + the fake server's own crash traceback).
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "cpu backend with no threads key yet (pre-first-job) -> hs [0], khs 0" 20015 "$SUM_OK" "$BACK_NO_THREADS_KEY" \
-	'.khs == "0" and .stats.hs == [0]'
+stats_case "cpu backend with no threads key yet (pre-first-job) -> Phase A total stands" 20025 "$SUM_OK" "$BACK_NO_THREADS_KEY" \
+	'.khs == "0.00" and .stats.hs == [0.00]'
 
 # ---- budget: ONE shared 3.0 s deadline - a slow step gets whatever is left, never more, and the whole run
 #      (ownership check + both curls + bloxsense) stays comfortably under 3.2 s wall time even in bad cases.
@@ -342,7 +354,7 @@ EOF
 chmod +x "$BLOX_DIR/bloxsense"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20010 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20010 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 export BLOX_API_PORT=20010
 run_hstats_timed
@@ -357,7 +369,7 @@ fi
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20016 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20016 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 reset_proc; listen 20016 1016 "$BLOX_DIR/xmrig"
 export BLOX_API_PORT=20016
@@ -395,7 +407,7 @@ hex1017=$(printf '%04X' 20017)
 } > "$PROC/net/tcp"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" --argjson d 10 '{summary: $s, backends: $b, delay: $d}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20017 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20017 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 export BLOX_API_PORT=20017
 run_hstats_timed
@@ -423,7 +435,7 @@ PY
 bloxsense_says "$(fake_topo_json 4)"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20018 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20018 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 export BLOX_API_PORT=20018
 run_hstats_timed
@@ -448,13 +460,13 @@ EOF
 chmod +x "$BLOX_DIR/bloxsense"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20019 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20019 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 export BLOX_API_PORT=20019
 run_hstats_timed
 sleep 0.5   # let init reap anything that died, before checking for survivors
 survivors1=$(pgrep -f "$MARKER1" || true)
-if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors1 ]]; then
+if awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' && [[ $(jq -r '.khs == "0.00" and .stats.hs == [0.00]' <<< "$res" 2>/dev/null) == true ]] && [[ -z $survivors1 ]]; then
 	ok "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s (${elapsed}s)"
 else
 	bad "SIGTERM-ignoring bloxsense: killed, no survivors, < 3.0 s" "elapsed=${elapsed}s survivors=[$survivors1] $res"
@@ -506,7 +518,7 @@ EOF
 chmod +x "$BLOX_DIR/bloxsense"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
 : > "$T/api.out"
-python3 "$HERE/fake_xmrig_api.py" 20026 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+python3 "$HERE/fake_xmrig_api.py" 20026 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 
 cat > "$T/wrapper.sh" <<WRAP
@@ -528,7 +540,7 @@ caller_alive=$(pgrep -f "$CALLER_MARKER" || true)
 bloxsense_survivors=$(pgrep -f "$MARKER3" || true)
 elapsed=$(jq -r '.elapsed' <<< "$res" 2>/dev/null); [[ -n $elapsed && $elapsed != null ]] || elapsed=99
 if [[ -n $caller_alive ]] && [[ -z $bloxsense_survivors ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' \
-	&& [[ $(jq -r '.khs == "0" and .stats.hs == [0]' <<< "$res" 2>/dev/null) == true ]]
+	&& [[ $(jq -r '.khs == "0.00" and .stats.hs == [0.00]' <<< "$res" 2>/dev/null) == true ]]
 then
 	ok "process-group isolation: caller's group survives, bloxsense reaped, < 3.0 s (${elapsed}s)"
 else
@@ -562,14 +574,14 @@ if [[ $(loglines "stats API unavailable") == 1 ]]; then ok "state log: repeated 
 reset_proc; listen 20021 1021 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
 jq -n --argjson s "$SUM_OK" --argjson b "$BACK_NULLS" '{summary: $s, backends: $b}' > "$T/replies.json"
-: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20021 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20021 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 run_pkg2 20021   # recovered: verified per-core rows again
 if [[ $(loglines "recovered") == 1 && $(loglines "stats API unavailable") == 1 ]]; then ok "state log: recovery from unavailable is logged once"; else bad "state log: recovery from unavailable is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
 
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 reset_proc; listen 20022 1022 "$PKG2/xmrig"   # no tasks set up: affinity present but never independently confirmed
-: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20022 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20022 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 run_pkg2 20022
 if [[ $(loglines "affinity not verified") == 1 ]]; then ok "state log: unverified transition is logged once"; else bad "state log: unverified transition is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
@@ -578,7 +590,7 @@ if [[ $(loglines "affinity not verified") == 1 ]]; then ok "state log: repeated 
 
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 reset_proc; listen 20023 1023 "$PKG2/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
-: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20023 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+: > "$T/api.out"; python3 "$HERE/fake_xmrig_api.py" 20023 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 run_pkg2 20023   # recovered again, from unverified this time
 if [[ $(loglines "recovered") == 2 ]]; then ok "state log: recovery from unverified is logged once"; else bad "state log: recovery from unverified is logged once" "$(cat "$LOG2" 2>/dev/null)"; fi
@@ -625,6 +637,23 @@ kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 reset_proc   # a transition-worthy run (unavailable), captured without discarding stdout this time
 stdout_out=$(BLOX_DIR=$PKG2 BLOX_STATE_DIR=$STATE2 BLOX_API_PORT=20024 BLOX_PROCFS_ROOT=$PROC bash -c '. "$BLOX_DIR/h-stats.sh"' 2>/dev/null)
 if [[ -z $stdout_out ]]; then ok "state log: nothing is ever printed to stdout"; else bad "state log: nothing is ever printed to stdout" "stdout=$stdout_out"; fi
+
+# ---- no leaked fake-API child survives this script: every pid this script itself started (ALL_API_PIDS) must
+# be dead by the time the suite ends. A plain kill -0 here (with no SIGTERM+wait of its own first) would flag
+# the CURRENT stage's still-legitimately-running api as a false "leak" just because nothing has stopped it
+# YET - so this sends SIGTERM to everything tracked, waits for each (a no-op for anything already reaped), and
+# only THEN checks for survivors: a real leak is one that outlives its own SIGTERM, not one merely still alive
+# at this exact line.
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
+leaked=()
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+if [[ ${#leaked[@]} -eq 0 ]]; then
+	ok "no leaked fake-API child processes at suite end"
+else
+	bad "no leaked fake-API child processes at suite end" "still alive: ${leaked[*]}"
+	cleanup_apis
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

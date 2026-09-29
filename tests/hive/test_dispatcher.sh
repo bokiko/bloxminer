@@ -9,7 +9,11 @@
 # Usage: tests/hive/test_dispatcher.sh (Linux: needs jq, bash)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKGSRC=$(cd "$HERE/../../bloxminer" && pwd)
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d)
+S11_API_PID=""   # backstop only - killed inline right after its own case finishes; the trap exists so an
+	# abnormal exit mid-case can never leave it running (pid only, never a pattern - 127.0.0.1:20015 is
+	# permanently held by another, lead-owned process on shared build hosts)
+trap '[[ -n $S11_API_PID ]] && kill -9 "$S11_API_PID" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-68s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-68s FAIL: %s\n' "$1" "$2"; }
@@ -736,6 +740,13 @@ else
 	bad "one shell, step D: reflects new algo/port only, no staleness" "$lineD"
 fi
 if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus again): still verus's own empty answer, no leftover from step D"; else bad "one shell, step E: no leftover from step D" "$lineE"; fi
+
+if [[ -n $S11_API_PID ]] && kill -0 "$S11_API_PID" 2>/dev/null; then
+	bad "no leaked fake-API child process at suite end" "still alive: $S11_API_PID"
+	kill -9 "$S11_API_PID" 2>/dev/null
+else
+	ok "no leaked fake-API child process at suite end"
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

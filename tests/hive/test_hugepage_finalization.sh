@@ -21,8 +21,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKGSRC=$(cd "$HERE/../../bloxminer" && pwd)
 T=$(mktemp -d)
 API_PID=""
-cleanup() { [[ -n $API_PID ]] && kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null; rm -rf "$T"; }
-trap cleanup EXIT
+cleanup() { [[ -n $API_PID ]] && kill -9 "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null; rm -rf "$T"; }
+trap cleanup EXIT INT TERM
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-78s ok\n' "$1"; }
@@ -590,6 +590,13 @@ if [[ $n_zero_khs == 0 ]]; then ok "repeated timeouts: \$khs stayed valid every 
 if [[ $n_wrong_final == 0 ]]; then ok "repeated timeouts: final stayed 0 every single time (never a partial finalize)"; else bad "repeated timeouts: final stayed 0" "n_wrong_final=$n_wrong_final of 5"; fi
 if [[ $n_record_changed == 0 ]]; then ok "repeated timeouts: record byte-identical after every killed attempt - no late write, even once the FIFO is later unblocked"; else bad "repeated timeouts: record byte-identical after every killed attempt" "n_record_changed=$n_record_changed of 5"; fi
 if [[ $n_survivor == 0 ]]; then ok "repeated timeouts: NO surviving descendant left blocked on the FIFO after ANY of the 5 polls - none accumulate"; else bad "repeated timeouts: no surviving descendants accumulate" "n_survivor=$n_survivor of 5"; fi
+
+if [[ -n $API_PID ]] && kill -0 "$API_PID" 2>/dev/null; then
+	bad "no leaked fake-API child process at suite end" "still alive: $API_PID"
+	kill -9 "$API_PID" 2>/dev/null
+else
+	ok "no leaked fake-API child process at suite end"
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
