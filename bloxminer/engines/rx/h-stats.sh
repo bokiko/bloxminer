@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034   # khs and stats (set far below) are read by the Hive agent that sources this
+	# file - this directive must stay file-level (before any code at all) to cover both, so it moved up here
+	# when the deadline fallback block below became the file's first actual statement.
 # Sourced by the Hive agent: must set $khs (total kH/s) and $stats (JSON). ONE shared 3.0 s deadline for the
 # whole run.
 #
@@ -67,7 +70,18 @@
 # never survive there - confirmed on a live rig (state transitions really happened, per the state file, but no
 # diagnostic line was ever found in XMRig's log or its rotated copies). The stats log is bounded to its last
 # ~200 lines once it passes 1 MiB.
-# shellcheck disable=SC2034   # khs and stats are read by the Hive agent that sources this file
+# ONE absolute deadline for the WHOLE poll, inherited from the top-level dispatcher (bloxminer/h-stats.sh),
+# which computes it at the TRUE poll entry - before even engine selection, let alone anything below. Only
+# computed here as a fallback, for when this file is sourced standalone (every test in this repo, and any
+# direct invocation with no dispatcher above it) - either way, manifest parsing, PORT/PKG derivation and the
+# LIB heredoc all happen AFTER this point, so they count against the budget too, never for free.
+if [[ -z ${DEADLINE_US:-} ]]; then
+	__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
+	__t_us="${__t%%.*}${__t#*.}"
+	DEADLINE_US=$(( __t_us + 2400000 ))
+	unset __t __t_us
+fi
+
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
 
 PROC=${BLOX_PROCFS_ROOT:-/proc}          # /proc path prefix; tests only
@@ -370,19 +384,27 @@ run() {
 
 	complete=$(jq -r 'all(.[]; .khs != null)' <<< "$rows")
 	phaseb_total=$(jq -r '[.[].khs] | map(select(. != null)) | add // 0' <<< "$rows" | awk '{printf "%.2f", $1}')
-	consistent=1
-	awk -v pb="$phaseb_total" -v pa="$khs_fresh" 'BEGIN{ exit !(pb+0 == 0 && pa+0 > 0) }' && consistent=0
+	# consistent := Phase A itself has no confident positive rate (khs_fresh == 0 - nothing to protect a
+	# complete Phase B reading from), OR the two totals agree within 10% of Phase A's own value. A near-zero
+	# Phase B total quietly replacing a HEALTHY (positive) Phase A rate is exactly the false-zero this rule
+	# exists to catch - an exact-zero special case alone is not enough, hence the proportional tolerance.
+	consistent=0
+	awk -v b="$phaseb_total" -v a="$khs_fresh" 'BEGIN{
+		if (a+0 == 0) { exit 0 }
+		d = b - a; if (d < 0) d = -d
+		exit !(d <= 0.10 * a)
+	}' && consistent=1
 	if [[ $complete == true && $consistent == 1 ]]; then
+		# Phase B's total AND its own stats replace Phase A's - never a mixed payload (Phase A's number with
+		# Phase B's rows, or vice versa): either Phase B is trusted whole, or Phase A's whole result stands.
 		khs=$phaseb_total
-	else
-		khs=$khs_fresh
-	fi
-	stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
-		--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
-		--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
-		'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
-		 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
-	write_result "$khs" "$stats"
+		stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
+			--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
+			--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
+			 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
+		write_result "$khs" "$stats"
+	fi   # else: Phase A's already-written result (khs_fresh + its own stats) stands, completely untouched
 
 	# enrichment cache: TEMPERATURE only, keyed by this xmrig instance (pid + its own /proc start time) - see
 	# the file header. Never khs.
@@ -402,10 +424,9 @@ BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for th
 KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.7 s, leaving 0.3 s of
                     # slack for this wrapper, so the whole run stays under 3.0 s even in the worst case
                     # (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
-# ONE absolute deadline, computed HERE, before the child is even launched - process setup (setsid, exec, LIB
-# sourcing) counts against the budget, not just the child's own post-launch work, and the parent's own alarm
-# below derives its sleep from the SAME value, not a second, independently-drifting 2.4 s timer of its own.
-now_us; DEADLINE_US=$(( REPLY + BUDGET_US ))
+# $DEADLINE_US itself was already computed at the very top of this file (inherited from the dispatcher, or a
+# standalone fallback) - not re-derived here, which would silently grant back whatever the manifest/PORT/LIB
+# setup above already spent.
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at each phase boundary - never
 # captured from the child's stdout. Never a pipe: a command-substitution pipe only reaches EOF once every
 # process that ever held its write end (including an orphan that somehow escaped the kill) has closed it, so a

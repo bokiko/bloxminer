@@ -11,6 +11,13 @@ BLOX_HP_T0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}   # Round 5c: this poll'
 	# can be bounded to whatever remains of the SHARED ~3.0 s poll budget once the engine's own collection below
 	# has run - see h-common.sh's finalize_rx_hugepages_bounded. Round 5e: bash 5's own builtin EPOCHREALTIME
 	# (no fork), falling back to `date +%s.%N` only if unset (an older bash).
+# ONE absolute deadline for the WHOLE poll, computed at the true entry point - before manifest/config parsing,
+# engine selection, or anything else below, all of which count against the shared budget just as much as the
+# engine's own collection does. Exported so the engine h-stats.sh sourced below inherits this SAME value
+# (its own DEADLINE_US computation is only a fallback for when it is sourced standalone, e.g. by a test, with
+# no dispatcher entry point above it to have set this already).
+BLOX_HP_T0_US="${BLOX_HP_T0%%.*}${BLOX_HP_T0#*.}"
+export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))   # 2.4 s of the shared 3.0 s budget - matches both engines' BUDGET_US
 BLOX_DIR=${BLOX_DIR:-/hive/miners/custom/bloxminer}
 if ! . "$BLOX_DIR/h-manifest.conf" 2>/dev/null || ! . "$BLOX_DIR/h-common.sh" 2>/dev/null; then
 	khs=0; stats=""; return 0 2>/dev/null || exit 0

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034   # khs and stats (set far below) are read by the Hive agent that sources this
+	# file - this directive must stay file-level (before any code at all) to cover both.
 # Sourced by the Hive agent: must set $khs (total kH/s) and $stats (JSON). The miner does the work (topology,
 # temperatures, power, freshness); this script only reads its local API and checks the reply is complete.
 # Rows: one per physical core (SMT threads summed) when every thread is bound and the topology resolves,
@@ -30,7 +32,18 @@
 # stays in the SAME process group as this whole collection (a bare `timeout` would otherwise start `nc` in a
 # NEW group of its own, which the outer group-kill below could not reach - the exact class of bug rx's own
 # bloxsense call already guards against the same way).
-# shellcheck disable=SC2034   # khs and stats are read by the Hive agent that sources this file
+# ONE absolute deadline for the WHOLE poll, inherited from the top-level dispatcher (bloxminer/h-stats.sh),
+# which computes it at the TRUE poll entry - before even engine selection, let alone anything below. Only
+# computed here as a fallback, for when this file is sourced standalone (every test in this repo, and any
+# direct invocation with no dispatcher above it) - either way, manifest parsing and the LIB heredoc below both
+# happen AFTER this point, so they count against the budget too, never for free.
+if [[ -z ${DEADLINE_US:-} ]]; then
+	__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
+	__t_us="${__t%%.*}${__t#*.}"
+	DEADLINE_US=$(( __t_us + 2400000 ))
+	unset __t __t_us
+fi
+
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
 ENGINE_VERSION=3.0.0   # the frozen ccminer engine's own release version (this file never rebuilds it)
 
@@ -200,15 +213,21 @@ run() {
 	(( ok )) || return 0   # Phase B did not validate - Phase A's answer (already written) stands, unchanged
 
 	local khs_b; khs_b=$(printf '%s\n' "${hs[@]}" | awk '{s+=$1} END{printf "%.2f", s}')
-	# consistent := not (Phase B's total is 0 while Phase A's, from the SAME poll, was positive) - a complete,
-	# validly-formatted cores reply summing to exactly 0 right after summary reported a positive FRESHKHS is
-	# the false-zero this review caught, not a fresher answer, so Phase A's total stands; the per-core rows are
-	# still shown (they are structurally valid), just not trusted to override the top-level rate.
-	if awk -v b="$khs_b" -v a="$khs_a" 'BEGIN{ exit !(b+0 == 0 && a+0 > 0) }'; then
-		khs=$khs_a
-	else
-		khs=$khs_b
-	fi
+	# consistent := Phase A itself has no confident positive rate (khs_a == 0 - nothing to protect a
+	# structurally-valid Phase B reading from), OR the two totals agree within 10% of Phase A's own value. A
+	# near-zero (not just exactly-zero) Phase B total quietly replacing a HEALTHY Phase A rate is exactly the
+	# false-zero this review caught - an exact-zero special case alone is not enough, hence the tolerance.
+	# When inconsistent, Phase A's WHOLE result (already written: khs_a + its own single-row stats) stands -
+	# never a mixed payload of Phase A's number with Phase B's (contradicting) per-core rows.
+	local consistent=0
+	awk -v b="$khs_b" -v a="$khs_a" 'BEGIN{
+		if (a+0 == 0) { exit 0 }
+		d = b - a; if (d < 0) d = -d
+		exit !(d <= 0.10 * a)
+	}' && consistent=1
+	(( consistent )) || return 0
+
+	khs=$khs_b
 	n=${#hs[@]}
 	stats=$(jq -nc \
 		--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
@@ -229,10 +248,9 @@ LIBEOF
 BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for the forkless budget arithmetic
                     # both this parent and the child (run(), via remaining_us) derive every timer from
 KILL_GRACE=0.3
-# ONE absolute deadline, computed HERE, before the child is even launched - process setup (setsid, exec, LIB
-# sourcing) counts against the budget, not just the child's own post-launch work, and the parent's own alarm
-# below derives its sleep from the SAME value, not a second, independently-drifting 2.4 s timer of its own.
-now_us; DEADLINE_US=$(( REPLY + BUDGET_US ))
+# $DEADLINE_US itself was already computed at the very top of this file (inherited from the dispatcher, or a
+# standalone fallback) - not re-derived here, which would silently grant back whatever the manifest/LIB setup
+# above already spent.
 
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at least once after Phase A and
 # again after Phase B if that also completes - never captured from the child's stdout (collect()/a single

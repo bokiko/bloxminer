@@ -176,33 +176,52 @@ python3 "$HERE/fake_api.py" "$PORT" "$T/replies3.json" > "$T/api3.out" 2>&1 & AP
 for _ in $(seq 50); do grep -q ready "$T/api3.out" && break; sleep 0.1; done
 grep -q ready "$T/api3.out" || bad "dispatcher: fake API startup" "$(cat "$T/api3.out" 2>/dev/null)"
 export BLOX_DIR="$BLOX_DIR3"
-cpuset=""; [[ $HAVE_TASKSET == 1 && $NPROC -ge 3 ]] && cpuset="0-2"
-saturate_cpus "$cpuset"; sleep 0.3
-n_zero=0; n_over=0; max_elapsed=0
-n_dispatcher_polls=20; [[ -n $cpuset ]] && n_dispatcher_polls=10
-for i in $(seq 1 "$n_dispatcher_polls"); do
-	t0=$(date +%s.%N)
-	if [[ -n $cpuset ]]; then
-		# shellcheck disable=SC2016
-		res=$(timeout 8 taskset -c "$cpuset" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+
+run_dispatcher_case() {   # $1 cpuset ("" = none), $2 n_polls, $3 enforce_budget (1/0)
+	local cpuset=$1 n=$2 enforce_budget=$3
+	saturate_cpus "$cpuset"; sleep 0.3
+	local n_zero=0 n_over=0 max_elapsed=0 i t0 t1 elapsed khs
+	for i in $(seq 1 "$n"); do
+		t0=$(date +%s.%N)
+		if [[ -n $cpuset ]]; then
+			# shellcheck disable=SC2016
+			res=$(timeout 8 taskset -c "$cpuset" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		else
+			# shellcheck disable=SC2016
+			res=$(timeout 8 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		fi
+		t1=$(date +%s.%N)
+		elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+		khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+		awk -v k="${khs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  dispatcher poll $i: ZERO khs ($res)"; }
+		awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over=$((n_over+1)); echo "  dispatcher poll $i: OVER BUDGET (${elapsed}s)"; }
+		awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
+	done
+	stop_saturating
+	local label="top-level dispatcher h-stats.sh (verus engine, $n polls${cpuset:+, taskset $cpuset})"
+	if [[ $n_zero == 0 && ( $enforce_budget == 0 || $n_over == 0 ) ]]; then
+		ok "$label: no false zeros$( ((enforce_budget)) && echo ", all under 3.0 s" ) (max ${max_elapsed}s, n_over=$n_over)"
 	else
-		# shellcheck disable=SC2016
-		res=$(timeout 8 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		bad "$label: no false zeros$( ((enforce_budget)) && echo ", all under budget" )" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
 	fi
-	t1=$(date +%s.%N)
-	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
-	khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
-	awk -v k="${khs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  dispatcher poll $i: ZERO khs ($res)"; }
-	awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over=$((n_over+1)); echo "  dispatcher poll $i: OVER BUDGET (${elapsed}s)"; }
-	awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
-done
-stop_saturating
-kill "$API3_PID" 2>/dev/null; wait "$API3_PID" 2>/dev/null
-if [[ $n_zero == 0 && $n_over == 0 ]]; then
-	ok "top-level dispatcher h-stats.sh (verus engine, $n_dispatcher_polls polls${cpuset:+, taskset $cpuset}): no false zeros, all under 3.0 s (max ${max_elapsed}s)"
+}
+
+run_dispatcher_case "" 20 1
+if [[ $HAVE_TASKSET == 1 ]]; then
+	# The ENTIRE sourced call through the dispatcher (manifest parsing, engine_from_config, THEN the verus
+	# engine's own collection) under small, stressed cpusets (1-3 CPUs) - proves the single absolute deadline
+	# (now computed at this TRUE poll entry, before even manifest parsing) bounds the whole thing end-to-end.
+	# Budget enforced from 3 CPUs up only, matching the engine-only case's own documented tolerance policy.
+	for want in 1 2 3; do
+		(( want <= NPROC )) || continue
+		hi=$((want - 1))
+		eb=1; (( want < 3 )) && eb=0
+		run_dispatcher_case "0-$hi" 10 "$eb"
+	done
 else
-	bad "top-level dispatcher h-stats.sh (verus engine): no false zeros, all under budget" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
+	echo "SKIP: taskset not available - dispatcher stressed-cpuset cases skipped"
 fi
+kill "$API3_PID" 2>/dev/null; wait "$API3_PID" 2>/dev/null
 
 leaked=()
 for p in "$API_PID" "$API3_PID"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done

@@ -310,6 +310,38 @@ for i in $(seq 1 "$N_POLLS"); do
 	awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
 done
 stop_saturating
+
+# ---- the ENTIRE sourced call through the TOP-LEVEL dispatcher (manifest parsing, engine_from_config,
+# THEN the engine's own collection, THEN hugepage finalization - everything a real Hive poll does, not just
+# the engine's own h-stats.sh in isolation), pinned via taskset to small, stressed cpusets (1-3 CPUs) against
+# ALL CPUs saturated - proves the single absolute deadline (now computed at this TRUE poll entry, before even
+# manifest parsing) actually bounds the whole thing end-to-end, with a stated tolerance for scheduling jitter
+# at the most extreme (1-2 CPU) tiers, matching the same tolerance policy as test_verus_under_load.sh.
+if command -v taskset > /dev/null 2>&1; then
+	NPROC=$(nproc)
+	for want in 1 2 3; do
+		(( want <= NPROC )) || continue
+		hi=$((want - 1))
+		saturate_cpus; sleep 0.3
+		t0=$(date +%s.%N)
+		# shellcheck disable=SC2016
+		res=$(timeout 5 taskset -c "0-$hi" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+		t1=$(date +%s.%N)
+		elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+		stop_saturating
+		pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+		eb=1; (( want < 3 )) && eb=0   # budget enforced from 3 CPUs up - same policy as verus's own load test
+		if awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' && { (( ! eb )) || awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}'; }; then
+			ok "top-level dispatcher h-stats.sh, taskset 0-$hi ($want CPU(s)): khs=$pkhs (${elapsed}s)"
+		else
+			bad "top-level dispatcher h-stats.sh, taskset 0-$hi ($want CPU(s)): khs > 0$( ((eb)) && echo ", < 3.5s" )" \
+				"elapsed=${elapsed}s res=$res"
+		fi
+	done
+else
+	echo "SKIP: taskset not available - top-level dispatcher stressed-cpuset case skipped"
+fi
+
 kill "$API3_PID" 2>/dev/null; wait "$API3_PID" 2>/dev/null
 unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT BLOX_STATE_DIR
 

@@ -238,20 +238,31 @@ PY
 )
 reset_proc; listen 20002 1002 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "null thread rates -> row marked null (never fabricated 0), Phase A's total stands" 20002 "$SUM_OK" "$BACK_NULLS" \
-	'.stats.hs == [null, null, 5, null] and .khs == "0.00"'
+stats_case "null thread rates -> incomplete, Phase A's WHOLE result stands (never a mixed payload)" 20002 "$SUM_OK" "$BACK_NULLS" \
+	'.khs == "0.00" and .stats.hs == [0]'
 
 SUM_POS=$(jq -nc '{uptime: 321, connection: {accepted: 15, rejected: 1}, algo: "rx/0", version: "6.26.0",
                    donate_level: 0, hashrate: {total: [6000, null, null]}}')   # a real, positive fresh rate
 reset_proc; listen 20027 1027 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
-stats_case "positive summary + null detail rows -> Phase A's positive total kept, not a null-as-0 partial sum" \
-	20027 "$SUM_POS" "$BACK_NULLS" '.khs == "6.00" and .stats.hs == [null, null, 5, null]'
+stats_case "positive summary + null detail rows -> Phase A's WHOLE result kept, never a mixed payload" \
+	20027 "$SUM_POS" "$BACK_NULLS" '.khs == "6.00" and .stats.hs == [6]'
 
 reset_proc; listen 20028 1028 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
 bloxsense_says "$(fake_topo_json 4)"
 stats_case "positive summary + all-missing detail (backends empty) -> Phase A's positive total kept" \
 	20028 "$SUM_POS" "$(jq -nc '[]')" '.khs == "6.00" and .stats.hs == [6]'
+
+BACK_NEARZERO=$(python3 - <<'PY'
+import json
+threads = [{"affinity": c, "hashrate": [10.0, None, None]} for c in range(4)]   # complete, real, but tiny
+print(json.dumps([{"type": "cpu", "threads": threads}]))
+PY
+)
+reset_proc; listen 20029 1029 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "positive summary + complete-but-near-zero detail (>10% off) -> Phase A's WHOLE result kept" \
+	20029 "$SUM_POS" "$BACK_NEARZERO" '.khs == "6.00" and .stats.hs == [6]'
 
 BACK_ZERO=$(python3 - <<'PY'
 import json
