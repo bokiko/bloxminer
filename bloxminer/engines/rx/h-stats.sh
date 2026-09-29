@@ -57,7 +57,13 @@ algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null); [
 STATEDIR=${BLOX_STATE_DIR:-}
 if [[ -z $STATEDIR ]]; then [[ -d /run/hive ]] && STATEDIR=/run/hive || STATEDIR=$PKG; fi
 STATEFILE="$STATEDIR/.bloxminer-rx-hstats-state"
-export PROC PKG PORT VER algo STATEFILE CUSTOM_LOG_BASENAME
+# CACHEFILE: the rx engine's own last-known-good sample (this file's path alone keys it to "rx" - the verus
+# engine has an entirely separate state directory/file, so an engine switch can never read the other engine's
+# cache by accident; see the pid+start check below for protection against a NEW rx miner instance reusing the
+# same file). Written only on a real, freshly collected sample (see run()'s tail); read only when the timed
+# child below misses its deadline (see the rc!=0 branch at the bottom of this file).
+CACHEFILE="$STATEDIR/.bloxminer-rx-hstats-cache"
+export PROC PKG PORT VER algo STATEFILE CACHEFILE CUSTOM_LOG_BASENAME
 
 # The whole collection lives in one function library file so the parent (for its own fallback-on-timeout path)
 # and the timed child (for the real work) run the exact same code - nothing is duplicated or re-typed.
@@ -68,6 +74,27 @@ LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-lib.XXXXXX") || {
 cat > "$LIB" <<'LIBEOF'
 now() { date +%s.%N; }
 remaining() { awk -v s="$t0" -v n="$(now)" -v b="$BUDGET" 'BEGIN{r=b-(n-s); if (r<0) r=0; printf "%.2f", r}'; }
+
+# CACHE_MAX_AGE_S: how old a last-known-good sample (see CACHEFILE below) may be before it is no longer used to
+# answer a poll whose own fresh collection missed the deadline. 90 s: comfortably smooths over a CPU-load blip
+# (Hive's own zero-hashrate watchdog acts on the order of minutes, not seconds - see README's stall section)
+# while still bounding how long a truly wedged collector or a dead miner (once it stops even reaching the fast,
+# honest 0 path near the top of run()) can go on showing a stale positive rate.
+CACHE_MAX_AGE_S=90
+
+# _rx_pid_start <pid> - that pid's own starttime field (22nd field of /proc/<pid>/stat, robust to spaces or
+# parens inside the comm field by scanning from the LAST ')'), or empty if unreadable. No fork: `read` is a
+# builtin and the here-string does not exec anything either. Used to tell a genuinely still-running xmrig
+# instance apart from a DIFFERENT process that later reused the same pid (a real occurrence on a long-running
+# rig) - a plain pid match alone would not be enough to trust a cached sample against.
+_rx_pid_start() {
+	local f="$PROC/$1/stat" line rest arr
+	[[ -r $f ]] || return 0
+	read -r line < "$f" 2>/dev/null || return 0
+	rest=${line##*) }
+	read -r -a arr <<< "$rest"
+	printf '%s' "${arr[19]:-}"
+}
 have_budget() { awk -v r="$1" 'BEGIN{exit !(r > 0.05)}'; }   # < 50 ms left is not worth attempting
 cap() { awk -v r="$1" -v c="$2" 'BEGIN{print (r<c)?r:c}'; }   # min(remaining, nominal per-step ceiling)
 
@@ -84,6 +111,7 @@ note_state() {   # $1 = ok | unverified | unavailable; logs only on a transition
 		unavailable) msg="bloxminer-x: stats API unavailable" ;;
 		unverified)  msg="bloxminer-x: affinity not verified, showing per-thread rows" ;;
 		ok)          [[ -n $prev ]] && msg="bloxminer-x: recovered" ;;
+		cached)      msg="bloxminer-x: stats collector missed its deadline under CPU load - showing the last known-good sample (${2:-?}s old) until a fresh one is collected" ;;
 	esac
 	if [[ -n $msg ]]; then
 		{
@@ -120,7 +148,7 @@ valid_backends() {
 # function, whether called directly by the parent's own fallback path or, normally, inside the timed child).
 run() {
 	local r port_hex inode owner_pid owned fd_dir sum back uptime acc rej threads naff sense pkg_temp power_raw
-	local percore task_set api_set rows
+	local percore task_set api_set rows pidstart
 
 	r=$(remaining); have_budget "$r" || { note_state unavailable; fallback ""; return 0; }
 
@@ -241,6 +269,22 @@ run() {
 		--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
 		'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
 		 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
+
+	# last-known-good cache: written ONLY here - the single place in run() reflecting a real, freshly
+	# collected sample (this line is only ever reached after a verified-owned xmrig answered both API calls
+	# with schema-valid, non-empty thread data). $khs may itself legitimately be 0 here (e.g. every thread's
+	# hashrate[0] is genuinely 0 during a real stall) - that honest value is exactly what gets cached, so a
+	# later poll that both misses its own deadline AND finds this cache can never show a stale POSITIVE number
+	# over a real stall. Every earlier `fallback ""` return in run() above (no owner, API unreachable/invalid,
+	# no pool job yet) never reaches this line, so none of those - genuinely benign or genuinely dead - can
+	# ever overwrite a good cached sample with a placeholder. Keyed by this xmrig instance's pid AND its own
+	# /proc start time (never pid alone - pids get reused) so a later restart or an engine switch back to rx
+	# can never have its own first poll answered from a previous, unrelated instance's numbers.
+	pidstart=$(_rx_pid_start "$owner_pid")
+	if [[ -n $pidstart ]]; then
+		{ printf 'ts=%s\npid=%s\nstart=%s\nkhs=%s\nstats=%s\n' "$(now)" "$owner_pid" "$pidstart" "$khs" "$stats" \
+			> "$CACHEFILE.tmp" && mv -f "$CACHEFILE.tmp" "$CACHEFILE"; } 2>/dev/null
+	fi
 }
 
 # The only stdout this whole library ever produces: one JSON line, printed once run() has set $khs/$stats.
@@ -338,6 +382,36 @@ if [[ $rc == 0 ]] && jq -e 'type == "object" and (.khs | type) == "string" and h
 	khs=$(jq -r '.khs' <<< "$result")
 	stats=$(jq -c '.stats' <<< "$result")
 else
-	note_state unavailable   # the child was killed, crashed, or produced garbage - always land on the defined fallback
-	fallback ""
+	# The timed child was killed, crashed, or produced garbage. This is almost always the collector itself
+	# (curl/bloxsense/jq/the /proc scans) failing to finish inside its own budget under heavy CPU contention on
+	# a small cpuset (see the file header comment and tests/hive/test_rx_under_load.sh) - NOT xmrig being down:
+	# a genuinely unowned API port, a refused connection, or a real 0 hashrate all resolve INSIDE the child,
+	# fast, well within budget, and land in the `rc == 0` branch above with an honest, immediate 0 - none of
+	# those ever reach this branch. So it is safe to answer from the last REAL sample this exact xmrig instance
+	# produced (see run()'s cache write), bounded to CACHE_MAX_AGE_S seconds old, and only after re-confirming,
+	# fresh, right here - never from a stale variable - that the cached pid is still running, is still the same
+	# instance (its own /proc start time still matches what was cached, not just its pid, which gets reused),
+	# and still owns this package's xmrig binary. Every check below is a builtin, a single cheap `readlink`, or
+	# one `awk` for the age subtraction - deliberately minimal, since this path only runs when the system is
+	# already struggling to keep up with the 3.0 s budget.
+	cache_used=0
+	if [[ -f $CACHEFILE ]]; then
+		c_ts="" c_pid="" c_start="" c_khs="" c_stats=""
+		while IFS='=' read -r ck cv; do
+			case $ck in ts) c_ts=$cv ;; pid) c_pid=$cv ;; start) c_start=$cv ;; khs) c_khs=$cv ;; stats) c_stats=$cv ;; esac
+		done < "$CACHEFILE" 2>/dev/null
+		if [[ -n $c_ts && -n $c_pid && -n $c_start && -n $c_khs && -n $c_stats ]]; then
+			age=$(awk -v t="$c_ts" -v n="$(now)" 'BEGIN{a=n-t; if (a<0) a=0; printf "%.0f", a}')
+			live_start=$(_rx_pid_start "$c_pid")
+			if [[ -n $live_start && $live_start == "$c_start" && $age -le $CACHE_MAX_AGE_S ]] &&
+			   [[ $(readlink "$PROC/$c_pid/exe" 2>/dev/null) == "$PKG/xmrig" ]]; then
+				khs=$c_khs; stats=$c_stats; cache_used=1
+				note_state cached "$age"
+			fi
+		fi
+	fi
+	if (( ! cache_used )); then
+		note_state unavailable   # no usable cache either - land on the defined fallback, exactly as before
+		fallback ""
+	fi
 fi

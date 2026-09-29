@@ -40,14 +40,28 @@ p_rx() { sed -n "s|^$1=||p" "$RXPROV"; }
 [[ $(p_rx branding_patch_sha256) == "$(sha256sum "$ROOT/build/branding.patch" | cut -d' ' -f1)" ]] || { echo "rx provenance branding_patch_sha256 does not match this repo's build/branding.patch"; exit 1; }
 [[ $(p_rx blox_display_version) == "$VER" ]] || { echo "rx provenance blox_display_version ($(p_rx blox_display_version)) does not match package version $VER"; exit 1; }
 
-# bloxsense is compiled from these three sources (build/build-rx.sh's own HELPERS list, recorded at build
-# time as helper.bloxsense/<file>.sha256); the binary above is only verified against the bytes it actually
-# WAS built from - it says nothing about the sources THIS repo is about to ship next to it. Refuse to package
-# if any of the three has changed since that build, exactly as if the binary itself had changed.
-for BS in blox.h blox_sys.cpp bloxsense.cpp; do
-	[[ $(p_rx "helper.bloxsense/$BS.sha256") == "$(sha256sum "$ROOT/bloxsense/$BS" | cut -d' ' -f1)" ]] ||
-		{ echo "bloxsense/$BS does not match its recorded source hash in $RXPROV - refusing to package"; exit 1; }
-done
+# build/build-rx.sh records a sha256 for EVERY entry of its own HELPERS array at build time (as
+# helper.<path>.sha256 lines in $RXPROV) - not just the three bloxsense sources: the two donate0/branding
+# patches (already re-checked above by name), the rx engine's own gated scripts (h-config.sh/h-run.sh/
+# h-stats.sh), the shared h-manifest.conf, and build-rx.sh/package.sh themselves. The binary above is only
+# verified against the bytes it actually WAS built from - it says nothing about whether THIS repo's copy of
+# any of those helper files has since drifted from what the build saw. Walk every helper.*.sha256 line
+# recorded in the provenance (rather than a hand-maintained list here, which is exactly what let this drift
+# happen: package.sh only re-checked 3 of build-rx.sh's 11 HELPERS) and refuse to package if any one of them
+# no longer matches this repo's current copy - including package.sh's own hash, so a package.sh edit made
+# after the RX engine was last built is caught here, not shipped silently next to a provenance that describes
+# different bytes.
+rx_helpers_checked=0
+while IFS='=' read -r key val; do
+	[[ -n $key ]] || continue
+	hp=${key#helper.}; hp=${hp%.sha256}
+	[[ -n $hp ]] || continue
+	[[ -f "$ROOT/$hp" ]] || { echo "$hp: recorded in $RXPROV as a build/build-rx.sh HELPERS entry but missing from this repo - refusing to package"; exit 1; }
+	got=$(sha256sum "$ROOT/$hp" | cut -d' ' -f1)
+	[[ $got == "$val" ]] || { echo "$hp does not match its recorded source hash in $RXPROV (build/build-rx.sh HELPERS) - refusing to package"; exit 1; }
+	rx_helpers_checked=$((rx_helpers_checked + 1))
+done < <(grep '^helper\.' "$RXPROV")
+(( rx_helpers_checked > 0 )) || { echo "$RXPROV: no helper.*.sha256 entries found - build/build-rx.sh HELPERS provenance is missing, refusing to package"; exit 1; }
 
 REPO_COMMIT=${BLOXMINER_REPO_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}
 

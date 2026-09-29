@@ -12,7 +12,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - run: sudo apt-get install -y -qq shellcheck jq netcat-openbsd
+      - name: apt dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && break
+            echo "apt-get update failed (attempt $i/3), retrying..." >&2
+            sleep 5
+          done
+          sudo apt-get install -y -qq shellcheck jq netcat-openbsd
       - name: syntax
         run: for f in bloxminer/*.sh build/*.sh tools/*.sh tests/*/*.sh; do bash -n "$f"; done
       - name: shellcheck
@@ -27,6 +34,10 @@ jobs:
         run: tests/hive/test_config_diff.sh
       - name: HiveOS script tests (rx under load)
         run: tests/hive/test_rx_under_load.sh
+      - name: HiveOS script tests (rx stats cache)
+        run: tests/hive/test_rx_stats_cache.sh
+      - name: HiveOS script tests (verus under load)
+        run: tests/hive/test_verus_under_load.sh
       - name: HiveOS script tests (hugepage finalization)
         run: tests/hive/test_hugepage_finalization.sh
       - name: bloxsense tests

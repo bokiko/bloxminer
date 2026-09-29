@@ -134,6 +134,49 @@ tar -C "$ROOT" --exclude=.git --exclude=.backups -cf - . | tar -C "$REPO_COPY_CO
 O="$T/ok-repo-copy"; out=$(bash "$REPO_COPY_CONTROL/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$O" 2>&1); rc=$?
 if [[ $rc == 0 && -f $O/bloxminer-3.0.0.tar.gz ]]; then ok "control: untampered repo copy -> package.sh still succeeds"; else bad "control: untampered repo copy -> package.sh still succeeds" "rc=$rc out=$out"; fi
 
+# ---- 11b: every OTHER build/build-rx.sh HELPERS entry - not just the 3 bloxsense sources checked in test 11.
+#      package.sh used to hardcode exactly those 3 and silently skip the rest (the rx engine's own gated
+#      scripts, the shared manifest, build-rx.sh/package.sh themselves); it now walks every helper.*.sha256
+#      line recorded in $RXPROV, so a one-byte edit to ANY of them must independently refuse to package.
+#      Text-append (never flip_byte's binary XOR) so each shell/conf file stays syntactically valid - the
+#      refusal must come from the sha256 mismatch, not from a broken script failing for an unrelated reason.
+tamper_append() { printf '\n# tamper (test_package_provenance.sh)\n' >> "$1"; }
+for HP in bloxminer/engines/rx/h-config.sh bloxminer/engines/rx/h-run.sh bloxminer/engines/rx/h-stats.sh \
+          bloxminer/h-manifest.conf build/build-rx.sh build/package.sh; do
+	RC="$T/repo-tamper-$(tr '/' '_' <<< "$HP")"; rm -rf "$RC"; mkdir -p "$RC"
+	tar -C "$ROOT" --exclude=.git --exclude=.backups -cf - . | tar -C "$RC" -xf -
+	tamper_append "$RC/$HP"
+	O="$T/bad-$(tr '/' '_' <<< "$HP")"; out=$(bash "$RC/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$O" 2>&1); rc=$?
+	if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "$HP" <<< "$out"; then
+		ok "tampered $HP (HELPERS, 1 line appended) -> package.sh refuses"
+	else
+		bad "tampered $HP (HELPERS, 1 line appended) -> package.sh refuses" "rc=$rc out=$out"
+	fi
+done
+
+# ---- 11c: a HELPERS file recorded in provenance but since DELETED from the repo -> refuses with a clear
+#      "missing", not an unrelated sha256sum error swallowed by set -e's bare exit.
+RC="$T/repo-tamper-missing"; rm -rf "$RC"; mkdir -p "$RC"
+tar -C "$ROOT" --exclude=.git --exclude=.backups -cf - . | tar -C "$RC" -xf -
+rm -f "$RC/bloxminer/engines/rx/h-run.sh"
+O="$T/bad-missing-helper"; out=$(bash "$RC/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$O" 2>&1); rc=$?
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "missing from this repo" <<< "$out"; then
+	ok "HELPERS file deleted from repo -> package.sh refuses with a clear message"
+else
+	bad "HELPERS file deleted from repo -> package.sh refuses with a clear message" "rc=$rc out=$out"
+fi
+
+# ---- 11d: rx provenance with its ENTIRE helper.*.sha256 section stripped (an old-format/corrupt
+#      build.provenance) -> refuses outright rather than silently treating "zero helpers" as "nothing to check"
+X11D="$T/rx-no-helpers"; copy_outdir "$RX_OUT" "$X11D"
+sed -i.bak '/^helper\./d' "$X11D/build.provenance"
+O="$T/bad-rx-no-helpers"; run_pkg "$VERUS_OUT" "$X11D" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "no helper" <<< "$out"; then
+	ok "rx provenance with no helper.*.sha256 entries -> package.sh refuses"
+else
+	bad "rx provenance with no helper.*.sha256 entries -> package.sh refuses" "rc=$rc out=$out"
+fi
+
 # ---- 12: build/build-rx.sh's own HELPERS list - every path it records a source hash for must resolve to a
 #      real file in THIS repo layout, and its own self-reference must be build/build-rx.sh, never build/build.sh
 #      (the unrelated Verus/ccminer builder) - otherwise a real build/build-rx.sh run (root, Ubuntu 22.04,
