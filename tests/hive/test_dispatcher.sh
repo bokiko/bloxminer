@@ -306,10 +306,21 @@ fi
 exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
+# A working xmrig STUB (exits 0 immediately, real exec succeeds) so a fresh rx start's own final `exec ./xmrig`
+# in engines/rx/h-run.sh SUCCEEDS - never triggers that file's own rollback_rx_hugepages_reservation EXIT trap
+# (PR #2 follow-up review), which this section does NOT intend to exercise: it tests note_rx_hugepages_start's
+# own field-writing and restore_verus_hugepages's own gating, both unrelated to that trap. The trap gets its
+# own dedicated tests further below, where the stub is deliberately removed for one case. Matches section 9/
+# 10's own stub_engine pattern (a real, fast-exiting executable, never a missing/empty placeholder).
+cat > "$BLOX_DIR/xmrig" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$BLOX_DIR/xmrig"
 SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE MEMINFO BOOTFILE
 sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
 hugepages_called() { grep -q '^hugepages ' "$SYSCTL_LOG" 2>/dev/null; }
-run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # engine binary absent -> exec fails after the hugepage step, harmless here
+run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # verus's own ./bloxminer binary is absent (exec fails harmlessly there); rx's ./xmrig is the working stub above
 # marks the CURRENT record final=1, ours=<live nr_hugepages> - simulates a successful finalize_rx_hugepages
 # poll (real end-to-end finalization behaviour, including the exact xmrig-src-derived formula, is covered in
 # tests/hive/test_hugepage_finalization.sh) so this section can test restore_verus_hugepages's OWN logic.
@@ -492,6 +503,64 @@ rm -f "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\n' > "$HUGEFILE"; ech
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "not finalized" "$T/log/bloxminer.log" 2>/dev/null; then ok "legacy pre-Round-5 record (no final=): never restored, kept, logged"; else bad "legacy pre-Round-5 record (no final=): never restored, kept, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$(cat "$HUGEFILE" 2>/dev/null) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 rm -f "$HUGEFILE"
+
+# ---- 6b. PR #2 follow-up review (Codex): a host without AES-NI must be rejected by the DISPATCHER'S OWN
+#      preflight BEFORE it ever reserves anything - reusing engines/rx/h-run.sh's own cpu_ok() (via
+#      BLOX_RX_PREFLIGHT_ONLY=1, see that file and bloxminer/h-run.sh's own comments), never a second,
+#      hand-copied flag check. Before this fix, note_rx_hugepages_start ran FIRST unconditionally, reserving
+#      ~2.4 GiB that could then never be released (XMRig never ran, so finalize_rx_hugepages - which needs a
+#      live, owned XMRig reporting hashrate - could never confirm it, and restore_verus_hugepages refuses
+#      anything not final=1): the memory stayed pinned until reboot. Now: no `hugepages -rx` call AT ALL
+#      (neither this dispatcher's own nor the engine's, since the engine is never even reached), no record
+#      written, host's own nr_hugepages left completely alone, a clean Hive error sent.
+CPUINFO_NOAES="$T/cpuinfo-noaes"
+printf 'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm\n' > "$CPUINFO_NOAES"   # every real baseline flag EXCEPT aes
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; : > "$MESSAGE_LOG"
+CPUINFO="$CPUINFO_NOAES" run_h_run
+if ! hugepages_called && [[ ! -e $HUGEFILE ]]; then
+	ok "no-AES-NI CPU: dispatcher's own preflight rejects BEFORE any reservation - no hugepages call, no record"
+else
+	bad "no-AES-NI CPU: dispatcher's own preflight rejects BEFORE any reservation" "sysctl_log=$(cat "$SYSCTL_LOG" 2>/dev/null) hugefile=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE")"
+fi
+if [[ $(cat "$PROCFILE") == 512 ]]; then ok "no-AES-NI CPU: host's own nr_hugepages (512) left completely untouched"; else bad "no-AES-NI CPU: host's own nr_hugepages left untouched" "$(cat "$PROCFILE")"; fi
+if grep -q "AES-NI" "$MESSAGE_LOG" 2>/dev/null; then ok "no-AES-NI CPU: a clean Hive error message was sent (never a silent refusal)"; else bad "no-AES-NI CPU: a clean Hive error message was sent" "$(cat "$MESSAGE_LOG" 2>/dev/null)"; fi
+
+# ---- 6c. An rx start that fails AFTER the dispatcher's own reservation (here: the engine binary happens to be
+#      missing - any other post-reservation failure is covered the exact same way, by the same general
+#      EXIT-trap rollback in engines/rx/h-run.sh, not just this one specific cause) must roll back to the
+#      ORIGINAL prior value, verified by readback, record removed - never left pinned. Distinct from 6b above:
+#      that one never reserves at all; this one must reserve FIRST (a real, valid CPU), then roll back.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"
+rm -f "$BLOX_DIR/xmrig"   # remove the working stub added at the top of this section, for this one case only
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"
+run_h_run
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 2 ]]; then
+	ok "post-reservation failure (missing xmrig binary): the dispatcher's own reservation DID happen first (hugepages -rx twice - this dispatcher's own + the rx engine's own, exactly as a normal fresh start)"
+else
+	bad "post-reservation failure: the dispatcher's own reservation happened first (hugepages -rx twice)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ $(cat "$PROCFILE") == 512 ]]; then
+	ok "post-reservation failure: rolled back to the ORIGINAL prior value (512), verified by readback"
+else
+	bad "post-reservation failure: rolled back to the ORIGINAL prior value (512)" "$(cat "$PROCFILE")"
+fi
+if [[ ! -e $HUGEFILE ]]; then
+	ok "post-reservation failure: ownership record removed (rollback verified successful)"
+else
+	bad "post-reservation failure: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"
+fi
+if grep -q "rolled back vm.nr_hugepages to 512" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "post-reservation failure: rollback logged to this package's own log"
+else
+	bad "post-reservation failure: rollback logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+# restore the working stub in case anything later in this file still expects it
+cat > "$BLOX_DIR/xmrig" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$BLOX_DIR/xmrig"
 
 # ============================================================== 7. stats never from the previous engine
 # Neither fixture engine's real API is running here, so each one falls back to its own DEFINED no-API answer

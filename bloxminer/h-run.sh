@@ -33,7 +33,23 @@ fi
 # hook. Track only the reservation THIS package made (see h-common.sh): record the pre-rx value once before rx
 # starts, restore it once before verus starts next. A fresh install, or a foreign reservation this package
 # never touched, is left exactly as found either way.
+#
+# PR #2 review (Codex): this used to call note_rx_hugepages_start (which reserves ~2.4 GiB via `hugepages -rx`)
+# UNCONDITIONALLY, before the rx engine's own h-run.sh ever got a chance to reject a host without AES-NI - and
+# because XMRig then never ran, that reservation's ownership record could never finalize, permanently pinning
+# the memory until reboot (engines/rx/h-run.sh's own CPU gate rejects the start, but only AFTER this dispatcher
+# had already reserved). Fixed by running the SAME check first: the rx engine's own h-run.sh supports being
+# sourced in a preflight-only mode (BLOX_RX_PREFLIGHT_ONLY=1) that runs nothing but its own cpu_ok() and
+# returns its exact exit status - reusing that one function directly, rather than a second, hand-copied CPU
+# flag check here, is what makes it impossible for the two to ever drift apart. No reservation is made at all
+# on a rejected host; engines/rx/h-run.sh's own general EXIT-trap rollback (see its own header) is the
+# remaining safety net for any OTHER reason an rx start might fail after this dispatcher's own reservation.
 if [[ $engine == rx ]]; then
+	if ! BLOX_RX_PREFLIGHT_ONLY=1 . "$BLOX_DIR/engines/rx/h-run.sh"; then
+		fail "BloxMiner-X needs an x86-64 CPU with AES-NI (RandomX requires AES acceleration)"
+		sleep 60
+		return 1 2>/dev/null || exit 1
+	fi
 	note_rx_hugepages_start
 elif [[ $engine == verus ]]; then
 	restore_verus_hugepages
