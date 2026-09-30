@@ -191,15 +191,49 @@ run() {
 		khs=$fresh; hs=("$fresh"); temps=("${ptemp:-null}")
 	fi
 	n=${#hs[@]}
-	stats=$(jq -nc \
-		--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
-		--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
-		--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
-		--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
-		--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
-		'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
-		  algo: "verushash", ver: $ver}
-		 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+	# PR #2 follow-up review (Codex): this composition chains FOUR nested jq calls (command substitutions for
+	# hs/temp/fan/bus) into ONE outer jq call, same shape as Phase B's own final composition below - and, same
+	# as that one, any single nested call failing (a transient fork/exec failure under resource pressure - see
+	# rx/h-stats.sh's and Phase B's own history of this exact class of bug) leaves $stats empty while $khs
+	# already holds a real, positive number. Unlike Phase B's own final composition, this used to be written
+	# UNCONDITIONALLY - write_result would wrap an empty $stats as a literal empty JSON string (`"stats":""`,
+	# not the empty/malformed shape write_result's own guard below can catch, since --arg always succeeds
+	# regardless of content) and the parent would report a positive khs with NO stats at all. Validated here,
+	# the same way Phase B's own final composition already is (see that one's own comment for the shared
+	# rationale), before ever reaching write_result. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL deterministically
+	# simulates a nested jq failure for tests, the same way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL already
+	# does for write_result() itself - forcing the exact downstream symptom directly is more reliable than
+	# trying to reproduce the actual fork-pressure root cause on demand.
+	if [[ -n ${BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL:-} ]]; then
+		stats=""
+	else
+		stats=$(jq -nc \
+			--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
+			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
+			--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
+			--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
+			--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
+			  algo: "verushash", ver: $ver}
+			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+	fi
+	if ! jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$stats"; then
+		dbg "phase A: stats composition invalid/empty (was: '$stats') - writing the honest minimal object instead, khs=$khs stands"
+		# The honest minimal object: $khs (already a validated plain number, see num() above) and the other
+		# already-known scalars, in the SAME minimal shape DISPATCH_FALLBACK_STATS (bloxminer/h-stats.sh) uses
+		# for its own last-resort fallback - never silently dropping to an empty/missing stats while a real,
+		# positive khs is reported right next to it.
+		stats=$(jq -nc --argjson k "$khs" --argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" \
+			'{hs: [$k], hs_units: "khs", temp: [null], fan: [0], bus_numbers: [null], uptime: $uptime, ar: [$acc, $rej], algo: "verushash"}' 2>/dev/null)
+		if [[ $stats != "{"*"}" ]]; then
+			# even the minimal composition's own jq call failed (jq itself broken/missing, or still under the
+			# same resource pressure) - printf, no fork: $khs/$acc/$rej/$up are all already validated numeric
+			# (num()/int() above, or produced by this function itself), safe to interpolate raw; no string
+			# field (ver) is included here at all, avoiding any escaping risk from an untrusted string.
+			printf -v stats '{"hs":[%s],"hs_units":"khs","temp":[null],"fan":[0],"bus_numbers":[null],"uptime":%s,"ar":[%s,%s],"algo":"verushash"}' "$khs" "${up%.*}" "$acc" "$rej"
+		fi
+	fi
 	write_result "$khs" "$stats"
 	(( stall == 1 )) && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
 	local khs_a=$khs   # Phase A's own total, kept aside - Phase B may add detail rows but may only ever

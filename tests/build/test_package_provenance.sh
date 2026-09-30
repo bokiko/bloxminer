@@ -308,6 +308,36 @@ else
 	bad "rx provenance with no helper.*.sha256 entries -> package.sh refuses" "rc=$rc out=$out"
 fi
 
+# ---- 11e: PR #2 follow-up review (Codex): "Require every expected helper provenance entry" - the gate used
+#      to only require rx_helpers_checked > 0 (at least ONE helper.*.sha256 line present and matching), never
+#      "every CURRENTLY expected one is present" - deleting exactly ONE line from an otherwise-valid
+#      build.provenance (leaving every other helper.*.sha256 line, and the binary/patch checks above, all
+#      genuinely matching) used to still pass: that one file's own bytes were simply never re-checked at all.
+#      Deletes ONLY h-run.sh's own line - every other helper (including the other rx engine scripts) stays
+#      correctly recorded - and asserts package.sh now refuses, naming the specific missing helper.
+X11E="$T/rx-missing-one-helper"; copy_outdir "$RX_OUT" "$X11E"
+sed -i.bak '/^helper\.bloxminer\/engines\/rx\/h-run\.sh\.sha256=/d' "$X11E/build.provenance"
+O="$T/bad-rx-missing-one-helper"; run_pkg "$VERUS_OUT" "$X11E" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "bloxminer/engines/rx/h-run.sh" <<< "$out" && grep -qF "missing from" <<< "$out"; then
+	ok "rx provenance with exactly ONE helper.*.sha256 line deleted (others still valid) -> package.sh refuses"
+else
+	bad "rx provenance with exactly ONE helper.*.sha256 line deleted (others still valid) -> package.sh refuses" "rc=$rc out=$out"
+fi
+
+# ---- 11f: an EXTRA/unknown helper.*.sha256 entry - one that does not correspond to anything build/
+#      build-rx.sh's own HELPERS array currently lists (e.g. a stale leftover from a renamed/removed file, or
+#      a hand-edited addition) - must also refuse, not silently hash-check it and report "fine". The extra
+#      entry's own hash is deliberately CORRECT (sha256 of a real file in this repo) - the refusal must come
+#      from it not being an expected helper at all, never from a coincidental hash mismatch.
+X11F="$T/rx-extra-helper"; copy_outdir "$RX_OUT" "$X11F"
+printf 'helper.README.md.sha256=%s\n' "$(sha256sum "$ROOT/README.md" | cut -d' ' -f1)" >> "$X11F/build.provenance"
+O="$T/bad-rx-extra-helper"; run_pkg "$VERUS_OUT" "$X11F" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "README.md" <<< "$out" && grep -qF "not in build/build-rx.sh's own current HELPERS array" <<< "$out"; then
+	ok "rx provenance with an EXTRA/unknown helper.*.sha256 entry -> package.sh refuses"
+else
+	bad "rx provenance with an EXTRA/unknown helper.*.sha256 entry -> package.sh refuses" "rc=$rc out=$out"
+fi
+
 # ---- 12: build/build-rx.sh's own HELPERS list - every path it records a source hash for must resolve to a
 #      real file in THIS repo layout, and its own self-reference must be build/build-rx.sh, never build/build.sh
 #      (the unrelated Verus/ccminer builder) - otherwise a real build/build-rx.sh run (root, Ubuntu 22.04,

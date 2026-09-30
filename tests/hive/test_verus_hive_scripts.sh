@@ -188,6 +188,36 @@ else
 	bad "write_result's own guard: a forced jq failure never overwrites an already-good prior result" "res=$res debug=$(cat "$D_DEBUG" 2>/dev/null)"
 fi
 
+# ---- PR #2 follow-up review (Codex): "Reject an empty Phase A stats composition" - Phase A's own stats
+# composition chains four nested jq calls into one outer jq call; if any one of them failed (a transient
+# fork/exec failure under resource pressure - the same class this file's own write_result() guard above
+# exists for), $stats came back empty while $khs already held a real, positive number - write_result would
+# then wrap that empty $stats as a literal empty JSON string (`"stats":""`), passing write_result's own guard
+# (which only checks the OUTER wrap succeeded, not $2's own content) and reaching $OUTFILE: the parent would
+# report a positive khs with NO stats at all. Fixed: Phase A's composition is now validated the same way
+# Phase B's own final composition already is (non-empty JSON object, hs array of numbers, temp array) before
+# ever reaching write_result; on failure, an honest minimal object (khs from the fresh reading + a single
+# minimal row) is written instead - never an empty stats. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL
+# deterministically simulates the nested-jq failure, the same way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL
+# already does for write_result() itself, above. No cores reply (empty $c, same convention as the "2.0.0
+# engine (no cores command)" case above) - Phase B then skips outright (`[[ -z $cores ]] && return 0`), so
+# Phase A's own result (the honest minimal fallback, with the fix) is what the parent actually sees, never
+# masked by a legitimate Phase B reply overwriting it regardless of whether Phase A's own fix fired.
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+D_DEBUG2="$T/phasea_debug.log"; : > "$D_DEBUG2"
+res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG2" BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL=1 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+if [[ $(jq -r '.khs == "11900.00" and .stats.hs == [11900] and (.stats.temp | type) == "array"' <<< "$res" 2>/dev/null) == true ]] \
+	&& grep -q "phase A: stats composition invalid/empty" "$D_DEBUG2"
+then
+	ok "Phase A: forced nested-jq failure -> honest minimal stats object (khs stands, never empty stats)"
+else
+	bad "Phase A: forced nested-jq failure -> honest minimal stats object (khs stands, never empty stats)" "res=$res debug=$(cat "$D_DEBUG2" 2>/dev/null)"
+fi
+
 # ---- PR #2 follow-up review round 3 (Codex): "Normalize the fallback timestamp to microseconds" - now_us()
 #      (and this file's own DEADLINE_US fallback, right at the top) used to concatenate the raw fractional
 #      string straight onto the whole-seconds part: EPOCHREALTIME's own fraction is always exactly 6 digits

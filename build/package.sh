@@ -51,17 +51,44 @@ p_rx() { sed -n "s|^$1=||p" "$RXPROV"; }
 # no longer matches this repo's current copy - including package.sh's own hash, so a package.sh edit made
 # after the RX engine was last built is caught here, not shipped silently next to a provenance that describes
 # different bytes.
+#
+# PR #2 follow-up review (Codex): this used to only require rx_helpers_checked > 0 - i.e. "at least one
+# helper.*.sha256 line was present and matched", never "every CURRENTLY expected one was present". A single
+# line deleted from an otherwise-valid $RXPROV (accidentally, or by a tampered/truncated provenance) simply
+# made the loop below run one fewer iteration - that one file's own bytes were never re-checked at all, and
+# the gate still happily reported "fine" as long as at least one OTHER line remained. Fixed: the set of
+# RECORDED helper names is now compared against the set of EXPECTED ones - parsed straight out of build/
+# build-rx.sh's own HELPERS array (the exact same extraction tests/build/test_package_provenance.sh's own
+# test 12 already uses to prove every entry resolves to a real file - never a second, hand-maintained list
+# here, which is exactly what let this drift happen the FIRST time, per the paragraph above) - refusing on
+# either a MISSING entry (expected by HELPERS right now, but no longer recorded) or an EXTRA one (recorded,
+# but no longer in HELPERS - a stale entry from a renamed/removed file that would otherwise still get
+# silently hash-checked and reported as "fine").
+mapfile -t rx_expected_helpers < <(sed -n "/^HELPERS=(/,/)/p" "$ROOT/build/build-rx.sh" | tr -d '()' | sed 's/^HELPERS=//' | tr -s ' \t\n' '\n' | grep -v '^$')
+(( ${#rx_expected_helpers[@]} > 0 )) || { echo "build/build-rx.sh: could not parse its own HELPERS array - refusing to package"; exit 1; }
+
 rx_helpers_checked=0
+declare -A rx_recorded_helpers=()
 while IFS='=' read -r key val; do
 	[[ -n $key ]] || continue
 	hp=${key#helper.}; hp=${hp%.sha256}
 	[[ -n $hp ]] || continue
+	rx_recorded_helpers[$hp]=1
 	[[ -f "$ROOT/$hp" ]] || { echo "$hp: recorded in $RXPROV as a build/build-rx.sh HELPERS entry but missing from this repo - refusing to package"; exit 1; }
 	got=$(sha256sum "$ROOT/$hp" | cut -d' ' -f1)
 	[[ $got == "$val" ]] || { echo "$hp does not match its recorded source hash in $RXPROV (build/build-rx.sh HELPERS) - refusing to package"; exit 1; }
 	rx_helpers_checked=$((rx_helpers_checked + 1))
 done < <(grep '^helper\.' "$RXPROV")
 (( rx_helpers_checked > 0 )) || { echo "$RXPROV: no helper.*.sha256 entries found - build/build-rx.sh HELPERS provenance is missing, refusing to package"; exit 1; }
+
+for h in "${rx_expected_helpers[@]}"; do
+	[[ -n ${rx_recorded_helpers[$h]:-} ]] || { echo "$h: expected by build/build-rx.sh's own current HELPERS array but missing from $RXPROV's own helper.*.sha256 entries - refusing to package"; exit 1; }
+done
+for h in "${!rx_recorded_helpers[@]}"; do
+	found=0
+	for e in "${rx_expected_helpers[@]}"; do [[ $h == "$e" ]] && { found=1; break; }; done
+	(( found )) || { echo "$h: recorded in $RXPROV as a helper.*.sha256 entry but not in build/build-rx.sh's own current HELPERS array - refusing to package"; exit 1; }
+done
 
 REPO_COMMIT=${BLOXMINER_REPO_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}
 
