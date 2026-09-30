@@ -364,12 +364,24 @@ fi
 if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 2 ]] && ! sysctl_called; then ok "rx start: calls hugepages -rx TWICE (this dispatcher's own + the rx engine's own), never sysctl directly"; else bad "rx start: calls hugepages -rx TWICE, never sysctl directly" "$(cat "$SYSCTL_LOG")"; fi
 if [[ $(cat "$PROCFILE") == 1200 ]]; then ok "rx start: nr_hugepages actually raised to 1200 by this dispatcher's own call"; else bad "rx start: nr_hugepages actually raised to 1200" "$(cat "$PROCFILE")"; fi
 
-# ---- rx "restarted" (still rx, e.g. a flight-sheet edit that keeps the algo) -> record already exists, so
-#      note_rx_hugepages_start returns immediately without calling hugepages itself: only ONE call this time
-#      (the rx engine's own unconditional one), not two, and no overwrite of the existing record
-hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run
-if [[ $(cat "$HUGEFILE" 2>/dev/null) == "$rec1" ]]; then ok "rx restarted: existing record (prior=512/prelim=1200/final=0) NOT overwritten"; else bad "rx restarted: existing record NOT overwritten" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
-if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "rx restarted: hugepages -rx called only ONCE (the engine's own; this dispatcher's own call is skipped)"; else bad "rx restarted: hugepages -rx called only ONCE" "$(cat "$SYSCTL_LOG")"; fi
+# ---- rx "restarted" (still rx, e.g. a flight-sheet edit that keeps the algo) while the PREVIOUS record is
+#      still final=0 -> PR #2 follow-up review round 2 (Codex): every h-run.sh call means a genuinely NEW
+#      XMRig process is about to start (this file's own final action is always an unconditional `exec`), so
+#      the session fields must be REFRESHED for it even when the old record was never finalized - the OLD
+#      behaviour here (return immediately, touch nothing at all) is exactly what let a restart after the API
+#      being unreachable past the startup window inherit a stale start_uptime and immediately "conflict" (see
+#      the dedicated test for that below). This record is still provably ours (same boot, current==prelim), so
+#      "prior" (512) is correctly PRESERVED - only the session fields (prelim/free0/boot/start_uptime) refresh,
+#      exactly like a fresh start: hugepages -rx is called TWICE again (this dispatcher's own note call +
+#      the engine's own unconditional one), same as the very first rx start above.
+: > "$SYSCTL_LOG"; hconfig "p:1" "W" "" "" "rx/wow"; run_h_run
+rec_restarted=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_restarted") == 512 && $(sed -n 's/^final=//p' <<< "$rec_restarted") == 0 ]]; then
+	ok "rx restarted (still final=0, provably ours): prior (512) preserved, record refreshed for the new process"
+else
+	bad "rx restarted (still final=0, provably ours): prior preserved, record refreshed" "$rec_restarted"
+fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 2 ]]; then ok "rx restarted: hugepages -rx called TWICE again (this dispatcher's own + the rx engine's own) - the session is refreshed, not skipped"; else bad "rx restarted: hugepages -rx called TWICE again" "$(cat "$SYSCTL_LOG")"; fi
 
 # ---- verus with final=0 (never finalized yet) -> must NEVER restore, even though current == prelim (1200):
 #      Round 5's whole point is that "current == the value right after `hugepages -rx`" is NOT sufficient proof
@@ -398,8 +410,10 @@ if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "
 #      instance's own rollback would refuse (only ever touches final=0), and a later Verus start's own
 #      current==ours check would fail forever - ~2.4 GiB pinned exactly like the original bug. Fixed:
 #      note_rx_hugepages_start now REOPENS a final=1 (or corrupt/legacy) record for a fresh note - keeping the
-#      ORIGINAL "prior" but refreshing prelim/free0/boot/start_uptime and resetting final=0 - while an
-#      still-starting final=0 record (the "rx restarted" case tested above) is still left completely alone.
+#      ORIGINAL "prior" (when still provably ours - see 6f/6g below for the round-2 follow-up on that) but
+#      refreshing prelim/free0/boot/start_uptime and resetting final=0. A still-starting final=0 record is
+#      ALSO refreshed the same way now (the "rx restarted" case tested above) - the only case left completely
+#      untouched is no longer "any existing record", it is "none of the above apply" (nothing to refresh at all).
 restore_stub_xmrig() { cat > "$BLOX_DIR/xmrig" <<'SH'
 #!/bin/sh
 exit 0
@@ -444,6 +458,59 @@ else
 	bad "restart-then-finalize-then-verus: restored to the TRUE original prior (512)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
 fi
 if [[ ! -e $HUGEFILE ]]; then ok "restart-then-finalize-then-verus: ownership record removed (restore verified successful)"; else bad "restart-then-finalize-then-verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# ---- 6f. PR #2 follow-up review round 2 (Codex): "Refresh unfinished ownership records on every restart" -
+#      a record that is STILL final=0 (the API never became reachable within the whole
+#      HUGEPAGES_STARTUP_WINDOW_S, Hive's own watchdog restarts the miner) used to be left completely
+#      untouched, including its own start_uptime - so the NEW, perfectly healthy instance's own
+#      finalize_rx_hugepages would measure the window against a timestamp from the OLD, dead instance and
+#      immediately see it as already exceeded, marking "conflict" (terminal) even though nothing is actually
+#      wrong. Simulates exactly that: a final=0 record with a start_uptime far enough in the past (100) that
+#      the fixture's own static "now" (1000, /proc/uptime) is already >300s later - a restart must refresh
+#      start_uptime to NOW, not leave the stale one standing, while still correctly recognising this record as
+#      provably its own (same boot, current == prelim) and preserving the TRUE original prior.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 1200 > "$PROCFILE"
+printf 'prior=512\nprelim=1200\nfree0=100\nboot=boot-TEST-CONSTANT\nstart_uptime=100\nfinal=0\n' > "$HUGEFILE"   # a "stuck" final=0 record from long ago (start_uptime=100 vs the fixture's own static now=1000 - already 900s old, past the 300s window)
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+rec_refreshed=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^start_uptime=//p' <<< "$rec_refreshed") == 1000 ]]; then
+	ok "restart of a stuck final=0 record (past the startup window): start_uptime REFRESHED to now (1000), not left stale (100)"
+else
+	bad "restart of a stuck final=0 record: start_uptime refreshed to now" "$rec_refreshed"
+fi
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_refreshed") == 512 && $(sed -n 's/^final=//p' <<< "$rec_refreshed") == 0 ]]; then
+	ok "restart of a stuck final=0 record: still provably ours (same boot, current==prelim) - TRUE original prior (512) preserved"
+else
+	bad "restart of a stuck final=0 record: prior preserved, final=0" "$rec_refreshed"
+fi
+
+# ---- 6g. PR #2 follow-up review round 2 (Codex): "Rebase ownership after an external huge-page change" - a
+#      record (final=1 here) used to always have its own "prior" blindly preserved on a reopen, even if an
+#      operator (or another workload) changed vm.nr_hugepages since this package's own last write - current no
+#      longer equals the record's own "ours", so the old record can no longer positively vouch for its own
+#      "prior" being the right baseline. Must REBASE to the operator's own current value instead of the stale
+#      original, so a later Verus start restores to what the operator actually set, never silently overwriting
+#      it with a number from long before their change.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
+finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
+echo 2000 > "$PROCFILE"   # an OPERATOR (or another workload) changes nr_hugepages, unrelated to this package
+HUGEPAGES_TARGET=2200; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # rx "restarts"
+rec_rebased=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_rebased") == 2000 ]]; then
+	ok "external change (512 -> 2000) then rx restart: prior REBASED to the operator's own current value (2000), never the stale 512"
+else
+	bad "external change then rx restart: prior rebased to the operator's own value" "$rec_rebased"
+fi
+finalize_record_for_test   # 2nd instance finalizes with its OWN live value (whatever PROCFILE now is)
+ours_now=$(cat "$PROCFILE")
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run   # verus start
+if grep -q "nr_hugepages=2000" "$SYSCTL_LOG" 2>/dev/null; then
+	ok "external change then rx restart then verus: restores to the OPERATOR's own value (2000), never the stale original (512)"
+else
+	bad "external change then rx restart then verus: restores to the operator's own value (2000)" "ours_now=$ours_now $(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "external change then rx restart then verus: ownership record removed (restore verified successful)"; else bad "external change then rx restart then verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
 
 # ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"

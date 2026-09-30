@@ -349,51 +349,81 @@ log_hugepages_note() {
 	{ printf '%s %s\n' "$(date '+%F %T' 2>/dev/null)" "$1" >> "${CUSTOM_LOG_BASENAME:-$STATEDIR/bloxminer}.log"; } 2>/dev/null
 }
 
-# note_rx_hugepages_start - called just before exec'ing the rx engine.
+# note_rx_hugepages_start - called just before exec'ing the rx engine. EVERY call means a genuinely NEW XMRig
+# process is about to start: h-run.sh's own final action is always an unconditional `exec ./xmrig` (this file's
+# own header), so Hive calling it again - a flight-sheet edit, a watchdog restart after a hang, the API being
+# unreachable past the ownership window, anything - always means the PREVIOUS xmrig instance (if any) is gone
+# and a fresh one is about to take its place. There is no scenario where "the same process is still running
+# and this is a no-op call" - so the session-specific fields (prelim/free0/boot/start_uptime) are ALWAYS
+# refreshed for whatever is about to start, on every call, regardless of what an existing record's own `final`
+# says. The only real question a pre-existing record raises is what "prior" - the TRUE pre-rx baseline this
+# whole mechanism exists to protect - should be for THIS new session.
 #
-# An EXISTING record that is still final=0 (an rx restart that has not yet reached readiness - e.g. a
-# flight-sheet edit that keeps the same algo, or Hive simply calling h-run.sh again while the SAME xmrig
-# instance is still starting up) is left completely untouched: this function must never re-derive "prior"/
-# "prelim" over the top of it, or the ALREADY-STARTING rx's own already-raised value would become the "prior"
-# restored on the next Verus start.
+# PR #2 follow-up review (Codex), two rounds:
 #
-# PR #2 follow-up review (Codex): an existing record that is ALREADY final=1 (confirmed, from a PREVIOUS xmrig
-# instance) - or "conflict", or a legacy/corrupt record with no readable final= at all - is a DIFFERENT case:
-# it describes a session that is OVER, not one still starting up, so THIS call means a genuinely NEW RandomX
-# process is about to start (a real restart, not just a resourced config). The record must be REOPENED for
-# it: this file's own "hugepages -rx" call is about to run again regardless (unconditionally, right below, and
-# again from engines/rx/h-run.sh's own call after this) and can move vm.nr_hugepages again (e.g. 1200 -> 1201)
-# - if the OLD record were left standing (final=1, ours=<the PREVIOUS instance's own value>) while the NEW
-# instance's own reservation changes the live value further, this NEW start's own eventual finalize_rx_hugepages
-# call would refuse to even attempt finalizing (it already requires final==0 to try at all), AND this new
-# start's own rollback (engines/rx/h-run.sh, if THIS start then aborts) would ALSO refuse (it only ever touches
-# final=0 records) - either way, the record goes permanently stale and a later Verus start's own `current ==
-# ours` check fails forever, pinning the memory exactly like the original bug this whole mechanism exists to
-# prevent. Reopening keeps the ORIGINAL "prior" (the true pre-rx baseline, read from the OLD record - never
-# re-derived from the CURRENT live value, which already reflects that PREVIOUS instance's own reservation, not
-# the real baseline), refreshes prelim/free0/boot/start_uptime to what THIS new reservation is about to
-# produce, and resets final=0 - exactly like a first-ever note, just with a preserved "prior".
+# (round 1) An existing record that is still final=0 used to be left COMPLETELY untouched (a "still starting,
+# never touch it" guard) - wrong: if the API never became reachable within HUGEPAGES_STARTUP_WINDOW_S (5 min)
+# and Hive restarts the miner, the OLD record's own start_uptime is now stale by more than that window, so the
+# NEW (perfectly healthy) instance's own finalize_rx_hugepages would immediately see the window as already
+# exceeded and mark "conflict" - a terminal state - even though nothing is actually wrong. Fixed: final=0 no
+# longer means "never touch it" - it means "the session fields need refreshing for the NEW process", exactly
+# like final=1/conflict/corrupt below.
 #
-# Either way: reads the CURRENT vm.nr_hugepages ("prior", fresh or preserved as above), runs Hive's
-# `hugepages -rx` if present (see the top comment for why), then reads vm.nr_hugepages ("prelim") and
-# HugePages_Free ("free0") again, plus the current boot_id and (Round 5c) /proc/uptime ("start_uptime" - the
-# exclusive-ownership window's own clock, see the top-of-section comment).
+# (round 2) An existing record - whatever its `final` - used to always have its own "prior" blindly preserved,
+# on the theory that it must be the TRUE original baseline. Not necessarily true: an operator (or another
+# workload) could have changed vm.nr_hugepages since this package's own last write, or the record could be
+# from a DIFFERENT boot entirely (STATEDIR need not be tmpfs) - in either case the OLD "prior" describes a
+# baseline that may no longer be the right one to restore to, and blindly keeping it would have Verus restore
+# OVER whatever that operator/other-boot value actually was. Fixed: the old record's own "prior" is only ever
+# preserved when it is PROVABLY still this package's own, undisturbed reservation - the exact same proof
+# standard restore_verus_hugepages already uses for ITS OWN restore, just checked one step earlier and against
+# whichever value THIS record's own `final` state makes the right one to check: same boot_id AND (final=1:
+# current live value == the record's own "ours"; final=0: current live value == the record's own "prelim").
+# Anything else - a different boot, current not matching, or final is "conflict"/corrupt/legacy with nothing
+# trustworthy to check - means the old record can no longer positively vouch for its own "prior": the CURRENT
+# live value is taken as the new "prior" instead (the same as a genuinely first-ever note), which is the safer
+# of the two options named in the review (silently keeping a stale baseline vs. rebasing to what is actually
+# on the box right now) and is exactly what happens anyway when there was no record at all.
+#
+# Either way: after "prior" is settled, this runs Hive's `hugepages -rx` if present (see the top comment for
+# why), then reads vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id and
+# (Round 5c) /proc/uptime ("start_uptime" - the exclusive-ownership window's own clock, see the top-of-section
+# comment) - all freshly, for the process that is about to start.
 # No record is written at all if "prior"/"prelim"/"free0"/"start_uptime" cannot each be read as a known-good
-# number (on a reopen, the OLD record is simply left as it was, never partially overwritten) -
-# finalize_rx_hugepages (h-stats.sh) needs every one of them to compute XMRig's own predicted total and to
-# bound the window, and writing a record with any of them missing would let those checks never fire safely, so
-# this function simply never produces that record in the first place. `final=0` marks it not yet finalized;
-# `ours` is deliberately NOT written here any more (Round 5 - see the top-of-section comment for why "the
-# value right after `hugepages -rx`" was wrong) - it is only ever written by finalize_rx_hugepages, once
-# XMRig's own reported numbers confirm what it is.
+# number (the OLD record, if any, is simply left as it was, never partially overwritten) - finalize_rx_hugepages
+# (h-stats.sh) needs every one of them to compute XMRig's own predicted total and to bound the window, and
+# writing a record with any of them missing would let those checks never fire safely, so this function simply
+# never produces that record in the first place. `final=0` marks it not yet finalized; `ours` is deliberately
+# NOT written here any more (Round 5 - see the top-of-section comment for why "the value right after
+# `hugepages -rx`" was wrong) - it is only ever written by finalize_rx_hugepages, once XMRig's own reported
+# numbers confirm what it is.
 note_rx_hugepages_start() {
 	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp
 	if [[ -e $HUGEPAGES_FILE ]]; then
-		[[ $(_hp_field final) == 0 ]] && return 0   # still starting (or genuinely mid-flight) - never touched
-		prior=$(_hp_field prior)   # REOPEN: preserve the TRUE original prior from the OLD (now-over) record -
-			# see the comment above for why this must never be re-derived from the current live value here
-		[[ $prior =~ ^[0-9]+$ ]] || return 0   # a corrupt/legacy record's own "prior" cannot be trusted either -
-			# left exactly as found (never overwritten blindly) for a human/reboot to sort out
+		local rec_final rec_boot cur_boot rec_prior cur="" owned=0
+		rec_final=$(_hp_field final); rec_boot=$(_hp_field boot); rec_prior=$(_hp_field prior)
+		cur_boot=$(_hp_boot_id)
+		[[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
+		if [[ -n $rec_boot && $rec_boot == "$cur_boot" && $cur =~ ^[0-9]+$ ]]; then
+			if [[ $rec_final == 1 ]]; then
+				local rec_ours; rec_ours=$(_hp_field ours)
+				[[ $rec_ours =~ ^[0-9]+$ && $cur == "$rec_ours" ]] && owned=1
+			elif [[ $rec_final == 0 ]]; then
+				local rec_prelim; rec_prelim=$(_hp_field prelim)
+				[[ $rec_prelim =~ ^[0-9]+$ && $cur == "$rec_prelim" ]] && owned=1
+			fi   # "conflict", or anything else unrecognised (corrupt/legacy, no final= at all): never provably
+			     # owned - always rebase below, nothing here is trustworthy enough to check against
+		fi
+		if (( owned )) && [[ $rec_prior =~ ^[0-9]+$ ]]; then
+			prior=$rec_prior   # still provably this package's own, undisturbed reservation - preserve the
+				# TRUE original baseline rather than re-deriving it from the current (already-raised) value
+		else
+			[[ -r $proc ]] || return 0
+			prior=$(<"$proc") 2>/dev/null   # not provably ours any more - rebase to whatever is on the box
+				# right now, exactly like a genuinely first-ever note (see the header comment for why this is
+				# the safer of the two options, not "decline ownership")
+			[[ $prior =~ ^[0-9]+$ ]] || return 0
+		fi
 	else
 		[[ -r $proc ]] || return 0
 		prior=$(<"$proc") 2>/dev/null
