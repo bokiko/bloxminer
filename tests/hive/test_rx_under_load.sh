@@ -314,7 +314,13 @@ export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4071 BLOX_S
 saturate_cpus
 sleep 0.3
 N_POLLS=60
-n_zero=0; n_over_budget=0; max_elapsed=0
+HARD_CAP=4.0   # PR #2 follow-up (Codex): budget (3.0s) + a generous fixed 1.0s tolerance for legitimate
+	# scheduling jitter - never relaxed by the 90% soft-tolerance counter below. The bug this guards against
+	# (still_running's own fork-heavy liveness probe running unboundedly long under CPU starvation, delaying
+	# the deadline check itself) produced 3.5-4.0s polls that the OLD soft-tolerance-only check let slide as
+	# long as <= 10% of polls were affected - exactly the kind of real regression a purely statistical
+	# tolerance can hide. ANY single poll past this hard ceiling fails the whole case outright.
+n_zero=0; n_over_budget=0; n_hardfail=0; max_elapsed=0
 for i in $(seq 1 "$N_POLLS"); do
 	t0=$(date +%s.%N)
 	# shellcheck disable=SC2016
@@ -324,6 +330,7 @@ for i in $(seq 1 "$N_POLLS"); do
 	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
 	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  poll $i: ZERO khs ($res)"; }
 	awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over_budget=$((n_over_budget+1)); echo "  poll $i: OVER BUDGET (${elapsed}s)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP" 'BEGIN{exit !(e > c)}' && { n_hardfail=$((n_hardfail+1)); echo "  poll $i: HARD CAP EXCEEDED (${elapsed}s > ${HARD_CAP}s)"; }
 	awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
 done
 stop_saturating
@@ -341,8 +348,11 @@ if command -v taskset > /dev/null 2>&1; then
 		(( want <= NPROC )) || continue
 		hi=$((want - 1))
 		eb=1; (( want < 3 )) && eb=0   # budget enforced from 3 CPUs up - same policy as verus's own load test
+		HARD_CAP_D=4.5   # budget (3.5s) + a generous fixed 1.0s tolerance - see case 3's own HARD_CAP comment
+			# above for the full rationale. Scoped to the same tiers as $eb: at 1-2 CPUs, no timing claim (soft
+			# or hard) is made at all, by design (see this loop's own comment below).
 		saturate_cpus; sleep 0.3
-		n_zero_d=0; n_over_d=0; max_d=0
+		n_zero_d=0; n_over_d=0; n_hardfail_d=0; max_d=0
 		for _ in $(seq 1 "$DISP_N"); do
 			t0=$(date +%s.%N)
 			# shellcheck disable=SC2016
@@ -352,17 +362,19 @@ if command -v taskset > /dev/null 2>&1; then
 			pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
 			awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || n_zero_d=$((n_zero_d+1))
 			awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}' || n_over_d=$((n_over_d+1))
+			(( eb )) && { awk -v e="$elapsed" -v c="$HARD_CAP_D" 'BEGIN{exit !(e > c)}' && n_hardfail_d=$((n_hardfail_d+1)); }
 			awk -v e="$elapsed" -v m="$max_d" 'BEGIN{exit !(e > m)}' && max_d=$elapsed
 		done
 		stop_saturating
 		# Same >= 90% budget-compliance tolerance as the engine-only load tests (see their own comments for
-		# the full rationale) - ZERO false zeros is never relaxed.
+		# the full rationale) - ZERO false zeros is never relaxed, and neither is $n_hardfail_d (a statistical
+		# tolerance is never a licence for a single poll to run arbitrarily long).
 		n_ok_d=$((DISP_N - n_over_d)); n_need_d=$(( (DISP_N * 9 + 9) / 10 ))
-		if [[ $n_zero_d == 0 ]] && (( ! eb || n_ok_d >= n_need_d )); then
+		if [[ $n_zero_d == 0 && $n_hardfail_d == 0 ]] && (( ! eb || n_ok_d >= n_need_d )); then
 			ok "top-level dispatcher h-stats.sh, taskset 0-$hi ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N < 3.5s (need >= $n_need_d/$DISP_N)" ) (max ${max_d}s)"
 		else
-			bad "top-level dispatcher h-stats.sh, taskset 0-$hi ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N under budget (need >= $n_need_d/$DISP_N)" )" \
-				"n_zero=$n_zero_d n_over=$n_over_d max=${max_d}s"
+			bad "top-level dispatcher h-stats.sh, taskset 0-$hi ($want CPU(s)): no false zeros$( ((eb)) && echo ", $n_ok_d/$DISP_N under budget (need >= $n_need_d/$DISP_N), 0 hard-cap failures" )" \
+				"n_zero=$n_zero_d n_over=$n_over_d n_hardfail=$n_hardfail_d max=${max_d}s"
 		fi
 	done
 else
@@ -375,12 +387,14 @@ unset BLOX_DIR BLOX_PROCFS_ROOT BLOX_API_PORT BLOX_STATE_DIR
 # Budget compliance requires at least 90% of polls (rounded up, so even a short run keeps ONE poll of slack)
 # within 3.0 s, not literally every single one - a lone transient overrun from scheduling noise this host did
 # not cause is not the same thing as a real regression. ZERO false zeros is never relaxed at any tolerance -
-# that is the actual property a real Hive rig's watchdog cares about.
+# that is the actual property a real Hive rig's watchdog cares about. The 90% counter is a STATISTICAL
+# tolerance for jitter, never a licence for a single poll to run arbitrarily long - $n_hardfail (HARD_CAP
+# above) catches that separately and is never relaxed either.
 n_ok_budget=$((N_POLLS - n_over_budget)); n_need_budget=$(( (N_POLLS * 9 + 9) / 10 ))
-if [[ $n_zero == 0 ]] && (( n_ok_budget >= n_need_budget )); then
+if [[ $n_zero == 0 && $n_hardfail == 0 ]] && (( n_ok_budget >= n_need_budget )); then
 	ok "sustained polling ($N_POLLS polls, top-level h-stats.sh, full CPU load): no false zeros, $n_ok_budget/$N_POLLS under 3.0 s (need >= $n_need_budget/$N_POLLS, max ${max_elapsed}s)"
 else
-	bad "sustained polling ($N_POLLS polls): no false zeros, $n_ok_budget/$N_POLLS under budget (need >= $n_need_budget/$N_POLLS)" "n_zero=$n_zero n_over_budget=$n_over_budget max=${max_elapsed}s"
+	bad "sustained polling ($N_POLLS polls): no false zeros, $n_ok_budget/$N_POLLS under budget (need >= $n_need_budget/$N_POLLS), 0 hard-cap failures" "n_zero=$n_zero n_over_budget=$n_over_budget n_hardfail=$n_hardfail max=${max_elapsed}s"
 fi
 final3=$(sed -n 's/^final=//p' "$T/state3/.bloxminer-hugepages" 2>/dev/null)
 ours3=$(sed -n 's/^ours=//p' "$T/state3/.bloxminer-hugepages" 2>/dev/null)

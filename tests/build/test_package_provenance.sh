@@ -6,21 +6,127 @@
 # (binary + its own fresh provenance), not previously released tarballs - this suite tampers copies of those
 # outdirs the same way the old suite tampered tarball copies: never the originals.
 # Usage: tests/build/test_package_provenance.sh <verus-build-outdir> <rx-build-outdir>
-#   (or set BLOX_VERUS_OUT/BLOX_RX_OUT). HERMETIC - there is deliberately NO default/fallback location: a
-#   previous version of this test defaulted to a shared, mutable ~/c3work/{verus-out,rx-out} and kept passing
-#   its "baseline"/"control" cases against binaries built from an OLDER commit while the tree under test had
-#   already moved on (a real, observed failure - a stale rx-out made those two cases fail with a confusing
-#   "does not match its recorded source hash" instead of a clean skip). Outdirs are REQUIRED, and are proven to
-#   actually match $ROOT (the tree this test script itself lives in) before anything else runs - see below;
-#   never silently tested against a mismatching pair.
+#   (or set BLOX_VERUS_OUT/BLOX_RX_OUT). Outdirs are otherwise REQUIRED - there is deliberately NO default/
+#   fallback location: a previous version of this test defaulted to a shared, mutable ~/c3work/{verus-out,
+#   rx-out} and kept passing its "baseline"/"control" cases against binaries built from an OLDER commit while
+#   the tree under test had already moved on (a real, observed failure - a stale rx-out made those two cases
+#   fail with a confusing "does not match its recorded source hash" instead of a clean skip). Real outdirs are
+#   proven to actually match $ROOT (the tree this test script itself lives in) before anything else runs - see
+#   the hermetic check below; never silently tested against a mismatching pair.
+#
+# PR #2 follow-up review (Codex): with no outdirs given, this used to unconditionally SKIP - meaning
+# package.sh's entire tamper-detection logic (this file's ~20 cases) never ran in CI at all, since the
+# "scripts" CI job never compiles either engine (that is the separate, much slower "engine" job, and even it
+# only builds the Verus side). Fixed: with BLOX_CI set and no outdirs given, this generates SYNTHETIC-BUT-
+# FAITHFUL outdirs instead of skipping - fake binary bytes (their content is never what package.sh actually
+# checks; only their sha256, matched to a correspondingly fake provenance entry, is), but a GENUINELY correct
+# provenance file in every field package.sh's own [[ ... ]] checks actually verify: this repo's real
+# bloxminer.patch/donate0.patch/branding.patch hashes, the real current package version, and - for
+# build/package.sh's own source-bundle step, which does a REAL `git clone` + commit-match against upstream,
+# never fakeable - the real upstream repo/commit ccminer and xmrig are actually pinned to (resolved the same
+# way build/build.sh and build/build-rx.sh themselves do, not hand-duplicated). This exercises the real
+# tamper-detection logic end-to-end (every case below still copies+tampers this SAME baseline and asserts
+# package.sh still refuses), without ever compiling either engine. Local/release runs are unaffected: passing
+# real outdirs (or BLOX_VERUS_OUT/BLOX_RX_OUT) always wins, and with neither BLOX_CI nor real outdirs, this
+# still cleanly SKIPs (a bare local dev run, no network, no CI) rather than surprising a laptop with 40 clones.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 VERUS_OUT=${1:-${BLOX_VERUS_OUT:-}}
 RX_OUT=${2:-${BLOX_RX_OUT:-}}
+SYNTH_DIR=""
+gen_synthetic_outdirs() {   # $1 = verus outdir, $2 = rx outdir - see the header comment above for the full
+	# rationale. Fails loudly (never silently) on any network/tooling problem: under BLOX_CI, that must FAIL
+	# the whole suite (the point of this function existing), never fall through to a SKIP that looks the same
+	# as "nothing to test here".
+	local vout=$1 xout=$2
+	mkdir -p "$vout" "$xout"
+	local ver; ver=$(sed -n 's/^CUSTOM_VERSION=//p' "$ROOT/bloxminer/h-manifest.conf")
+	[[ -n $ver ]] || { echo "gen_synthetic_outdirs: could not read CUSTOM_VERSION from bloxminer/h-manifest.conf" >&2; return 1; }
+	# gen_fake_binary <path> <label> - a "binary" whose CONTENT is never what package.sh actually checks (only
+	# its sha256, matched into a correspondingly fake provenance entry below, is) - but MUST be large enough
+	# for this file's own flip_byte() (tests 2/7 below: `f.seek(-200, 2)` then flips that byte) to have
+	# anywhere to seek to; a too-small synthetic binary makes flip_byte's own seek raise (caught nowhere,
+	# since it runs as an uncaught exception in the disposable python heredoc), silently leaving the "tampered"
+	# copy byte-identical to the original - the tamper case then wrongly asserts a refusal that never had
+	# anything to refuse. 4 KiB of /dev/urandom is comfortably larger than that 200-byte tail, cheap, and
+	# unique per generation (no risk of colliding with anything real).
+	gen_fake_binary() { { printf '%s\n' "$2"; head -c 4096 /dev/urandom; } > "$1"; }
+
+	# ---- verus (ccminer) side - upstream/short-commit read from build/build.sh itself (never hand-duplicated
+	# here), resolved to the FULL 40-char commit build/package.sh's own -src bundle step requires (its own
+	# `git rev-parse HEAD` after checkout, compared against this exact string) the SAME way build/build.sh
+	# itself resolves it - a real, live git operation, proving the pin is still resolvable, not a hardcoded
+	# guess that could go stale if the upstream branch ever moved.
+	local v_upstream="https://github.com/monkins1010/ccminer.git"
+	local v_short
+	# shellcheck disable=SC2016   # single quotes on purpose: this is a literal sed pattern, not a shell expansion
+	v_short=$(sed -n 's/^COMMIT=\${COMMIT:-\([^}]*\)}.*/\1/p' "$ROOT/build/build.sh")
+	[[ -n $v_short ]] || { echo "gen_synthetic_outdirs: could not read COMMIT from build/build.sh" >&2; return 1; }
+	local vclone; vclone=$(mktemp -d)
+	git clone -q -b Verus2.2 "$v_upstream" "$vclone" || { rm -rf "$vclone"; echo "gen_synthetic_outdirs: git clone $v_upstream failed" >&2; return 1; }
+	( cd "$vclone" && git checkout -q "$v_short" ) || { rm -rf "$vclone"; echo "gen_synthetic_outdirs: git checkout $v_short failed" >&2; return 1; }
+	local v_full; v_full=$(git -C "$vclone" rev-parse HEAD); rm -rf "$vclone"
+	[[ $v_full =~ ^[0-9a-f]{40}$ ]] || { echo "gen_synthetic_outdirs: resolved verus commit '$v_full' is not a full sha" >&2; return 1; }
+
+	gen_fake_binary "$vout/bloxminer-O3" "synthetic bloxminer-O3 binary for CI provenance testing"
+	gen_fake_binary "$vout/libomp.so.5" "synthetic libomp.so.5 for CI provenance testing"
+	{
+		echo "binary_sha256=$(sha256sum "$vout/bloxminer-O3" | cut -d' ' -f1)"
+		echo "version=$ver"
+		echo "upstream=$v_upstream"
+		echo "upstream_commit=$v_full"
+		echo "patch_sha256=$(sha256sum "$ROOT/build/bloxminer.patch" | cut -d' ' -f1)"
+		echo "arch_flags=synthetic (CI provenance test - never a real build)"
+		echo "opt=-O3"
+		echo "compiler=synthetic"
+		echo "glibc_min=synthetic"
+		echo "libomp_sha256=$(sha256sum "$vout/libomp.so.5" | cut -d' ' -f1)"
+		echo "os=synthetic"
+	} > "$vout/bloxminer-O3.provenance"
+
+	# ---- rx (xmrig) side - upstream/tag/commit read from build/build-rx.sh itself (already the FULL 40-char
+	# hash there, no resolution needed - just extracted, not hand-duplicated).
+	local x_upstream x_tag x_commit
+	x_upstream=$(sed -n 's/^UPSTREAM=//p' "$ROOT/build/build-rx.sh")
+	x_tag=$(sed -n 's/^TAG=//p' "$ROOT/build/build-rx.sh")
+	x_commit=$(sed -n 's/^COMMIT=\([^[:space:]#]*\).*/\1/p' "$ROOT/build/build-rx.sh")
+	[[ -n $x_upstream && -n $x_tag && $x_commit =~ ^[0-9a-f]{40}$ ]] || { echo "gen_synthetic_outdirs: could not read UPSTREAM/TAG/COMMIT from build/build-rx.sh" >&2; return 1; }
+
+	gen_fake_binary "$xout/xmrig" "synthetic xmrig binary for CI provenance testing"
+	gen_fake_binary "$xout/bloxsense" "synthetic bloxsense binary for CI provenance testing"
+	{
+		echo "upstream=$x_upstream"
+		echo "upstream_tag=$x_tag"
+		echo "upstream_commit=$x_commit"
+		echo "patch_sha256=$(sha256sum "$ROOT/build/donate0.patch" | cut -d' ' -f1)"
+		echo "branding_patch_sha256=$(sha256sum "$ROOT/build/branding.patch" | cut -d' ' -f1)"
+		echo "blox_display_version=$ver"
+		echo "xmrig_sha256=$(sha256sum "$xout/xmrig" | cut -d' ' -f1)"
+		echo "bloxsense_sha256=$(sha256sum "$xout/bloxsense" | cut -d' ' -f1)"
+		# HELPERS: parsed straight out of build/build-rx.sh's own array (same extraction test 12 below already
+		# uses to prove every entry resolves to a real file) - never a second, hand-maintained copy that could
+		# drift out of sync with what build/package.sh will actually walk.
+		while IFS= read -r h; do
+			[[ -n $h ]] || continue
+			echo "helper.$h.sha256=$(sha256sum "$ROOT/$h" | cut -d' ' -f1)"
+		done < <(sed -n "/^HELPERS=(/,/)/p" "$ROOT/build/build-rx.sh" | tr -d '()' | sed 's/^HELPERS=//' | tr -s ' \t\n' '\n' | grep -v '^$')
+	} > "$xout/build.provenance"
+}
 if [[ -z $VERUS_OUT || -z $RX_OUT ]]; then
-	echo "SKIP: no build outdirs given - pass <verus-out> <rx-out> as arguments, or set BLOX_VERUS_OUT/BLOX_RX_OUT. This test needs build/build.sh and build/build-rx.sh output for the EXACT commit/tree under test; it never falls back to a shared or previously-built default location."
-	exit 0
+	if [[ -n ${BLOX_CI:-} ]]; then
+		SYNTH_DIR=$(mktemp -d)
+		VERUS_OUT="$SYNTH_DIR/verus-out"; RX_OUT="$SYNTH_DIR/rx-out"
+		if ! gen_synthetic_outdirs "$VERUS_OUT" "$RX_OUT"; then
+			echo "FAIL: BLOX_CI is set but synthetic outdir generation failed (see above) - this must not silently SKIP under CI" >&2
+			rm -rf "$SYNTH_DIR"
+			exit 1
+		fi
+	else
+		echo "SKIP: no build outdirs given - pass <verus-out> <rx-out> as arguments, or set BLOX_VERUS_OUT/BLOX_RX_OUT (or BLOX_CI=1 to generate synthetic ones - see this file's own header comment). This test needs build/build.sh and build/build-rx.sh output for the EXACT commit/tree under test; it never falls back to a shared or previously-built default location."
+		exit 0
+	fi
 fi
+trap '[[ -n $SYNTH_DIR ]] && rm -rf "$SYNTH_DIR"' EXIT
 [[ -f $VERUS_OUT/bloxminer-O3 && -f $VERUS_OUT/bloxminer-O3.provenance && -f $VERUS_OUT/libomp.so.5 && -f $RX_OUT/xmrig && -f $RX_OUT/bloxsense && -f $RX_OUT/build.provenance ]] || {
 	echo "SKIP: build outdirs not found or incomplete ($VERUS_OUT / $RX_OUT)"; exit 0; }
 
@@ -41,7 +147,7 @@ if ! HERMCHECK_OUT=$(bash "$ROOT/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$HERM
 fi
 rm -rf "$HERMCHECK_DIR"
 
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d); trap '[[ -n $SYNTH_DIR ]] && rm -rf "$SYNTH_DIR"; rm -rf "$T"' EXIT
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-60s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-60s FAIL: %s\n' "$1" "$2"; }

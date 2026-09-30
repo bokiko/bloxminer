@@ -10,6 +10,13 @@ permissions:
 jobs:
   scripts:
     runs-on: ubuntu-22.04
+    env:
+      # PR #2 follow-up review (Codex): tells tests/hive/test_config_diff.sh and
+      # tests/build/test_package_provenance.sh this IS CI - neither may silently SKIP here (bokiko's own
+      # ~/c3work/frozen and real build outdirs exist only on his machine, never on a runner); each instead
+      # downloads/generates what it needs to run for real, and a SKIP becomes a hard FAIL if that ever fails.
+      # See each script's own header comment for the full rationale.
+      BLOX_CI: "1"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: apt dependencies

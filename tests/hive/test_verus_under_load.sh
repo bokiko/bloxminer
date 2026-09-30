@@ -106,7 +106,12 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	# test ran one warm-up poll before saturating, to seed a last-known-good cache sample; that hid exactly the
 	# cold-start-under-load failure mode Codex's review called out, so it is gone, not merely disabled.
 	saturate_cpus "$cpuset"; sleep 0.3
-	local n_zero=0 n_over=0 max_elapsed=0 i=0 t0 t1 elapsed res khs run_start
+	local n_zero=0 n_over=0 n_hardfail=0 max_elapsed=0 i=0 t0 t1 elapsed res khs run_start
+	local hard_cap=4.0   # PR #2 follow-up (Codex): budget (3.0s) + a generous fixed 1.0s tolerance for
+		# legitimate scheduling jitter - never relaxed by the 90% soft-tolerance counter below. See
+		# test_rx_under_load.sh's own HARD_CAP comment for the full rationale (the bug this guards against:
+		# still_running's own fork-heavy liveness probe delaying the deadline check itself under CPU
+		# starvation). Only checked when $enforce_budget is set - same scoping as the soft tolerance.
 	run_start=$(date +%s.%N)
 	while :; do
 		i=$((i+1))
@@ -123,6 +128,7 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 		khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
 		awk -v k="${khs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  $label poll $i: ZERO khs ($res)"; }
 		awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over=$((n_over+1)); echo "  $label poll $i: OVER BUDGET (${elapsed}s)"; }
+		(( enforce_budget )) && { awk -v e="$elapsed" -v c="$hard_cap" 'BEGIN{exit !(e > c)}' && { n_hardfail=$((n_hardfail+1)); echo "  $label poll $i: HARD CAP EXCEEDED (${elapsed}s > ${hard_cap}s)"; }; }
 		awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
 		(( i >= n )) || continue
 		(( min_duration == 0 )) && break
@@ -147,13 +153,14 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	# not the same thing as a real regression, and this suite must never report the difference as a failure.
 	# ZERO false zeros is never relaxed, at any tier, under any amount of noise - that is the actual property
 	# a real Hive rig's watchdog cares about, and is exactly what the tolerance above must never be allowed to
-	# paper over.
+	# paper over. Neither is $n_hardfail (when budget is enforced at all) - the 90% counter is a STATISTICAL
+	# tolerance for jitter, never a licence for a single poll to run arbitrarily long.
 	local n_ok=$((i - n_over)) n_need=0
 	((enforce_budget)) && n_need=$(( (i * 9 + 9) / 10 ))   # ceil(90% of i)
-	if [[ $n_zero == 0 ]] && (( ! enforce_budget || n_ok >= n_need )); then
+	if [[ $n_zero == 0 && $n_hardfail == 0 ]] && (( ! enforce_budget || n_ok >= n_need )); then
 		ok "$label ($i polls over ${wall}s, 16-row/32-thread reply): no false zeros$( ((enforce_budget)) && echo ", $n_ok/$i under 3.0 s (need >= $n_need/$i)" ) (max ${max_elapsed}s, n_over=$n_over)"
 	else
-		bad "$label ($i polls over ${wall}s): no false zeros, $( ((enforce_budget)) && echo "$n_ok/$i under budget (need >= $n_need/$i)" )" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
+		bad "$label ($i polls over ${wall}s): no false zeros, $( ((enforce_budget)) && echo "$n_ok/$i under budget (need >= $n_need/$i), 0 hard-cap failures" )" "n_zero=$n_zero n_over=$n_over n_hardfail=$n_hardfail max=${max_elapsed}s"
 	fi
 }
 
@@ -203,7 +210,9 @@ export BLOX_DIR="$BLOX_DIR3"
 run_dispatcher_case() {   # $1 cpuset ("" = none), $2 n_polls, $3 enforce_budget (1/0)
 	local cpuset=$1 n=$2 enforce_budget=$3
 	saturate_cpus "$cpuset"; sleep 0.3
-	local n_zero=0 n_over=0 max_elapsed=0 i t0 t1 elapsed khs
+	local n_zero=0 n_over=0 n_hardfail=0 max_elapsed=0 i t0 t1 elapsed khs
+	local hard_cap=4.0   # see run_case()'s own comment for the full rationale - never relaxed by the 90%
+		# soft-tolerance counter below, only checked when $enforce_budget is set.
 	for i in $(seq 1 "$n"); do
 		t0=$(date +%s.%N)
 		if [[ -n $cpuset ]]; then
@@ -218,18 +227,19 @@ run_dispatcher_case() {   # $1 cpuset ("" = none), $2 n_polls, $3 enforce_budget
 		khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
 		awk -v k="${khs:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  dispatcher poll $i: ZERO khs ($res)"; }
 		awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}' || { n_over=$((n_over+1)); echo "  dispatcher poll $i: OVER BUDGET (${elapsed}s)"; }
+		(( enforce_budget )) && { awk -v e="$elapsed" -v c="$hard_cap" 'BEGIN{exit !(e > c)}' && { n_hardfail=$((n_hardfail+1)); echo "  dispatcher poll $i: HARD CAP EXCEEDED (${elapsed}s > ${hard_cap}s)"; }; }
 		awk -v e="$elapsed" -v m="$max_elapsed" 'BEGIN{exit !(e > m)}' && max_elapsed=$elapsed
 	done
 	stop_saturating
 	local label="top-level dispatcher h-stats.sh (verus engine, $n polls${cpuset:+, taskset $cpuset})"
 	# Same >= 90% budget-compliance tolerance as run_case() above (see its own comment for the full rationale)
-	# - ZERO false zeros is never relaxed.
+	# - ZERO false zeros is never relaxed, and neither is $n_hardfail.
 	local n_ok=$((n - n_over)) n_need=0
 	((enforce_budget)) && n_need=$(( (n * 9 + 9) / 10 ))
-	if [[ $n_zero == 0 ]] && (( ! enforce_budget || n_ok >= n_need )); then
+	if [[ $n_zero == 0 && $n_hardfail == 0 ]] && (( ! enforce_budget || n_ok >= n_need )); then
 		ok "$label: no false zeros$( ((enforce_budget)) && echo ", $n_ok/$n under 3.0 s (need >= $n_need/$n)" ) (max ${max_elapsed}s, n_over=$n_over)"
 	else
-		bad "$label: no false zeros, $( ((enforce_budget)) && echo "$n_ok/$n under budget (need >= $n_need/$n)" )" "n_zero=$n_zero n_over=$n_over max=${max_elapsed}s"
+		bad "$label: no false zeros, $( ((enforce_budget)) && echo "$n_ok/$n under budget (need >= $n_need/$n), 0 hard-cap failures" )" "n_zero=$n_zero n_over=$n_over n_hardfail=$n_hardfail max=${max_elapsed}s"
 	fi
 }
 

@@ -620,20 +620,30 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# became its own session/process-group leader), and differs from our own pgid and from 0/1 (confirming
 	# real isolation, not an accidental no-op or a kernel/init group). Anything else - including the
 	# handshake simply not having arrived yet - falls back to signalling $CPID alone, never a group.
-	validated_pgid() {
+	validated_pgid() {   # sets $REPLY to the verified pgid, or empty, and returns 1 if not validated - no fork
+		# (was `echo "$hs"` read back via `$(validated_pgid)`, and `cat "$HANDSHAKE"` before that - PR #2
+		# follow-up review, see still_running()'s own comment below for why both matter under CPU starvation)
+		REPLY=""
 		local hs=""
-		[[ -s $HANDSHAKE ]] && hs=$(cat "$HANDSHAKE" 2>/dev/null)
+		[[ -s $HANDSHAKE ]] && { read -r hs < "$HANDSHAKE"; } 2>/dev/null   # bash builtin read, no fork (was cat)
 		[[ $hs =~ ^[0-9]+$ ]] || return 1
 		[[ $hs == "$CPID" && $hs != "$PARENT_PGID" ]] || return 1
 		(( hs > 1 )) || return 1
-		echo "$hs"
+		REPLY=$hs
 	}
-	still_running() {   # true if the (validated) group, or else just $CPID, still has anything alive
-		local g; g=$(validated_pgid)
-		if [[ -n $g ]]; then pgrep -g "$g" > /dev/null 2>&1; else kill -0 "$CPID" 2>/dev/null; fi
+	still_running() {   # true if the (validated) group, or else just $CPID, still has anything alive.
+		# PR #2 follow-up review (Codex): this whole check must be FORK-FREE. It used to run `cat` (via
+		# validated_pgid's own `$(...)`) and `pgrep -g` on every single poll-loop iteration below - under full
+		# CPU saturation, fork/exec latency for those two external processes is exactly what can go unscheduled
+		# past the poll's own absolute deadline (measured on a real load test: 3.5-4.0 s iterations against a
+		# 2.4 s budget), since the deadline check itself never runs until THIS call returns. `kill -0` against
+		# a negative pid (the whole process group) is bash's own BUILTIN kill - not the external /bin/kill -
+		# and answers the identical question ("does anything remain in this group") with no fork at all.
+		local g; validated_pgid; g=$REPLY
+		if [[ -n $g ]]; then kill -0 -- "-$g" 2>/dev/null; else kill -0 "$CPID" 2>/dev/null; fi
 	}
-	escalate() {   # $1 = signal name
-		local g; g=$(validated_pgid)
+	escalate() {   # $1 = signal name - also forkless (bash's builtin kill), same rationale as still_running()
+		local g; validated_pgid; g=$REPLY
 		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
 	}
 
@@ -651,8 +661,13 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# (an orphaned background job holding a command-substitution pipe's write end open, hanging the CALLER even
 	# after everything else finished - reproduced once in practice) cannot recur either.
 	dbg "parent: launched CPID=$CPID, entering bounded poll"
-	while still_running; do
+	# PR #2 follow-up review (Codex): the deadline is checked BEFORE the liveness probe on every iteration, not
+	# after (the old `while still_running; do remaining_us; have_budget_us ... done` checked liveness FIRST,
+	# as the loop's own condition) - now that still_running() is forkless this is mostly defense in depth, but
+	# it also means a poll that is already out of budget never even pays for the (cheap, but not free) probe.
+	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
+		still_running || break
 		sleep 0.05
 	done
 	remaining_us

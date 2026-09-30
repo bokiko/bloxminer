@@ -628,9 +628,14 @@ finalize_rx_hugepages() {
 }
 
 # _hp_bounded_still_running <cpid> <verified pgid, or empty> - true if anything remains: the WHOLE verified
-# group (pgrep -g), or else just <cpid> alone when no group was ever confirmed. Shared by
-# finalize_rx_hugepages_bounded's own timeout/escalation logic below.
-_hp_bounded_still_running() { if [[ -n ${2:-} ]]; then pgrep -g "$2" > /dev/null 2>&1; else kill -0 "$1" 2>/dev/null; fi; }
+# group, or else just <cpid> alone when no group was ever confirmed. Shared by finalize_rx_hugepages_bounded's
+# own timeout/escalation logic below. PR #2 follow-up review (Codex): must be FORK-FREE - this used to run
+# `pgrep -g` on every poll-loop iteration below; under full CPU saturation, fork/exec latency for an external
+# process is exactly what can go unscheduled past the poll's own absolute deadline (see both engines' own
+# h-stats.sh, same review, same underlying bug - real load-test evidence there: 3.5-4.0 s iterations against a
+# 2.4 s budget). `kill -0` against a negative pid (the whole process group) is bash's own BUILTIN kill - not
+# the external /bin/kill - and answers the identical question with no fork at all.
+_hp_bounded_still_running() { if [[ -n ${2:-} ]]; then kill -0 -- "-$2" 2>/dev/null; else kill -0 "$1" 2>/dev/null; fi; }
 
 # _hp_bounded_escalate <signal> <cpid> <verified pgid, or empty> - signals the WHOLE verified group when one
 # was confirmed (reaching every descendant: curl, find, and any subshell finalize_rx_hugepages forks - see
@@ -727,17 +732,21 @@ finalize_rx_hugepages_bounded() {
 	# reusing the value computed at function entry would double-count that time on top of the reserve.
 	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
 	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
-	# Poll for the child's own exit (short interval, kill -0/pgrep - no fork wasted on a real result once it's
-	# done) instead of `wait -n <cpid> <apid>`: `wait -n` given explicit pids that mix a job-control-tracked
+	# Poll for the child's own exit (short interval, forkless `kill -0` - no fork wasted on a real result once
+	# it's done) instead of `wait -n <cpid> <apid>`: `wait -n` given explicit pids that mix a job-control-tracked
 	# child (backgrounded under `set -m`, its own process group) with a plain one (the alarm `sleep`, started
 	# after `set +m`) was measured to BLOCK for the alarm's own full duration even when the FIRST child had
 	# already exited in ~1 ms - reproducible, and specific to how the invoking shell itself was started
 	# (`bash -c '...'` vs a script file) - not something this function can assume away. Polling has no such
 	# invocation-context dependency.
 	local poll_deadline; poll_deadline=$(awk -v n="$now" -v a="$alarm" 'BEGIN{printf "%.6f", n+a}')
-	while _hp_bounded_still_running "$cpid" "$pgid"; do
+	# PR #2 follow-up review (Codex): the deadline is checked BEFORE the liveness probe on every iteration, not
+	# after (the old `while _hp_bounded_still_running ...; do now=...; awk ... done` checked liveness FIRST, as
+	# the loop's own condition) - see both engines' own h-stats.sh (same review) for the full rationale.
+	while :; do
 		now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
 		awk -v n="$now" -v d="$poll_deadline" 'BEGIN{exit !(n < d)}' || break
+		_hp_bounded_still_running "$cpid" "$pgid" || break
 		sleep 0.05
 	done
 	if _hp_bounded_still_running "$cpid" "$pgid"; then

@@ -342,20 +342,23 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# see the RandomX engine's own h-stats.sh for the full rationale (identical pattern).
 	CPID=$!
 
-	validated_pgid() {   # see the RandomX engine's own h-stats.sh for the full rationale (identical pattern)
+	validated_pgid() {   # sets $REPLY to the verified pgid, or empty - see the RandomX engine's own h-stats.sh
+		# for the full rationale (identical pattern) - no fork (was `echo`/`$(...)` + `cat`, PR #2 follow-up)
+		REPLY=""
 		local hs=""
-		[[ -s $HANDSHAKE ]] && hs=$(cat "$HANDSHAKE" 2>/dev/null)
+		[[ -s $HANDSHAKE ]] && { read -r hs < "$HANDSHAKE"; } 2>/dev/null   # bash builtin read, no fork (was cat)
 		[[ $hs =~ ^[0-9]+$ ]] || return 1
 		[[ $hs == "$CPID" && $hs != "$PARENT_PGID" ]] || return 1
 		(( hs > 1 )) || return 1
-		echo "$hs"
+		REPLY=$hs
 	}
-	still_running() {
-		local g; g=$(validated_pgid)
-		if [[ -n $g ]]; then pgrep -g "$g" > /dev/null 2>&1; else kill -0 "$CPID" 2>/dev/null; fi
+	still_running() {   # forkless (bash's builtin kill against the negative pgid) - see the RandomX engine's
+		# own h-stats.sh for the full rationale (identical pattern, same PR #2 follow-up review)
+		local g; validated_pgid; g=$REPLY
+		if [[ -n $g ]]; then kill -0 -- "-$g" 2>/dev/null; else kill -0 "$CPID" 2>/dev/null; fi
 	}
 	escalate() {
-		local g; g=$(validated_pgid)
+		local g; validated_pgid; g=$REPLY
 		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
 	}
 
@@ -369,8 +372,11 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# every other timing decision) has no such invocation-context dependency: it costs nothing extra when
 	# $CPID finishes promptly (the loop just exits on its very first check) and never waits any longer than
 	# the alarm-based version would have in the worst case either way.
-	while still_running; do
+	# PR #2 follow-up review (Codex): deadline checked BEFORE the liveness probe on every iteration - see the
+	# RandomX engine's own h-stats.sh for the full rationale (identical pattern, same review).
+	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
+		still_running || break
 		sleep 0.05
 	done
 	if still_running; then
