@@ -368,13 +368,24 @@ run() {
 		# the whole run below) instead of a new one of its own - otherwise a bloxsense that ignores SIGTERM
 		# could end up in a process group the outer timeout's kill never reaches, and survive as an orphan.
 		cap_us "$REPLY" 1000000; us_to_secstr "$REPLY"
-		sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>/dev/null)
+		sense=$(timeout --foreground "$REPLY" "$PKG/bloxsense" --json 2>&1); dbg "phase B: bloxsense rc=$? len=${#sense} body=${sense:0:200}"
 	else
 		note_state shallow; return 0
 	fi
 	jq -e . > /dev/null 2>&1 <<< "$sense" || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
 	pkg_temp=$(jq -c '.pkg_temp' <<< "$sense")
+	# A jq failure (e.g. a transient fork/exec failure under resource pressure - the exact class of bug Codex's
+	# review of a714388 already found once, in the final result-reading step) would otherwise leave $pkg_temp
+	# empty, which is NOT valid JSON - and $pkg_temp is fed into `--argjson` below (both branches of the
+	# percore/rows split), where jq treats an invalid --argjson value as a FATAL argument error: the entire
+	# `rows=` computation would then silently produce nothing, cascading into $complete/$phaseb_total also
+	# being empty two steps later (exactly the GH-CI-only symptom this round's diagnostics caught: "phase B:
+	# complete= phaseb_total=" - both empty, not "true"/"false" or a number). Defined default: this cosmetic
+	# detail (a single row's temperature, in the unverified/per-thread path) is worth losing to a transient jq
+	# hiccup; the RATE Phase B is here to compute is never allowed to depend on this succeeding (see below).
+	[[ $pkg_temp =~ ^(null|[0-9.]+)$ ]] || { dbg "phase B: pkg_temp invalid/empty (jq failure?) - forcing null, was: $pkg_temp"; pkg_temp=null; }
 	power_raw=$(jq -c '.power_w' <<< "$sense")
+	[[ $power_raw =~ ^(null|[0-9.]+)$ ]] || { dbg "phase B: power_raw invalid/empty (jq failure?) - forcing null, was: $power_raw"; power_raw=null; }
 
 	# ---- binding verification, budget permitting (the /proc task scan is also inside the timed child)
 	percore=0
@@ -436,9 +447,27 @@ run() {
 			def rate0: (.hashrate[0]) as $r | if ($r == null or ($r | type) != "number" or ($r | isnan) or ($r | isinfinite)) then null elif $r < 0 then 0 else $r end;
 			map(rate0 as $r0 | if $r0 == null then {khs: null, temp: $pt} else {khs: (($r0 / 1000) * 100 | round / 100), temp: $pt} end)' <<< "$threads")
 	fi
+	dbg "phase B: percore=$percore rows=${rows:0:300}"
 
 	complete=$(jq -r 'all(.[]; .khs != null)' <<< "$rows")
 	phaseb_total=$(jq -r '[.[].khs] | map(select(. != null)) | add // 0' <<< "$rows" | awk '{printf "%.2f", $1}')
+	# $complete/$phaseb_total must come out exactly "true"/"false" and a plain non-negative number,
+	# respectively - anything else (typically empty: a transient jq fork/exec failure under resource pressure,
+	# or $rows itself being malformed/empty from the step above) is a FAILED computation, not a legitimate
+	# "incomplete" or "zero" reading, and must be logged as such rather than silently falling through - relying
+	# on bash's `[[ "" == true ]]` being false (which happens to also reject Phase B here, but for the wrong
+	# reason, unlogged) is exactly the class of silent failure that made the GH-CI-only version of this bug take
+	# two full round-trips to even see. Forcing both to their safe values here makes the fallback explicit AND
+	# guarantees `khs=$phaseb_total` below can never be assigned something non-numeric even if some future edit
+	# moves that assignment before the $complete check.
+	if [[ $complete != true && $complete != false ]]; then
+		dbg "phase B: FAILED - \$complete came back invalid/empty (was: '$complete') - Phase A's khs=$khs stands"
+		complete=false
+	fi
+	if [[ ! $phaseb_total =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+		dbg "phase B: FAILED - \$phaseb_total came back invalid/empty (was: '$phaseb_total') - Phase A's khs=$khs stands"
+		complete=false; phaseb_total=0
+	fi
 	# consistent := Phase A itself has no confident positive rate (khs_fresh == 0 - nothing to protect a
 	# complete Phase B reading from), OR the two totals agree within 10% of Phase A's own value. A near-zero
 	# Phase B total quietly replacing a HEALTHY (positive) Phase A rate is exactly the false-zero this rule
@@ -506,7 +535,12 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
 		run
-	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>&1 &
+	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
+	# stderr from EVERYTHING inside run() (every jq/awk/curl call's own error text, otherwise completely
+	# invisible - a jq argument/parse failure prints there, not to $OUTFILE) goes to $BLOX_HSTATS_DEBUG_LOG
+	# when debugging, /dev/null otherwise (unchanged production behavior: this file is sourced by Hive's own
+	# agent, which must never see anything on this script's stdout/stderr - see the file header). A plain
+	# redirect, evaluated once right here in the parent, before the fork - no extra process, debugging or not.
 	CPID=$!
 
 	# A group-kill is only ever attempted against a pgid that: came from the handshake (so it is what the

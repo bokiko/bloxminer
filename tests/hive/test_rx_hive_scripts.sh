@@ -229,6 +229,25 @@ stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BA
 	 .stats.ver == "3.0.0 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
+# Coordinator (review of a4c4850): every SUM_OK-family fixture in this file omits `hashrate` from /2/summary
+# entirely, so Phase A always reports 0.00 and every one of these tests exercises Phase B's own /2/backends
+# path - useful, deliberate coverage (it is exactly what caught the GH-CI-only Phase B failure this fixture
+# was reviewed alongside), but NOT what a real XMRig 6.26.0 /2/summary reply actually looks like: it always
+# includes `hashrate.total`. Added here rather than changed into SUM_OK itself - SUM_OK is shared by dozens of
+# cases above and below whose own expected numbers depend on it staying exactly as it is (Phase A reporting 0
+# so Phase B's total is trusted unconditionally); changing it would need every one of those numbers reworked
+# for no benefit. This is a NEW, additional case: a realistic summary WITH hashrate.total, agreeing with
+# Phase B's own total (so both phases independently reach the same answer, proving Phase A's own hashrate.
+# total parsing - the `((.hashrate.total[0]?) // 0) | n0` in run()'s Phase A - is exercised by at least one
+# test, not just Phase B's richer path).
+SUM_WITH_HASHRATE=$(jq -nc '{uptime: 50, connection: {accepted: 2, rejected: 0}, algo: "rx/0", version: "6.26.0",
+	hashrate: {total: [2000.0, null, null]}}')
+BACK_SMALL=$(python3 -c 'import json; print(json.dumps([{"type": "cpu", "threads": [{"affinity": 0, "hashrate": [2000.0, None, None]}]}]))')
+reset_proc; listen 20032 1032 "$BLOX_DIR/xmrig"
+stats_case "realistic /2/summary WITH hashrate.total (unlike every SUM_OK-family case above/below): Phase A's own total agrees with Phase B's" \
+	20032 "$SUM_WITH_HASHRATE" "$BACK_SMALL" \
+	'.khs == "2.00" and .stats.hs == [2] and .stats.uptime == 50 and .stats.ar == [2, 0]'
+
 BACK_NULLS=$(python3 - <<'PY'
 import json
 threads = [{"affinity": c, "hashrate": [None, None, None]} for c in range(4)]
