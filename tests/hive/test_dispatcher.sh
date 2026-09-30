@@ -410,7 +410,7 @@ if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "
 #      instance's own rollback would refuse (only ever touches final=0), and a later Verus start's own
 #      current==ours check would fail forever - ~2.4 GiB pinned exactly like the original bug. Fixed:
 #      note_rx_hugepages_start now REOPENS a final=1 (or corrupt/legacy) record for a fresh note - keeping the
-#      ORIGINAL "prior" (when still provably ours - see 6f/6g below for the round-2 follow-up on that) but
+#      ORIGINAL "prior" (when still provably ours - see 6f/6g/6h below for the round-2/round-3 follow-up on that) but
 #      refreshing prelim/free0/boot/start_uptime and resetting final=0. A still-starting final=0 record is
 #      ALSO refreshed the same way now (the "rx restarted" case tested above) - the only case left completely
 #      untouched is no longer "any existing record", it is "none of the above apply" (nothing to refresh at all).
@@ -511,6 +511,35 @@ else
 	bad "external change then rx restart then verus: restores to the operator's own value (2000)" "ours_now=$ours_now $(cat "$SYSCTL_LOG" 2>/dev/null)"
 fi
 if [[ ! -e $HUGEFILE ]]; then ok "external change then rx restart then verus: ownership record removed (restore verified successful)"; else bad "external change then rx restart then verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# ---- 6h. PR #2 follow-up review round 3 (Codex): "Preserve the baseline after XMRig's normal page raise" -
+#      6g's own fix (current == prelim, exactly, for a final=0 record) was ITSELF too strict: XMRig's own
+#      huge-page allocation normally raises vm.nr_hugepages further, on top of whatever `hugepages -rx` already
+#      reserved, during its own startup - still well inside HUGEPAGES_STARTUP_WINDOW_S. A restart landing
+#      between that raise and the first finalize_rx_hugepages poll (current == prelim + XMRig's own delta, same
+#      boot) was being misread as "not provably owned", rebasing "prior" to the already-raised value - the
+#      exact bug this whole mechanism exists to prevent, just one step earlier. Simulates exactly that: a
+#      final=0 record (prelim=1200) whose live value has since moved to 1201 (XMRig's own raise, same boot,
+#      never touched by this package's own `hugepages -rx`) - a restart must still recognise this as owned
+#      (current >= prelim) and preserve the TRUE original prior (0), not rebase to 1201.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 0 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=0, prelim=1200, not yet finalized
+echo 1201 > "$PROCFILE"   # XMRig's own startup raises nr_hugepages further, still the same session/boot, still inside the window - no finalize yet
+HUGEPAGES_TARGET=1202; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # restart lands here: current(1201) >= prelim(1200), same boot -> still provably owned
+rec_afterraise=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_afterraise") == 0 && $(sed -n 's/^final=//p' <<< "$rec_afterraise") == 0 ]]; then
+	ok "restart-after-raise (prelim 1200, XMRig's own live value 1201, still final=0, same boot): TRUE original prior (0) preserved, not rebased to 1201"
+else
+	bad "restart-after-raise: prior preserved (0), not rebased to XMRig's own raised value" "$rec_afterraise"
+fi
+finalize_record_for_test   # this (restarted) instance finalizes with its own live value
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run   # verus start
+if grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then
+	ok "restart-after-raise then verus: restores to the TRUE original prior (0), never XMRig's own raised value"
+else
+	bad "restart-after-raise then verus: restores to the TRUE original prior (0)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "restart-after-raise then verus: ownership record removed (restore verified successful)"; else bad "restart-after-raise then verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
 
 # ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"
@@ -978,6 +1007,33 @@ else
 fi
 if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus again): still verus's own empty answer, no leftover from step D"; else bad "one shell, step E: no leftover from step D" "$lineE"; s11_fail=1; fi
 (( s11_fail )) && s11_dump_diagnostics
+
+# ============================================================== 12. Round 5 follow-up (Codex): "Normalize the
+# fallback timestamp to microseconds" - the dispatcher's OWN DEADLINE_US fallback (bloxminer/h-stats.sh, right
+# at its own true entry point, before engine selection or anything else) used to concatenate the raw
+# fractional string straight onto the whole-seconds part: EPOCHREALTIME's own fraction is always exactly 6
+# digits (real microseconds), but the `date +%s.%N` FALLBACK's is 9 (nanoseconds) - taken only on bash < 5, but
+# load-bearing if it ever is. Concatenated raw, DEADLINE_US itself was silently inflated by ~1000x whenever
+# that fallback path was ever taken - a deadline that should be ~2.4 s away would instead compute as roughly
+# 2,400 days away, meaning every downstream budget check (both engines' own remaining_us/have_budget_us, which
+# only ever fall back to their OWN local computation when DEADLINE_US is not already set - never true here,
+# since the dispatcher always sets it first) would inherit an effectively infinite budget and never correctly
+# bound anything. Forces the fallback path (EPOCHREALTIME explicitly unset in a fresh bash) and checks the
+# dispatcher's own exported $DEADLINE_US lands within a generous few seconds of a known-good reference - the
+# pre-fix concatenation would be off by roughly 1000x, nowhere near this tolerance. See both engines' own test
+# suites for the identical assertion on their own now_us().
+setup_pkg
+deadline_us_fallback=$(timeout 5 bash -c '
+	unset EPOCHREALTIME
+	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1
+	echo "$DEADLINE_US"
+' 2>/dev/null)
+ref_deadline_us=$(( $(date +%s) * 1000000 + 2400000 ))
+if [[ $deadline_us_fallback =~ ^[0-9]+$ ]] && (( deadline_us_fallback > ref_deadline_us - 10000000 && deadline_us_fallback < ref_deadline_us + 10000000 )); then
+	ok "dispatcher h-stats.sh DEADLINE_US fallback path (EPOCHREALTIME unset): normalized to real microseconds, not nanosecond-inflated"
+else
+	bad "dispatcher h-stats.sh DEADLINE_US fallback path: normalized to real microseconds" "DEADLINE_US=$deadline_us_fallback ref=$ref_deadline_us"
+fi
 
 if [[ -n $S11_API_PID ]] && kill -0 "$S11_API_PID" 2>/dev/null; then
 	bad "no leaked fake-API child process at suite end" "still alive: $S11_API_PID"

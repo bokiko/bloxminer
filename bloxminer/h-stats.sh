@@ -16,7 +16,14 @@ BLOX_HP_T0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}   # Round 5c: this poll'
 # engine's own collection does. Exported so the engine h-stats.sh sourced below inherits this SAME value
 # (its own DEADLINE_US computation is only a fallback for when it is sourced standalone, e.g. by a test, with
 # no dispatcher entry point above it to have set this already).
-BLOX_HP_T0_US="${BLOX_HP_T0%%.*}${BLOX_HP_T0#*.}"
+# Round 5f (Codex): EPOCHREALTIME's own fraction is always exactly 6 digits (real microseconds) already, but
+# the `date +%s.%N` FALLBACK above (bash < 5 only) is 9 (nanoseconds) - concatenating it raw, as before,
+# silently inflated DEADLINE_US by 1000x whenever that fallback path was ever taken. Pad with trailing zeros
+# first, then keep only the first 6 digits - normalizes either source (6-digit already, 9-digit, or anything
+# shorter) to exactly 6 real microsecond digits, no fork.
+BLOX_HP_T0_FRAC="${BLOX_HP_T0#*.}000000"
+BLOX_HP_T0_US="${BLOX_HP_T0%%.*}${BLOX_HP_T0_FRAC:0:6}"
+unset BLOX_HP_T0_FRAC
 export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))   # 2.4 s of the shared 3.0 s budget - matches both engines' BUDGET_US
 # A minimal, valid, engine-agnostic stats object - not an empty string - for the two failure points below.
 # Neither engine's own VER/algo is reliably known at this level (the manifest/config that would provide them

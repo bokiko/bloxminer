@@ -572,6 +572,32 @@ else
 fi
 bloxsense_says "$(fake_topo_json 4)"   # restore a fast bloxsense for anything after this point
 
+# ---- PR #2 follow-up review round 3 (Codex): "Normalize the fallback timestamp to microseconds" - now_us()
+#      (and this file's own DEADLINE_US fallback, right at the top) used to concatenate the raw fractional
+#      string straight onto the whole-seconds part: EPOCHREALTIME's own fraction is always exactly 6 digits
+#      (real microseconds), but the `date +%s.%N` FALLBACK's is 9 (nanoseconds) - taken only on bash < 5, but
+#      load-bearing if it ever is. Concatenated raw, every "microsecond" value this file computes off that
+#      fallback was silently inflated by ~1000x, blowing the whole 2.4 s budget arithmetic by three orders of
+#      magnitude (a deadline that should be ~2.4 s away would instead compute as roughly 2,400 days away).
+#      Forces the fallback path (EPOCHREALTIME explicitly unset in a fresh bash) and checks now_us()'s own
+#      $REPLY lands within a generous few seconds of a known-good reference (date +%s, scaled to real
+#      microseconds) - the pre-fix concatenation would be off by roughly 1000x, nowhere near this tolerance.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+reset_proc   # no fake API for this one at all (BLOX_API_PORT below points at nothing listening) - only now_us()
+	# itself is under test here, and a connection-refused Phase A curl fails fast, well within budget
+now_us_fallback=$(BLOX_API_PORT=19999 timeout 5 bash -c '
+	unset EPOCHREALTIME
+	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1
+	now_us
+	echo "$REPLY"
+' 2>/dev/null)
+ref_us=$(( $(date +%s) * 1000000 ))
+if [[ $now_us_fallback =~ ^[0-9]+$ ]] && (( now_us_fallback > ref_us - 10000000 && now_us_fallback < ref_us + 10000000 )); then
+	ok "now_us() fallback path (EPOCHREALTIME unset, date +%s.%N): normalized to real microseconds, not nanosecond-inflated"
+else
+	bad "now_us() fallback path: normalized to real microseconds" "now_us=$now_us_fallback ref_us=$ref_us"
+fi
+
 # ---- a bloxsense that TRAPS/IGNORES SIGTERM and sleeps indefinitely must still die (via the outer timeout's
 #      SIGKILL grace period reaching the SAME process group, per --foreground), never survive this script, and
 #      never block the parent on a pipe it still holds open (checked via a temp file, not a pipe, already)

@@ -45,9 +45,13 @@ khs=""; stats=""
 # happen AFTER this point, so they count against the budget too, never for free.
 if [[ -z ${DEADLINE_US:-} ]]; then
 	__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
-	__t_us="${__t%%.*}${__t#*.}"
+	# Round 5f (Codex): normalize the fraction to exactly 6 digits (microseconds) BEFORE concatenating - see
+	# now_us() below for the full rationale (EPOCHREALTIME's own fraction is already 6 digits, but the
+	# `date +%s.%N` fallback's is 9; padding then truncating handles either, no fork).
+	__t_frac="${__t#*.}000000"
+	__t_us="${__t%%.*}${__t_frac:0:6}"
 	DEADLINE_US=$(( __t_us + 2400000 ))
-	unset __t __t_us
+	unset __t __t_frac __t_us
 fi
 
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
@@ -80,9 +84,15 @@ cat > "$LIB" <<'LIBEOF'
 dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s verus[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }   # see the parent's own copy of this function for the full rationale
 
 now_us() {   # sets $REPLY = now, integer microseconds since epoch
-	local t=${EPOCHREALTIME:-}
+	local t=${EPOCHREALTIME:-} frac
 	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
-	REPLY="${t%%.*}${t#*.}"
+	# Round 5f (Codex): EPOCHREALTIME's own fraction is already exactly 6 digits (real microseconds), but the
+	# `date +%s.%N` fallback's is 9 (nanoseconds) - concatenating it raw, as before, silently inflated the
+	# result by 1000x whenever that fallback path was ever taken. Pad with trailing zeros first, then keep
+	# only the first 6 digits - normalizes either source (6-digit already, 9-digit, or shorter/missing) to
+	# exactly 6 real microsecond digits, no fork. See the RandomX engine's own now_us() for the full rationale.
+	frac="${t#*.}000000"
+	REPLY="${t%%.*}${frac:0:6}"
 }
 remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEADLINE_US, floored at 0 -
 	# DEADLINE_US is computed exactly once, by the PARENT, before the child is even launched (process

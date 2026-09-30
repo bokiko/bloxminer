@@ -359,7 +359,7 @@ log_hugepages_note() {
 # says. The only real question a pre-existing record raises is what "prior" - the TRUE pre-rx baseline this
 # whole mechanism exists to protect - should be for THIS new session.
 #
-# PR #2 follow-up review (Codex), two rounds:
+# PR #2 follow-up review (Codex), three rounds:
 #
 # (round 1) An existing record that is still final=0 used to be left COMPLETELY untouched (a "still starting,
 # never touch it" guard) - wrong: if the API never became reachable within HUGEPAGES_STARTUP_WINDOW_S (5 min)
@@ -378,12 +378,25 @@ log_hugepages_note() {
 # preserved when it is PROVABLY still this package's own, undisturbed reservation - the exact same proof
 # standard restore_verus_hugepages already uses for ITS OWN restore, just checked one step earlier and against
 # whichever value THIS record's own `final` state makes the right one to check: same boot_id AND (final=1:
-# current live value == the record's own "ours"; final=0: current live value == the record's own "prelim").
-# Anything else - a different boot, current not matching, or final is "conflict"/corrupt/legacy with nothing
-# trustworthy to check - means the old record can no longer positively vouch for its own "prior": the CURRENT
-# live value is taken as the new "prior" instead (the same as a genuinely first-ever note), which is the safer
-# of the two options named in the review (silently keeping a stale baseline vs. rebasing to what is actually
-# on the box right now) and is exactly what happens anyway when there was no record at all.
+# current live value == the record's own "ours"; final=0 (round 2): current live value == the record's own
+# "prelim"). Anything else - a different boot, current not matching, or final is "conflict"/corrupt/legacy
+# with nothing trustworthy to check - means the old record can no longer positively vouch for its own "prior":
+# the CURRENT live value is taken as the new "prior" instead (the same as a genuinely first-ever note), which
+# is the safer of the two options named in the review (silently keeping a stale baseline vs. rebasing to what
+# is actually on the box right now) and is exactly what happens anyway when there was no record at all.
+#
+# (round 3) Round 2's final=0 check (current == prelim, exactly) was ITSELF too strict: XMRig's own huge-page
+# allocation, on top of whatever `hugepages -rx` already reserved, normally raises vm.nr_hugepages further
+# during its own startup, still well inside HUGEPAGES_STARTUP_WINDOW_S - i.e. this is documented, expected,
+# in-policy behaviour for a session that is still exclusively ours, not tampering. A restart landing between
+# that raise and the first finalize_rx_hugepages poll (current == prelim + XMRig's own delta, same boot) was
+# being misread as "not provably owned" and rebasing "prior" to the already-raised value - the exact bug this
+# whole mechanism exists to prevent, just one step earlier. Fixed: for a final=0 record, same boot AND
+# `current >= prelim` counts as owned (current can only be >= prelim from this package's own reservation
+# growing during startup; it is never expected to shrink on its own). The final=1 rule is unchanged (exact
+# `current == ours`, since by then XMRig's own allocation is done and finalize_rx_hugepages has already
+# recorded the settled value) - only rebase, for either state, when boot differs or current is LOWER than
+# what this package itself is known to have reserved.
 #
 # Either way: after "prior" is settled, this runs Hive's `hugepages -rx` if present (see the top comment for
 # why), then reads vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id and
@@ -410,7 +423,17 @@ note_rx_hugepages_start() {
 				[[ $rec_ours =~ ^[0-9]+$ && $cur == "$rec_ours" ]] && owned=1
 			elif [[ $rec_final == 0 ]]; then
 				local rec_prelim; rec_prelim=$(_hp_field prelim)
-				[[ $rec_prelim =~ ^[0-9]+$ && $cur == "$rec_prelim" ]] && owned=1
+				# Round 5g (Codex): a plain equality check here was too strict. XMRig's OWN huge-page
+				# allocation, on top of whatever `hugepages -rx` already reserved, only ever RAISES
+				# vm.nr_hugepages further during its own normal startup - never lowers it - and that startup
+				# is still inside the documented exclusive-ownership window (HUGEPAGES_STARTUP_WINDOW_S) this
+				# final=0 state represents in the first place. A restart between that raise and the first
+				# finalize_rx_hugepages poll (current == prelim+delta, same boot) is therefore still THIS
+				# package's own, undisturbed session - not evidence of tampering - so `current >= prelim` is
+				# accepted as owned, consistent with the policy the window already grants. Only `current <
+				# prelim` (something took pages away since - an operator, a different reservation, anything
+				# that could not have come from XMRig's own startup raising the count) fails to vouch for it.
+				[[ $rec_prelim =~ ^[0-9]+$ ]] && (( cur >= rec_prelim )) && owned=1
 			fi   # "conflict", or anything else unrecognised (corrupt/legacy, no final= at all): never provably
 			     # owned - always rebase below, nothing here is trustworthy enough to check against
 		fi

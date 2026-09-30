@@ -487,6 +487,13 @@ that. If the reservation is never confirmed within the window, BloxMiner gives u
 session's record — it is logged once, and no restore will happen on the next Verus switch (the "unsupported"
 outcome above is scoped to that startup window alone, never open-ended).
 
+A RandomX restart *inside* that same window (Hive re-invoking the miner before confirmation — a flight-sheet
+edit, a watchdog restart, the API briefly unreachable) is expected and stays fully supported: BloxMiner still
+recognizes the reservation as its own (nothing else touched `vm.nr_hugepages` in the meantime, same boot) and
+keeps tracking the original pre-RandomX baseline for the eventual restore, even as XMRig's own value climbs
+further during its own startup. Only something that lowers `vm.nr_hugepages` below what BloxMiner itself
+reserved, or a reboot, breaks that continuity — and falls under "unsupported" above.
+
 **Restore conditions, on switching to the Verus engine.** The reservation is only ever restored automatically
 when **both** are true: the RandomX engine's reservation was finalized (confirmed, as above) in the *same
 boot*, and `vm.nr_hugepages` still equals exactly the value BloxMiner left it at (nothing else changed it in
