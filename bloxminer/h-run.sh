@@ -59,7 +59,19 @@ if [[ $engine == rx ]]; then
 		sleep 60
 		return 1 2>/dev/null || exit 1
 	fi
-	note_rx_hugepages_start
+	# PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - note_rx_
+	# hugepages_start now returns 1 (checked here, exactly like cpu_ok() just above) in exactly one case: an
+	# existing ownership record is stale (not provably this package's own current session) and could not be
+	# removed (h-common.sh's own _hp_invalidate). That check has to fail CLOSED here, not just inside that
+	# function: engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless of
+	# anything the dispatcher decided, so the ONLY way to actually keep vm.nr_hugepages untouched - rather
+	# than merely skipping THIS package's own tracking of a reservation that happens anyway - is to never
+	# reach that exec at all, same as a failed CPU gate already does one line above.
+	if ! note_rx_hugepages_start; then
+		fail "BloxMiner (RandomX engine): an existing huge-page ownership record is stale and could not be invalidated ($HUGEPAGES_FILE unwritable?) - refusing to start rather than risk a later Verus restore trusting it; see this package's own log"
+		sleep 60
+		return 1 2>/dev/null || exit 1
+	fi
 elif [[ $engine == verus ]]; then
 	restore_verus_hugepages
 fi

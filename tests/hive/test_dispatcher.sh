@@ -318,6 +318,27 @@ fi
 exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
+# PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - stubs for note_rx_
+# hugepages_start's own write path (`rm -f`/`mv -f` on $HUGEFILE), toggled independently via MV_FAIL/RM_FAIL so
+# tests below can deterministically force EITHER the refreshed record's own write to fail (MV_FAIL, standing in
+# for a full/unwritable STATEDIR, exactly as h-common.sh's own review comment names it) OR the stale record's
+# own removal to fail (RM_FAIL, the "stale-record-removal-fails" case) - independent of this box's real
+# filesystem permissions or whether the suite happens to be running as root (which would make a real chmod-
+# based read-only-directory simulation meaningless: root bypasses ordinary permission checks for unlink/
+# rename). Both default to passthrough (real rm/mv) so every OTHER test in this file, none of which sets
+# either var, is completely unaffected.
+cat > "$FAKEBIN/rm" <<'SH'
+#!/bin/sh
+[ "${RM_FAIL:-0}" = "1" ] && exit 1
+exec /bin/rm "$@"
+SH
+chmod +x "$FAKEBIN/rm"
+cat > "$FAKEBIN/mv" <<'SH'
+#!/bin/sh
+[ "${MV_FAIL:-0}" = "1" ] && exit 1
+exec /bin/mv "$@"
+SH
+chmod +x "$FAKEBIN/mv"
 # A working xmrig STUB (exits 0 immediately, real exec succeeds) so a fresh rx start's own final `exec ./xmrig`
 # in engines/rx/h-run.sh SUCCEEDS - never triggers that file's own rollback_rx_hugepages_reservation EXIT trap
 # (PR #2 follow-up review), which this section does NOT intend to exercise: it tests note_rx_hugepages_start's
@@ -332,7 +353,7 @@ chmod +x "$BLOX_DIR/xmrig"
 SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE MEMINFO BOOTFILE
 sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
 hugepages_called() { grep -q '^hugepages ' "$SYSCTL_LOG" 2>/dev/null; }
-run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # verus's own ./bloxminer binary is absent (exec fails harmlessly there); rx's ./xmrig is the working stub above
+run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" MV_FAIL="${MV_FAIL:-0}" RM_FAIL="${RM_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # verus's own ./bloxminer binary is absent (exec fails harmlessly there); rx's ./xmrig is the working stub above
 # marks the CURRENT record final=1, ours=<live nr_hugepages> - simulates a successful finalize_rx_hugepages
 # poll (real end-to-end finalization behaviour, including the exact xmrig-src-derived formula, is covered in
 # tests/hive/test_hugepage_finalization.sh) so this section can test restore_verus_hugepages's OWN logic.
@@ -598,6 +619,71 @@ if [[ $(sed -n 's/^prior=//p' <<< "$rec_inwindow") == 0 ]]; then
 	ok "regression guard: IN-WINDOW restart-after-raise still preserves the TRUE original prior (0), Round 4's window check did not break 6h"
 else
 	bad "regression guard: in-window restart-after-raise still preserves prior (0)" "$rec_inwindow"
+fi
+
+# ---- 6k. PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - the exact
+#      counterexample. A final=1 record (prior=512, ours=1200) from a FINISHED 1st rx instance; an operator
+#      then raises nr_hugepages to 2000 (no longer provably ours - 6g's own scenario). A 2nd rx instance starts:
+#      note_rx_hugepages_start correctly determines "not owned" and must rebase prior to 2000 - but this time
+#      the REFRESHED record's own write (after `hugepages -rx` reserves, landing back on 1200 - the SAME value
+#      the OLD, now-superseded record's own "ours" already held) FAILS (MV_FAIL, standing in for a full/
+#      unwritable STATEDIR). Before this fix, the OLD record would have been left untouched by a failed write -
+#      final=1, prior=512, ours=1200 - EXACTLY matching the live value this SAME rx session's own reservation
+#      just produced, so a later Verus start's cur==ours check would have wrongly "confirmed" it and restored
+#      the stale 512, discarding the operator's real 2000 baseline entirely. Must instead: invalidate (remove)
+#      the OLD record BEFORE ever reserving - proven here by the record being GONE even though the refresh
+#      write itself still fails - so nothing stale is left for a later Verus start to wrongly trust.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
+finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
+echo 2000 > "$PROCFILE"   # operator raises nr_hugepages - the 1st instance's record can no longer vouch for it
+stale_record=$(cat "$HUGEFILE")
+HUGEPAGES_TARGET=1200; MV_FAIL=1; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run; MV_FAIL=0   # 2nd instance: not owned (cur 2000 != ours 1200) -> must invalidate before reserving; its OWN refresh write then also fails
+if [[ ! -e $HUGEFILE ]]; then
+	ok "stale record invalidated before refresh (even though the refresh write itself then failed) - no record left at all, never the stale final=1/prior=512/ours=1200"
+else
+	bad "stale record invalidated before refresh" "still present, and != stale: $(cat "$HUGEFILE") (was: $stale_record)"
+fi
+if grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then ok "stale-record-invalidate-then-write-fails: hugepages -rx still ran for this genuinely new session (XMRig starts fine either way)"; else bad "stale-record-invalidate-then-write-fails: hugepages -rx still ran" "$(cat "$SYSCTL_LOG")"; fi
+# The critical assertion: a Verus start afterwards must NEVER restore the stale 512 - with no record at all,
+# restore_verus_hugepages has nothing to act on, which is exactly the safe outcome (never a wrong restore,
+# even though this particular rx->verus transition's own baseline is not automatically restored either).
+: > "$SYSCTL_LOG"; hconfig "p:1" "W" "" "" ""; run_h_run
+if ! sysctl_called; then
+	ok "stale-record-invalidate-then-write-fails, then Verus start: NEVER restores the stale 512 (no record to act on)"
+else
+	bad "stale-record-invalidate-then-write-fails, then Verus start: never restores the stale 512" "$(cat "$SYSCTL_LOG")"
+fi
+
+# ---- 6l. PR #2 follow-up review (Codex): "stale-record-removal-fails case" - same starting point as 6k, but
+#      this time the INVALIDATION itself (removing the stale record) fails (RM_FAIL). The simpler, safer of the
+#      two options named in the review: abort BEFORE ever calling `hugepages -rx` at all, leaving vm.nr_hugepages
+#      completely untouched (the operator's own 2000 stands) and the stale record exactly as it was (still
+#      final=1/prior=512/ours=1200) - logged once. Crucially, this does NOT re-expose the original bug: because
+#      nr_hugepages was never touched, the live value (2000) still does not match the stale record's own "ours"
+#      (1200), so a later Verus start's existing cur==ours gate refuses it on its own, exactly as it already
+#      would without any of this fix - the stale record is left inert, not made harmless some other way.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
+finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
+echo 2000 > "$PROCFILE"   # operator raises nr_hugepages - the 1st instance's record can no longer vouch for it
+stale_record2=$(cat "$HUGEFILE")
+RM_FAIL=1; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run; RM_FAIL=0   # 2nd instance: not owned, invalidation itself fails -> must abort before reserving
+if [[ -e $HUGEFILE && $(cat "$HUGEFILE") == "$stale_record2" ]]; then
+	ok "stale-record-removal-fails: record left EXACTLY as it was (untouched), never partially rewritten"
+else
+	bad "stale-record-removal-fails: record left exactly as it was" "$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo MISSING) (was: $stale_record2)"
+fi
+if ! grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then ok "stale-record-removal-fails: hugepages -rx is NEVER called - this rx start aborts before ever reserving"; else bad "stale-record-removal-fails: hugepages -rx never called" "$(cat "$SYSCTL_LOG")"; fi
+if [[ $(cat "$PROCFILE") == 2000 ]]; then ok "stale-record-removal-fails: vm.nr_hugepages left completely untouched (operator's own 2000 stands)"; else bad "stale-record-removal-fails: vm.nr_hugepages left untouched (2000)" "$(cat "$PROCFILE")"; fi
+if grep -q "could not be removed" "$T/log/bloxminer.log" 2>/dev/null; then ok "stale-record-removal-fails: refusal logged"; else bad "stale-record-removal-fails: refusal logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+# A later Verus start must still correctly refuse this now-untouched stale record (cur 2000 != its own ours 1200) -
+# proving it was left inert, not merely left in place and gotten lucky.
+: > "$SYSCTL_LOG"; hconfig "p:1" "W" "" "" ""; run_h_run
+if ! sysctl_called && [[ -e $HUGEFILE ]]; then
+	ok "stale-record-removal-fails, then Verus start: still correctly refuses the untouched stale record (cur 2000 != ours 1200), never restores 512"
+else
+	bad "stale-record-removal-fails, then Verus start: still correctly refuses the stale record" "$(cat "$SYSCTL_LOG")"
 fi
 
 # ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)

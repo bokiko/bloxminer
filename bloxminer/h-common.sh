@@ -390,6 +390,20 @@ log_hugepages_note() {
 	{ printf '%s %s\n' "$(date '+%F %T' 2>/dev/null)" "$1" >> "${CUSTOM_LOG_BASENAME:-$STATEDIR/bloxminer}.log"; } 2>/dev/null
 }
 
+# _hp_invalidate - removes the ownership record and PROVES it is actually gone, never just trusting `rm -f`'s
+# own exit status (the same belt-and-braces standard restore_verus_hugepages already applies to ITS OWN writes:
+# reading vm.nr_hugepages back after sysctl, never trusting sysctl's own exit status alone). Returns 0 only
+# when $HUGEPAGES_FILE provably does not exist any more (including "it never existed in the first place");
+# returns 1 otherwise. A full filesystem does NOT by itself block an unlink (that needs write+execute
+# permission on the CONTAINING directory, not free space) - this exists for the case that genuinely can: an
+# unwritable/read-only STATEDIR, or any other reason rm silently fails. See note_rx_hugepages_start's own call
+# for why a stale record that cannot be removed must never simply be left in place.
+_hp_invalidate() {
+	rm -f "$HUGEPAGES_FILE" 2>/dev/null
+	[[ -e $HUGEPAGES_FILE ]] && return 1
+	return 0
+}
+
 # note_rx_hugepages_start - called just before exec'ing the rx engine. EVERY call means a genuinely NEW XMRig
 # process is about to start: h-run.sh's own final action is always an unconditional `exec ./xmrig` (this file's
 # own header), so Hive calling it again - a flight-sheet edit, a watchdog restart after a hang, the API being
@@ -516,6 +530,40 @@ note_rx_hugepages_start() {
 			prior=$rec_prior   # still provably this package's own, undisturbed reservation - preserve the
 				# TRUE original baseline rather than re-deriving it from the current (already-raised) value
 		else
+			# PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - the
+			# record still on disk right now describes a session this package can no longer positively vouch
+			# for (a different boot, an operator/foreign change, an expired window, or a corrupt/legacy
+			# record) and is about to be superseded by a brand-new one below. Between now and that new write,
+			# the OLD record must never be left sitting there for a LATER call to still trust: it is removed
+			# FIRST, with removal PROVEN (never trusting `rm`'s own exit status alone - see _hp_invalidate),
+			# closing exactly the gap Codex's counterexample used - a failed refresh write further down (a
+			# full/unwritable STATEDIR) leaving the OLD, already-superseded record in place, still final=1
+			# with some OLD prior/ours, for finalize_rx_hugepages to skip (final is not 0) and
+			# restore_verus_hugepages to later wrongly trust IF this new session's own `hugepages -rx`
+			# reservation happens to land on the exact value the old record's own "ours" recorded - plausible,
+			# since that reservation is a near-deterministic function of NUMA/CPU topology, not a fresh random
+			# number each time - restoring the OLD "prior" over whatever baseline (an operator's own change,
+			# or simply "no session was ever attempted") is actually correct right now.
+			#
+			# If the stale record cannot be removed (STATEDIR unwritable - a full filesystem does not by
+			# itself block an unlink, which needs directory write permission, not free space), this function
+			# signals failure (return 1, checked by the caller - see below) instead of proceeding - the
+			# simpler and safer of the two options Codex named. Proceeding anyway would NOT actually leave
+			# vm.nr_hugepages untouched the way it might look from here alone: engines/rx/h-run.sh runs its
+			# OWN, entirely unconditional `hugepages -rx` call right before exec'ing XMRig, regardless of
+			# anything this function decides - so "abort before reserving" only means anything if the CALLER
+			# (bloxminer/h-run.sh) also never reaches that exec at all once this returns failure, exactly like
+			# it already refuses to reach it on a failed cpu_ok() check just above this call. That is the
+			# actual mechanism that keeps vm.nr_hugepages untouched and the stale record's own numbers
+			# (whatever they still say) describing a value that stays not-live - the same mismatch that
+			# already makes restore_verus_hugepages refuse safely on its own next check, with nothing new to
+			# get wrong. The cost is this rx session refusing to start at all until the write problem is fixed
+			# (a real cost, but the alternative - proceeding while a stale, coincidence-prone record sits
+			# there unneutralised - is exactly the bug this whole fix exists to close).
+			_hp_invalidate || {
+				log_hugepages_note "BloxMiner: existing huge-page ownership record is stale (not provably this package's own current session) but could not be removed ($HUGEPAGES_FILE unwritable?) - refusing to start rx this time rather than risk a later Verus restore trusting it; vm.nr_hugepages left untouched, record left as-is"
+				return 1
+			}
 			[[ -r $proc ]] || return 0
 			prior=$(<"$proc") 2>/dev/null   # not provably ours any more - rebase to whatever is on the box
 				# right now, exactly like a genuinely first-ever note (see the header comment for why this is
@@ -552,6 +600,13 @@ note_rx_hugepages_start() {
 	{ printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=0\n' \
 		"$prior" "$prelim" "$free0" "$boot" "$start_uptime" > "$tmp"; } 2>/dev/null \
 		&& mv -f "$tmp" "$HUGEPAGES_FILE" 2>/dev/null
+	return 0   # PR #2 follow-up review audit: a failed write HERE (full/unwritable STATEDIR) is never worth
+		# blocking this rx session over, unlike the _hp_invalidate failure above - by this point any stale
+		# record was already either genuinely still ours (preserved, nothing to invalidate) or successfully
+		# removed (the "not owned" branch's own _hp_invalidate, already proven to have succeeded or this
+		# function would already have returned 1 before ever reaching here) - so a failed write here just
+		# means no record at all going forward, exactly the already-safe "next Verus start leaves
+		# vm.nr_hugepages untouched" outcome the three checks just above already accept for the same reason.
 }
 
 # finalize_rx_hugepages - called from the TOP-LEVEL h-stats.sh (never from here, never from h-run.sh), once per
@@ -646,7 +701,14 @@ finalize_rx_hugepages() {
 	if [[ ! $now_uptime =~ ^[0-9]+$ ]]; then return 0; fi   # can't measure the window right now - retry next poll
 	if (( now_uptime - start_uptime > HUGEPAGES_STARTUP_WINDOW_S )); then
 		log_hugepages_note "BloxMiner: rx's exclusive huge-page ownership window (${HUGEPAGES_STARTUP_WINDOW_S}s from the dispatcher's own \`hugepages -rx\` call) passed before readiness was confirmed - never finalizing this rx session, ownership record kept"
-		_hp_rewrite conflict
+		# PR #2 follow-up review (Codex) audit: unlike note_rx_hugepages_start's own stale-record case (see
+		# _hp_invalidate), a failed _hp_rewrite here leaves the record exactly as it already was - still
+		# final=0, still describing THIS same session's own prior/prelim/free0/boot/start_uptime, none of
+		# which change under a "conflict"/finalize write. restore_verus_hugepages requires final==1 exactly,
+		# so this can never be wrongly trusted for a restore; the only cost of a persistently failing write
+		# is this check simply repeating every poll (logged once already, above) rather than settling into
+		# the terminal "conflict" state - logged here too, for operator visibility, never a behaviour change.
+		_hp_rewrite conflict || log_hugepages_note "BloxMiner: could not persist the 'conflict' huge-page ownership record ($HUGEPAGES_FILE unwritable?) - stays final=0, this check will simply repeat next poll"
 		return 0
 	fi
 
@@ -660,14 +722,14 @@ finalize_rx_hugepages() {
 		need_pages=$(_hp_xmrig_2mb_need_pages "$owner_pid")
 		if [[ ! $need_pages =~ ^[0-9]+$ ]]; then
 			log_hugepages_note "BloxMiner: 1gb-pages is enabled and could not read a complete 2 MB-only huge-page mapping from /proc/$owner_pid/smaps (KernelPageSize/Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
-			_hp_rewrite conflict
+			_hp_rewrite conflict || log_hugepages_note "BloxMiner: could not persist the 'conflict' huge-page ownership record ($HUGEPAGES_FILE unwritable?) - stays final=0, this check will simply repeat next poll"
 			return 0
 		fi
 	else
 		need_pages=$(_hp_xmrig_need_pages "$owner_pid")
 		if [[ ! $need_pages =~ ^[0-9]+$ || $need_pages -le 0 ]]; then
 			log_hugepages_note "BloxMiner: could not read a complete huge-page mapping from /proc/$owner_pid/smaps_rollup (Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
-			_hp_rewrite conflict
+			_hp_rewrite conflict || log_hugepages_note "BloxMiner: could not persist the 'conflict' huge-page ownership record ($HUGEPAGES_FILE unwritable?) - stays final=0, this check will simply repeat next poll"
 			return 0
 		fi
 	fi
@@ -682,11 +744,17 @@ finalize_rx_hugepages() {
 	if [[ $cur != "$predicted" ]]; then
 		local need_src="/proc/$owner_pid/smaps_rollup"; (( onegb )) && need_src="/proc/$owner_pid/smaps, 2 MB-only"
 		log_hugepages_note "BloxMiner: vm.nr_hugepages ($cur) does not match XMRig's own predicted reservation (prelim $prelim + max(0, need $need_pages - free0 $free0) = $predicted, need from $need_src) once the dataset finished allocating - something else changed it during the startup window; never finalizing this rx session, record kept"
-		_hp_rewrite conflict
+		_hp_rewrite conflict || log_hugepages_note "BloxMiner: could not persist the 'conflict' huge-page ownership record ($HUGEPAGES_FILE unwritable?) - stays final=0, this check will simply repeat next poll"
 		return 0
 	fi
 
-	_hp_rewrite 1 "$cur"   # everything XMRig itself raised, positively confirmed via its own kernel-mapped huge pages, nothing foreign involved
+	# everything XMRig itself raised, positively confirmed via its own kernel-mapped huge pages, nothing
+	# foreign involved. A failed write here (PR #2 follow-up review audit) leaves the record exactly as it
+	# already was - still final=0, still this same session's own fields - never a stale record from some
+	# OTHER session (that class of risk is note_rx_hugepages_start's own, closed by _hp_invalidate above);
+	# the only cost is this session simply never finalizing (safe: restore_verus_hugepages requires final==1
+	# exactly) and this check retrying every poll until it either succeeds or the startup window expires.
+	_hp_rewrite 1 "$cur" || log_hugepages_note "BloxMiner: huge-page reservation confirmed (ours=$cur) but the finalized record could not be persisted ($HUGEPAGES_FILE unwritable?) - stays final=0, finalization will simply be re-attempted next poll"
 }
 
 # _hp_bounded_still_running <cpid> <verified pgid, or empty> - true if anything remains: the WHOLE verified
@@ -885,7 +953,16 @@ restore_verus_hugepages() {
 	if command -v sysctl > /dev/null 2>&1 && sysctl -q -w vm.nr_hugepages="$prior" 2>/dev/null; then
 		local verify=""; [[ -r $proc ]] && verify=$(<"$proc") 2>/dev/null
 		if [[ $verify == "$prior" ]]; then
-			rm -f "$HUGEPAGES_FILE" 2>/dev/null   # only consumed once the restore is verified, by readback, to have succeeded
+			# PR #2 follow-up review (Codex) audit: only consumed once the restore is verified, by readback,
+			# to have succeeded. If removal itself fails (STATEDIR unwritable), the record lingers with
+			# final=1/ours=$ours describing an rx session that is now OVER (nr_hugepages == prior, not ours
+			# any more) - but this is never dangerous the way an un-invalidated STALE record was before
+			# _hp_invalidate existed: the very next rx start's own note_rx_hugepages_start sees cur(==prior)
+			# != rec_ours immediately (prior is essentially never equal to the ours it was reserved on top
+			# of), correctly determines "not owned", and invalidates this exact leftover record itself before
+			# reserving again - the same mechanism that closes the ORIGINAL bug also mops this one up. Logged
+			# here purely for operator visibility, never a behaviour change.
+			_hp_invalidate || log_hugepages_note "BloxMiner: restored vm.nr_hugepages to $prior but could not remove the now-consumed ownership record ($HUGEPAGES_FILE) - a later rx start's own invalidation will clear it before reserving again"
 		else
 			log_hugepages_note "BloxMiner: restore write to $prior did not read back correctly (now=${verify:-<unreadable>}) - record kept for a later attempt"
 		fi
