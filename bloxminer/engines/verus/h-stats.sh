@@ -244,18 +244,24 @@ run() {
 	# had already safely captured. Validating here, before touching $khs/$stats/$OUTFILE, is what prevents
 	# that; a caught failure leaves BOTH the globals and the file exactly as Phase A already left them.
 	n=${#hs[@]}
+	# The composition AND its validation are folded into ONE if-condition (via &&), not run as bare statements
+	# checked afterward - see rx/h-stats.sh's own copy of this same construct for the full rationale (a bare
+	# failing statement outside an if/while condition risks the whole script being torn down by an inherited
+	# shell option before ever reaching an "if this failed" check that comes after it; every command that
+	# decides whether this replaces Phase A's result lives inside the if's own condition instead, which bash's
+	# error-handling rules always shield from that class of surprise).
 	local new_stats
-	new_stats=$(jq -nc \
-		--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
-		--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
-		--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
-		--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
-		--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
-		'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
-		  algo: "verushash", ver: $ver}
-		 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
-	if jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
-		(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
+	if new_stats=$(jq -nc \
+			--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
+			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
+			--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
+			--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
+			--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
+			  algo: "verushash", ver: $ver}
+			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)') \
+		&& jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
 	then
 		khs=$khs_b
 		stats=$new_stats

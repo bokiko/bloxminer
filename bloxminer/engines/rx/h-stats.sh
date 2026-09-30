@@ -235,12 +235,30 @@ fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON numbe
 }
 
 # write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
-# after Phase A and again after Phase B if it improves on it - see the file header. No fork: every caller
-# passes a khs that is already a plain, validated numeric string (never attacker/API-controlled text - it is
-# always the output of `%.2f`-style awk formatting or a jq `round`), so the wrapper JSON is built with `printf`
-# instead of forking jq a second time to do only string interpolation jq would do anyway; $2 is always already
-# valid JSON text produced by this same file's own jq calls.
+# after Phase A and again after Phase B if it improves on it - see the file header. No fork in the normal
+# path: every caller is EXPECTED to pass a khs that is already a plain, validated numeric string and a stats
+# that is already valid JSON text produced by this same file's own jq calls, so the wrapper JSON is built with
+# `printf` instead of forking jq a second time to do only string interpolation jq would do anyway.
+# This is nonetheless the SINGLE choke point every write in this file goes through (Phase A's own composition,
+# Phase B's replacement, the LIB-creation-failure fallback) - an upstream caller-side validation gap, or a
+# transient failure this file has not yet learned to guard against upstream (an already-observed, real class
+# of bug: an intermediate jq call in a caller's own composition failing under conditions never fully
+# reproduced outside GitHub Actions' own runners), could otherwise still reach here with a malformed $1/$2 and
+# silently write invalid JSON over an already-good $OUTFILE. Refusing here, at the one place that can see
+# both halves right before they become permanent, closes that gap regardless of which upstream caller or
+# condition produced it. Bash-only pattern checks (no fork) - this runs on every phase boundary, so a jq
+# structural check here would cost a fork every single call; these checks refuse exactly the failure class
+# this exists for (an empty or clearly non-JSON $2, or a $1 that is not a plain non-negative number) without
+# that cost.
 write_result() {
+	if [[ ! $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+		dbg "write_result: REFUSED - khs is not a plain non-negative number (was: '$1') - \$OUTFILE left as-is"
+		return 1
+	fi
+	if [[ $2 != "{"*"}" ]]; then
+		dbg "write_result: REFUSED - stats does not look like a JSON object (was: '$2') - \$OUTFILE left as-is"
+		return 1
+	fi
 	local tmp="$OUTFILE.w.$$"
 	{ printf '{"khs":"%s","stats":%s}' "$1" "$2" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
@@ -491,20 +509,33 @@ run() {
 		# with `{"khs":"500.00","stats":}` - syntactically invalid JSON - and the PARENT's own read-back guard
 		# (which only ever sees $OUTFILE, never these in-process variables) would have no choice but to
 		# discard the whole thing and report the safe fallback 0, destroying a real positive rate Phase A had
-		# already safely captured. Validating here, before ever touching $khs/$stats/$OUTFILE, is what
-		# actually prevents that - a caught failure below leaves BOTH the globals and the file exactly as
-		# Phase A already left them.
+		# already safely captured.
+		# The composition AND its validation are both folded into ONE if-condition (via &&), not run as bare
+		# statements first and checked afterward: whatever the exact reason a caller-side jq composition can
+		# fail (this exact class was reproduced once already, in three-separate-jq-calls form, on a slower/
+		# more resource-pressured runner - see a714388's own history; a second, still only partially understood
+		# instance of "many things succeed, then one specific multi-arg jq call fails" was observed on GitHub
+		# Actions again here), a bare failing statement OUTSIDE an if/while condition risks the whole script
+		# being torn down by an inherited shell option (e.g. errexit, however it reached this process - CI
+		# runners are not guaranteed to start every nested shell the same way a manual invocation does) before
+		# ever reaching an "if this failed" check that comes AFTER it. Every command that decides whether this
+		# replaces Phase A's result lives inside the if's own condition, which bash's error-handling rules
+		# always shield from that class of surprise regardless of what caused the failure.
+		# write_result() ITSELF also independently refuses an empty/malformed $stats or non-numeric $khs (see
+		# its own header) - belt and suspenders: even a gap in this validation, upstream of write_result, could
+		# never actually land invalid JSON in $OUTFILE.
 		local new_stats
 		[[ -n ${BLOX_HSTATS_TEST_FORCE_STATS_FAIL:-} ]] && power_raw='BROKEN'   # tests only: not valid JSON,
 			# so the --argjson below fails fatally - simulates the transient jq/fork failure this whole
 			# validate-before-write guard exists for, without weakening anything it guards against
-		new_stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
-			--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
-			--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
-			'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
-			 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
-		if jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
-			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
+		dbg "phase B: composing final stats - hs_src=$(jq -c '[.[].khs]' <<< "$rows" 2>&1) temp_src=$(jq -c '[.[].temp]' <<< "$rows" 2>&1) acc=$acc rej=$rej uptime=$uptime ver=$VER algo=$algo power_raw=$power_raw"
+		if new_stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
+				--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
+				--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
+				'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
+				 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)') \
+			&& jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+				(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
 		then
 			khs=$phaseb_total
 			stats=$new_stats
