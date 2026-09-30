@@ -38,15 +38,24 @@ fi
 # UNCONDITIONALLY, before the rx engine's own h-run.sh ever got a chance to reject a host without AES-NI - and
 # because XMRig then never ran, that reservation's ownership record could never finalize, permanently pinning
 # the memory until reboot (engines/rx/h-run.sh's own CPU gate rejects the start, but only AFTER this dispatcher
-# had already reserved). Fixed by running the SAME check first: the rx engine's own h-run.sh supports being
-# sourced in a preflight-only mode (BLOX_RX_PREFLIGHT_ONLY=1) that runs nothing but its own cpu_ok() and
-# returns its exact exit status - reusing that one function directly, rather than a second, hand-copied CPU
-# flag check here, is what makes it impossible for the two to ever drift apart. No reservation is made at all
-# on a rejected host; engines/rx/h-run.sh's own general EXIT-trap rollback (see its own header) is the
-# remaining safety net for any OTHER reason an rx start might fail after this dispatcher's own reservation.
+# had already reserved).
+#
+# PR #2 follow-up review (Codex): an earlier fix here sourced engines/rx/h-run.sh ITSELF, in a special env-var-
+# gated "preflight-only" mode, relying on that file's own early `return` to stop before its other side effects
+# (including the EXIT trap it installs) - correct, but harder to verify by inspection than it needed to be.
+# Fixed to remove that whole class of question: engines/rx/cpu-gate.sh is nothing but cpu_ok()'s own definition
+# - sourcing it can never have a side effect beyond defining that one function, so there is no "does the early
+# return actually fire first" for a reviewer to have to trust. cpu_ok() is then called directly, in plain
+# sight, right here, BEFORE note_rx_hugepages_start - reusing that one function (also called by engines/rx/
+# h-run.sh's own, unchanged, defense-in-depth check before ITS OWN `hugepages -rx`) is what makes it impossible
+# for the two checks to ever drift apart. No reservation is made at all on a rejected host: `hugepages -rx` is
+# never called, no record is ever written. engines/rx/h-run.sh's own general EXIT-trap rollback (see its own
+# header) is the remaining safety net for any OTHER reason an rx start might fail after this dispatcher's own
+# reservation.
 if [[ $engine == rx ]]; then
-	if ! BLOX_RX_PREFLIGHT_ONLY=1 . "$BLOX_DIR/engines/rx/h-run.sh"; then
-		fail "BloxMiner-X needs an x86-64 CPU with AES-NI (RandomX requires AES acceleration)"
+	. "$BLOX_DIR/engines/rx/cpu-gate.sh"   # cpu_ok() only - no other side effect at all, see that file's header
+	if ! cpu_ok; then
+		fail "BloxMiner (RandomX engine) needs an x86-64 CPU with AES-NI (RandomX requires AES acceleration)"
 		sleep 60
 		return 1 2>/dev/null || exit 1
 	fi

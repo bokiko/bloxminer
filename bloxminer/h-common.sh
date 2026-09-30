@@ -349,25 +349,56 @@ log_hugepages_note() {
 	{ printf '%s %s\n' "$(date '+%F %T' 2>/dev/null)" "$1" >> "${CUSTOM_LOG_BASENAME:-$STATEDIR/bloxminer}.log"; } 2>/dev/null
 }
 
-# note_rx_hugepages_start - called just before exec'ing the rx engine. ONLY if no record already exists (an rx
-# restart - e.g. a flight-sheet edit that keeps the same algo - must never re-derive "prior"/"prelim", or rx's
-# own already-raised value would become the "prior" restored on the next Verus start): reads the CURRENT
-# vm.nr_hugepages ("prior"), runs Hive's `hugepages -rx` if present (see the top comment for why), then reads
-# vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id and (Round 5c)
-# /proc/uptime ("start_uptime" - the exclusive-ownership window's own clock, see the top-of-section comment).
-# No-op entirely (no record written) if the record already exists, or if "prior"/"prelim"/"free0"/"start_uptime"
-# cannot each be read as a known-good number - finalize_rx_hugepages (h-stats.sh) needs every one of them to
-# compute XMRig's own predicted total and to bound the window, and writing a record with any of them missing
-# would let those checks never fire safely, so this function simply never produces that record in the first
-# place. `final=0` marks it not yet finalized; `ours` is deliberately NOT written here any more (Round 5 - see
-# the top-of-section comment for why "the value right after `hugepages -rx`" was wrong) - it is only ever
-# written by finalize_rx_hugepages, once XMRig's own reported numbers confirm what it is.
+# note_rx_hugepages_start - called just before exec'ing the rx engine.
+#
+# An EXISTING record that is still final=0 (an rx restart that has not yet reached readiness - e.g. a
+# flight-sheet edit that keeps the same algo, or Hive simply calling h-run.sh again while the SAME xmrig
+# instance is still starting up) is left completely untouched: this function must never re-derive "prior"/
+# "prelim" over the top of it, or the ALREADY-STARTING rx's own already-raised value would become the "prior"
+# restored on the next Verus start.
+#
+# PR #2 follow-up review (Codex): an existing record that is ALREADY final=1 (confirmed, from a PREVIOUS xmrig
+# instance) - or "conflict", or a legacy/corrupt record with no readable final= at all - is a DIFFERENT case:
+# it describes a session that is OVER, not one still starting up, so THIS call means a genuinely NEW RandomX
+# process is about to start (a real restart, not just a resourced config). The record must be REOPENED for
+# it: this file's own "hugepages -rx" call is about to run again regardless (unconditionally, right below, and
+# again from engines/rx/h-run.sh's own call after this) and can move vm.nr_hugepages again (e.g. 1200 -> 1201)
+# - if the OLD record were left standing (final=1, ours=<the PREVIOUS instance's own value>) while the NEW
+# instance's own reservation changes the live value further, this NEW start's own eventual finalize_rx_hugepages
+# call would refuse to even attempt finalizing (it already requires final==0 to try at all), AND this new
+# start's own rollback (engines/rx/h-run.sh, if THIS start then aborts) would ALSO refuse (it only ever touches
+# final=0 records) - either way, the record goes permanently stale and a later Verus start's own `current ==
+# ours` check fails forever, pinning the memory exactly like the original bug this whole mechanism exists to
+# prevent. Reopening keeps the ORIGINAL "prior" (the true pre-rx baseline, read from the OLD record - never
+# re-derived from the CURRENT live value, which already reflects that PREVIOUS instance's own reservation, not
+# the real baseline), refreshes prelim/free0/boot/start_uptime to what THIS new reservation is about to
+# produce, and resets final=0 - exactly like a first-ever note, just with a preserved "prior".
+#
+# Either way: reads the CURRENT vm.nr_hugepages ("prior", fresh or preserved as above), runs Hive's
+# `hugepages -rx` if present (see the top comment for why), then reads vm.nr_hugepages ("prelim") and
+# HugePages_Free ("free0") again, plus the current boot_id and (Round 5c) /proc/uptime ("start_uptime" - the
+# exclusive-ownership window's own clock, see the top-of-section comment).
+# No record is written at all if "prior"/"prelim"/"free0"/"start_uptime" cannot each be read as a known-good
+# number (on a reopen, the OLD record is simply left as it was, never partially overwritten) -
+# finalize_rx_hugepages (h-stats.sh) needs every one of them to compute XMRig's own predicted total and to
+# bound the window, and writing a record with any of them missing would let those checks never fire safely, so
+# this function simply never produces that record in the first place. `final=0` marks it not yet finalized;
+# `ours` is deliberately NOT written here any more (Round 5 - see the top-of-section comment for why "the
+# value right after `hugepages -rx`" was wrong) - it is only ever written by finalize_rx_hugepages, once
+# XMRig's own reported numbers confirm what it is.
 note_rx_hugepages_start() {
-	[[ -e $HUGEPAGES_FILE ]] && return 0
 	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp
-	[[ -r $proc ]] || return 0
-	prior=$(<"$proc") 2>/dev/null
-	[[ $prior =~ ^[0-9]+$ ]] || return 0
+	if [[ -e $HUGEPAGES_FILE ]]; then
+		[[ $(_hp_field final) == 0 ]] && return 0   # still starting (or genuinely mid-flight) - never touched
+		prior=$(_hp_field prior)   # REOPEN: preserve the TRUE original prior from the OLD (now-over) record -
+			# see the comment above for why this must never be re-derived from the current live value here
+		[[ $prior =~ ^[0-9]+$ ]] || return 0   # a corrupt/legacy record's own "prior" cannot be trusted either -
+			# left exactly as found (never overwritten blindly) for a human/reboot to sort out
+	else
+		[[ -r $proc ]] || return 0
+		prior=$(<"$proc") 2>/dev/null
+		[[ $prior =~ ^[0-9]+$ ]] || return 0
+	fi
 	{ command -v hugepages > /dev/null 2>&1 && hugepages -rx; } > /dev/null 2>&1
 	prelim=""
 	[[ -r $proc ]] && prelim=$(<"$proc") 2>/dev/null

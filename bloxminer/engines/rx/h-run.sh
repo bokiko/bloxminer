@@ -1,40 +1,21 @@
 #!/usr/bin/env bash
-# CPU gate: x86-64 + AES-NI (XMRig's build adds -maes globally, cmake/flags.cmake) + SSE2 baseline
-cpu_ok() {   # CPUINFO overridable for testing
-	local f; f=" $(grep -m1 '^flags' "${CPUINFO:-/proc/cpuinfo}" | cut -d: -f2) "
-	for x in aes sse2; do [[ $f == *" $x "* ]] || return 1; done
-}
-
-# BLOX_RX_PREFLIGHT_ONLY: set by the top-level dispatcher (bloxminer/h-run.sh) to validate this EXACT CPU gate
-# BEFORE it reserves any huge pages for rx (note_rx_hugepages_start, h-common.sh). PR #2 review (Codex):
-# the dispatcher used to call note_rx_hugepages_start - which reserves ~2.4 GiB via `hugepages -rx` - before
-# this file ever got a chance to reject a no-AES-NI host below; because XMRig then never ran, the reservation's
-# ownership record could never finalize (finalize_rx_hugepages needs a live, owned XMRig reporting hashrate -
-# see h-common.sh), so a later Verus start's own restore_verus_hugepages saw final=0 and refused to touch it,
-# leaving the memory pinned until reboot. Reusing cpu_ok() - defined immediately above, nothing else in this
-# file evaluated yet - rather than a second, hand-copied flag check in the dispatcher is what makes it
-# impossible for the two to drift apart. This file otherwise stays completely unaware a dispatcher exists (see
-# h-common.sh's own header comment) - it merely supports being SOURCED, instead of exec'd as a whole process,
-# for this one purpose: run cpu_ok() and return its exact exit status before any of this file's own side
-# effects (cd, manifest sourcing, mkdir, hugepages, exec) ever happen. Never set by Hive itself - a real start
-# always execs this file whole, exactly as before this was added.
-if [[ -n ${BLOX_RX_PREFLIGHT_ONLY:-} ]]; then
-	cpu_ok; rc=$?
-	return $rc 2>/dev/null || exit $rc
-fi
+cd "${BLOX_DIR:-/hive/miners/custom/bloxminer}" || exit 1   # BLOX_DIR: tests only
+. ./engines/rx/cpu-gate.sh || exit 1   # cpu_ok() - see that file's own header for why it is separate
+. ./h-manifest.conf || exit 1
 
 # Undoes the top-level dispatcher's own just-made huge-page reservation if THIS start fails anywhere below
-# before XMRig ever execs. The CPU preflight the dispatcher now runs (above) should already prevent the
-# specific case PR #2's review found; this is a general safety net for any OTHER reason this file exits
-# without reaching its own final `exec` (a missing log directory, a future added check, ...) - "provably ours,
-# still safe to touch" is checked the exact same way h-common.sh's own restore_verus_hugepages checks it
-# before ITS OWN restore: a known "prior", a live vm.nr_hugepages that still exactly equals THIS reservation's
-# own "prelim" (nothing else has touched it since - the same class of proof, one step earlier: prelim here is
-# what ours becomes only once XMRig itself gets confirmed), and the SAME boot_id the record was written in.
-# Deliberately NOT sourcing h-common.sh for this (see its own header: engine scripts stay unaware a dispatcher
-# exists) - reads the same small, stable key=value record format directly instead. That on-disk shape is a
-# stable contract between the two (four decades-old key=value lines), not logic that can drift the way a CPU
-# flag comparison could - every field name/semantics below matches h-common.sh's own _hp_field reader exactly.
+# before XMRig ever execs. The dispatcher's own CPU preflight (bloxminer/h-run.sh, calls the same cpu_ok()
+# above BEFORE it ever reserves) should already prevent the specific case PR #2's review found; this is a
+# general safety net for any OTHER reason this file exits without reaching its own final `exec` (a missing log
+# directory, a missing/non-executable binary, a future added check, ...) - "provably ours, still safe to
+# touch" is checked the exact same way h-common.sh's own restore_verus_hugepages checks it before ITS OWN
+# restore: a known "prior", a live vm.nr_hugepages that still exactly equals THIS reservation's own "prelim"
+# (nothing else has touched it since - the same class of proof, one step earlier: prelim here is what ours
+# becomes only once XMRig itself gets confirmed), and the SAME boot_id the record was written in. Deliberately
+# NOT sourcing h-common.sh for this (see its own header: engine scripts stay unaware a dispatcher exists) -
+# reads the same small, stable key=value record format directly instead. That on-disk shape is a stable
+# contract between the two (five decades-old key=value lines), not logic that can drift the way a CPU flag
+# comparison could - every field name/semantics below matches h-common.sh's own _hp_field reader exactly.
 rollback_rx_hugepages_reservation() {
 	local rc=$?
 	(( rc == 0 )) && return 0   # only ever rolls back a FAILING start - a successful `exec` below replaces
@@ -69,16 +50,16 @@ rollback_rx_hugepages_reservation() {
 }
 trap rollback_rx_hugepages_reservation EXIT
 
-cd "${BLOX_DIR:-/hive/miners/custom/bloxminer}" || exit 1   # BLOX_DIR: tests only
-. ./h-manifest.conf || exit 1
 mkdir -p "$(dirname "$CUSTOM_LOG_BASENAME")" || exit 1
 
-# Same CPU gate as the dispatcher's own preflight above - kept here too, unchanged, as defense-in-depth for a
-# direct/standalone invocation of this file (bypassing the dispatcher entirely) and for anything that could in
-# principle change between the dispatcher's check and this one (there is nothing today, but this file must
-# never simply trust that it already passed elsewhere) - reuses the exact same cpu_ok(), never a second copy.
+# CPU gate BEFORE this engine's own `hugepages -rx` call below (PR #2 follow-up review, Codex: made this
+# ordering unambiguous in both this file and the dispatcher's own - see cpu-gate.sh's header). Kept here too,
+# unchanged, as defense-in-depth for a direct/standalone invocation of this file (bypassing the dispatcher
+# entirely) and for anything that could in principle change between the dispatcher's check and this one (there
+# is nothing today, but this file must never simply trust that it already passed elsewhere) - reuses the exact
+# same cpu_ok() sourced above, never a second copy.
 if ! cpu_ok; then
-	msg="BloxMiner-X needs an x86-64 CPU with AES-NI (RandomX requires AES acceleration)"
+	msg="BloxMiner (RandomX engine) needs an x86-64 CPU with AES-NI (RandomX requires AES acceleration)"
 	echo "$msg" | tee -a "$CUSTOM_LOG_BASENAME.log"
 	message error "$msg" 2>/dev/null
 	sleep 60; exit 1

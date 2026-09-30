@@ -24,7 +24,8 @@ COMMIT=b2ca72480c58d197e18c885d9fc1a0c8d517e60a   # pinned tag commit; build fai
 # script tracks its OWN file as build/build-rx.sh, never build/build.sh (that is the unrelated Verus/ccminer
 # builder).
 HELPERS=(bloxsense/blox.h bloxsense/blox_sys.cpp bloxsense/bloxsense.cpp
-         bloxminer/engines/rx/h-config.sh bloxminer/engines/rx/h-run.sh bloxminer/engines/rx/h-stats.sh bloxminer/h-manifest.conf
+         bloxminer/engines/rx/h-config.sh bloxminer/engines/rx/h-run.sh bloxminer/engines/rx/h-stats.sh
+         bloxminer/engines/rx/cpu-gate.sh bloxminer/h-manifest.conf
          build/build-rx.sh build/package.sh build/donate0.patch build/branding.patch)
 
 # Dependency tarballs xmrig's own scripts/build.uv.sh, build.hwloc.sh, build.openssl3.sh fetch for this tag,

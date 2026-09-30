@@ -389,6 +389,62 @@ if [[ ! -e $HUGEFILE ]]; then ok "verus after finalization: ownership record rem
 : > "$SYSCTL_LOG"; run_h_run
 if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "verus with no record -> no sysctl call" "$(cat "$SYSCTL_LOG")"; fi
 
+# ---- 6d/6e. PR #2 follow-up review (Codex): "Re-finalize huge-page ownership on RandomX restarts" -
+#      note_rx_hugepages_start used to return unconditionally whenever ANY record already existed, including
+#      one already final=1 from a PREVIOUS xmrig instance - but a NEW note call means a genuinely NEW RandomX
+#      process is starting (this file's own `hugepages -rx` runs again regardless, and CAN move nr_hugepages
+#      again), so leaving the OLD final=1/ours=<previous instance's value> standing left the record permanently
+#      stale: this new instance's own finalize_rx_hugepages could never re-finalize (already "done"), this
+#      instance's own rollback would refuse (only ever touches final=0), and a later Verus start's own
+#      current==ours check would fail forever - ~2.4 GiB pinned exactly like the original bug. Fixed:
+#      note_rx_hugepages_start now REOPENS a final=1 (or corrupt/legacy) record for a fresh note - keeping the
+#      ORIGINAL "prior" but refreshing prelim/free0/boot/start_uptime and resetting final=0 - while an
+#      still-starting final=0 record (the "rx restarted" case tested above) is still left completely alone.
+restore_stub_xmrig() { cat > "$BLOX_DIR/xmrig" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$BLOX_DIR/xmrig"; }
+
+# ---- 6d: restart-then-abort - a SECOND RandomX instance (after the first was already finalized) that then
+#      fails to start must roll back to the TRUE original prior, never the first instance's own intermediate
+#      value, and never get stuck because the reopened record still shows final=1.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
+finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
+rm -f "$BLOX_DIR/xmrig"   # the SECOND instance's own binary happens to be missing - a genuine post-reservation abort
+HUGEPAGES_TARGET=1201; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # 2nd (restart) instance
+if [[ $(cat "$PROCFILE") == 512 ]]; then
+	ok "restart-then-abort: rolled back to the TRUE original prior (512), never the 1st instance's own 1200"
+else
+	bad "restart-then-abort: rolled back to the TRUE original prior (512)" "$(cat "$PROCFILE")"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "restart-then-abort: ownership record removed (rollback verified successful)"; else bad "restart-then-abort: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+if grep -q "rolled back vm.nr_hugepages to 512" "$T/log/bloxminer.log" 2>/dev/null; then ok "restart-then-abort: rollback logged"; else bad "restart-then-abort: rollback logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+# ---- 6e: restart-then-finalize-then-verus - a SECOND RandomX instance that reopens the record, finalizes
+#      (its OWN "ours", not the first instance's), and only THEN does Verus start - must still restore to the
+#      TRUE original prior, using the SECOND instance's own live value for the current==ours comparison.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
+finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
+HUGEPAGES_TARGET=1201; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # 2nd instance: reopens, prior=512 preserved, prelim=1201
+rec_reopened=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_reopened") == 512 && $(sed -n 's/^prelim=//p' <<< "$rec_reopened") == 1201 \
+      && $(sed -n 's/^final=//p' <<< "$rec_reopened") == 0 ]]; then
+	ok "restart (2nd instance): record REOPENED - prior=512 preserved from the 1st instance, prelim refreshed to 1201, final=0"
+else
+	bad "restart (2nd instance): record reopened correctly" "$rec_reopened"
+fi
+finalize_record_for_test   # 2nd instance finalizes: final=1, ours=1201 (its OWN live value, not the 1st's 1200)
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run   # verus start
+if grep -q "nr_hugepages=512" "$SYSCTL_LOG" 2>/dev/null; then
+	ok "restart-then-finalize-then-verus: restored to the TRUE original prior (512), using the 2nd instance's own ours (1201)"
+else
+	bad "restart-then-finalize-then-verus: restored to the TRUE original prior (512)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "restart-then-finalize-then-verus: ownership record removed (restore verified successful)"; else bad "restart-then-finalize-then-verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+
 # ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
@@ -505,14 +561,14 @@ if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "not finalized" "$T/log/blox
 rm -f "$HUGEFILE"
 
 # ---- 6b. PR #2 follow-up review (Codex): a host without AES-NI must be rejected by the DISPATCHER'S OWN
-#      preflight BEFORE it ever reserves anything - reusing engines/rx/h-run.sh's own cpu_ok() (via
-#      BLOX_RX_PREFLIGHT_ONLY=1, see that file and bloxminer/h-run.sh's own comments), never a second,
-#      hand-copied flag check. Before this fix, note_rx_hugepages_start ran FIRST unconditionally, reserving
-#      ~2.4 GiB that could then never be released (XMRig never ran, so finalize_rx_hugepages - which needs a
-#      live, owned XMRig reporting hashrate - could never confirm it, and restore_verus_hugepages refuses
-#      anything not final=1): the memory stayed pinned until reboot. Now: no `hugepages -rx` call AT ALL
-#      (neither this dispatcher's own nor the engine's, since the engine is never even reached), no record
-#      written, host's own nr_hugepages left completely alone, a clean Hive error sent.
+#      preflight BEFORE it ever reserves anything - reusing engines/rx/cpu-gate.sh's own cpu_ok() (sourced
+#      directly, see that file and bloxminer/h-run.sh's own comments), never a second, hand-copied flag check.
+#      Before this fix, note_rx_hugepages_start ran FIRST unconditionally, reserving ~2.4 GiB that could then
+#      never be released (XMRig never ran, so finalize_rx_hugepages - which needs a live, owned XMRig
+#      reporting hashrate - could never confirm it, and restore_verus_hugepages refuses anything not final=1):
+#      the memory stayed pinned until reboot. Now: no `hugepages -rx` call AT ALL (neither this dispatcher's
+#      own nor the engine's, since the engine is never even reached), no record written, host's own
+#      nr_hugepages left completely alone, a clean Hive error sent.
 CPUINFO_NOAES="$T/cpuinfo-noaes"
 printf 'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm\n' > "$CPUINFO_NOAES"   # every real baseline flag EXCEPT aes
 rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"
@@ -525,6 +581,20 @@ else
 fi
 if [[ $(cat "$PROCFILE") == 512 ]]; then ok "no-AES-NI CPU: host's own nr_hugepages (512) left completely untouched"; else bad "no-AES-NI CPU: host's own nr_hugepages left untouched" "$(cat "$PROCFILE")"; fi
 if grep -q "AES-NI" "$MESSAGE_LOG" 2>/dev/null; then ok "no-AES-NI CPU: a clean Hive error message was sent (never a silent refusal)"; else bad "no-AES-NI CPU: a clean Hive error message was sent" "$(cat "$MESSAGE_LOG" 2>/dev/null)"; fi
+
+# ---- 6b2. The SAME rejection, but via a DIRECT engine-script start - the dispatcher entirely bypassed (e.g.
+#      engines/rx/h-run.sh invoked some other way, or a manual/standalone invocation). Proves this file's OWN
+#      defense-in-depth cpu_ok() check (unchanged, still there for exactly this case) ALSO rejects BEFORE its
+#      own `hugepages -rx` call, independently of whatever the dispatcher does or does not check - no
+#      reservation, no record, either way in.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; : > "$SYSCTL_LOG"; : > "$MESSAGE_LOG"
+CPUINFO="$CPUINFO_NOAES" PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" timeout 2 bash "$BLOX_DIR/engines/rx/h-run.sh" > /dev/null 2>&1
+if ! hugepages_called && [[ ! -e $HUGEFILE ]]; then
+	ok "no-AES-NI CPU, DIRECT engine-script start (dispatcher bypassed): rejects BEFORE any hugepages call, no record"
+else
+	bad "no-AES-NI CPU, direct engine-script start: rejects BEFORE any hugepages call" "sysctl_log=$(cat "$SYSCTL_LOG" 2>/dev/null) hugefile=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE")"
+fi
+if [[ $(cat "$PROCFILE") == 512 ]]; then ok "no-AES-NI CPU, direct engine-script start: host's own nr_hugepages (512) left completely untouched"; else bad "no-AES-NI CPU, direct engine-script start: host's own nr_hugepages left untouched" "$(cat "$PROCFILE")"; fi
 
 # ---- 6c. An rx start that fails AFTER the dispatcher's own reservation (here: the engine binary happens to be
 #      missing - any other post-reservation failure is covered the exact same way, by the same general
