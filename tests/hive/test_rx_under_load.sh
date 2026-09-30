@@ -122,6 +122,12 @@ jq -n --argjson s "$SUM_OK" --argjson b "$BACK_OK" '{summary: $s, backends: $b}'
 python3 "$HERE/fake_xmrig_api.py" 4069 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 grep -q ready "$T/api.out" || { bad "fake /proc under full CPU load" "fake API did not start: $(cat "$T/api.out")"; }
+# "ready" (printed right after bind()+listen()) only confirms the LISTENING socket exists, never that the
+# server's own accept() loop has actually run yet - a request landing in that gap can go unanswered long
+# enough to look like a startup failure, purely a fake-server race with nothing to do with h-stats.sh itself
+# (test_rx_hive_scripts.sh's own stats_case() hit this exact race and added this exact round-trip confirmation
+# loop for it). Confirm a REAL HTTP round-trip before this test's saturated polling loop depends on this port.
+for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:4069/2/summary" && break; sleep 0.05; done
 
 export BLOX_DIR BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT=4069
 saturate_cpus
@@ -300,6 +306,9 @@ jq -n --argjson s "$SUM3" --argjson b "$BACK3" '{summary: $s, backends: $b}' > "
 python3 "$HERE/fake_xmrig_api.py" 4071 "$T/replies3.json" > "$T/api3.out" 2>&1 & API3_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api3.out" && break; sleep 0.1; done
 grep -q ready "$T/api3.out" || bad "sustained polling: fake API startup" "$(cat "$T/api3.out" 2>/dev/null)"
+# see the earlier fake_xmrig_api.py startup in this file for the full rationale - "ready" alone does not prove
+# a real HTTP round-trip works yet
+for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:4071/2/summary" && break; sleep 0.05; done
 
 export BLOX_DIR="$BLOX_DIR3" BLOX_PROCFS_ROOT="$PROC3" BLOX_API_PORT=4071 BLOX_STATE_DIR="$T/state3"
 saturate_cpus

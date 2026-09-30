@@ -284,6 +284,22 @@ stats_case "all-zero hashrate -> real rows, all 0 (not the single fallback row)"
 reset_proc   # nothing listening at all
 stats_case "API down -> khs 0, hs [0]" 20004 "" "" '.khs == "0" and .stats.hs == [0]'
 
+# Codex (review of 637df62): $algo is read from config.json and, in the emergency fallback path, interpolated
+# RAW (no jq --arg) into hand-built JSON - a malformed/hand-edited config.json with a `"` in its algo field
+# would have produced invalid JSON right when an honest answer matters most. h-stats.sh now regex-validates
+# $algo against rx's fixed shape before it is ever used, replacing anything that does not match with the safe
+# default "rx/0" - this is NOT a case h-config.sh's own ALGOS allow-list would ever let through at config-write
+# time, but this proves h-stats.sh's own INDEPENDENT read of the field never trusts it blindly either.
+# A bare unescaped quote genuinely breaks the hand-built fallback JSON's syntax (confirmed against the
+# pre-fix code: `"algo":"rx/0" BROKEN"}` is not valid JSON at all, jq -e fails on it) - unlike, say, an
+# injected `","otherkey":"val"` which merely adds an extra key and still parses (an earlier, WEAKER version of
+# this exact test used that and passed even against the unfixed code, catching nothing; keep this shape).
+jq -n '{pools: [{algo: "rx/0\" BROKEN"}]}' > "$CONF"
+reset_proc   # still nothing listening -> fallback() runs, exercising the exact line Codex flagged
+stats_case "malicious algo in config.json -> fallback JSON stays valid, safe default used" 20031 "" "" \
+	'.khs == "0" and .stats.hs == [0] and .stats.algo == "rx/0"'
+jq -n '{pools: [{algo: "rx/0"}]}' > "$CONF"   # restore for every stats_case below
+
 reset_proc; listen 20005 1005 "/usr/bin/xmrig"   # a foreign miner owns this port; API itself is healthy
 bloxsense_says "$(fake_topo_json 4)"
 stats_case "foreign listener on our port -> unavailable, never its stats" 20005 "$SUM_OK" "$BACK_NULLS" \

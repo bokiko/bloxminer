@@ -79,6 +79,13 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 	grep -q ready "$T/api.out" || { bad "$label: fake API startup" "$(cat "$T/api.out" 2>/dev/null)"; return; }
+	# "ready" (printed right after bind()+listen()) only confirms the LISTENING socket exists, never that the
+	# server's own accept() loop has actually run yet - a request that lands in that gap can go unanswered
+	# long enough to look like a startup failure, purely a fake-server race with nothing to do with h-stats.sh
+	# itself (test_rx_hive_scripts.sh's own stats_case() hit the HTTP-side version of this exact race and added
+	# this exact round-trip confirmation loop for it). Confirm a REAL command/response round-trip before this
+	# case's saturated polling loop ever depends on this port.
+	for _ in $(seq 20); do [[ $(echo -n summary | timeout 1 nc 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\0') == "$SUM_OK" ]] && break; sleep 0.05; done
 
 	# a FRESH BLOX_DIR per case - not load-bearing for correctness any more (verus/h-stats.sh keeps no
 	# cross-poll state at all post-redesign), but kept for the same isolation tests/hive/test_rx_under_load.sh
@@ -189,6 +196,8 @@ jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/rep
 python3 "$HERE/fake_api.py" "$PORT" "$T/replies3.json" > "$T/api3.out" 2>&1 & API3_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/api3.out" && break; sleep 0.1; done
 grep -q ready "$T/api3.out" || bad "dispatcher: fake API startup" "$(cat "$T/api3.out" 2>/dev/null)"
+# see run_case()'s own comment for the full rationale - "ready" alone does not prove a real round-trip works
+for _ in $(seq 20); do [[ $(echo -n summary | timeout 1 nc 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\0') == "$SUM_OK" ]] && break; sleep 0.05; done
 export BLOX_DIR="$BLOX_DIR3"
 
 run_dispatcher_case() {   # $1 cpuset ("" = none), $2 n_polls, $3 enforce_budget (1/0)

@@ -693,6 +693,15 @@ jq -n '{summary: {uptime:60, connection:{accepted:3,rejected:0}, algo:"rx/0", ve
         backends: [{type:"cpu", threads:[{affinity:0, hashrate:[500000.0,null,null]}]}]}' > "$S11_API_CFG"
 python3 "$HERE/fake_xmrig_api.py" 4357 "$S11_API_CFG" > "$T/s11_api.out" 2>&1 & S11_API_PID=$!
 for _ in $(seq 50); do grep -q ready "$T/s11_api.out" 2>/dev/null && break; sleep 0.1; done
+grep -q ready "$T/s11_api.out" 2>/dev/null || bad "one shell, step B setup: fake API failed to start" "$(cat "$T/s11_api.out" 2>/dev/null)"
+# "ready" (printed right after HTTPServer's own bind()+listen()) only confirms the LISTENING socket exists,
+# never that the server's accept loop is actually spun up and answering - a curl that lands in that startup
+# gap gets "Empty reply from server"/a connection reset, purely a fake-server race with NOTHING to do with
+# h-stats.sh itself (test_rx_hive_scripts.sh's own stats_case() hit this exact race and added this exact
+# round-trip confirmation loop for it - this section never had the same fix, on a slow/cold-start CI runner
+# where Python's own interpreter/module-import startup can stretch that gap wide enough to matter). Confirm a
+# REAL round-trip before step B (or any step) ever calls poll() against this port.
+for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:4357/2/summary" && break; sleep 0.05; done
 
 hconfig "p:1" "W" "" "" "rx/0"   # step A/B config: rx/0
 MULTI="$T/multi_poll.sh"
@@ -725,24 +734,44 @@ printf '{"algo":"verus"}' > "$CUSTOM_CONFIG_FILENAME"
 poll
 printf 'E khs=[%s] stats=[%s]\n' "$khs" "$stats"
 EOF
-res=$(BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" BLOX_PROCFS_ROOT="$S11_PROC" bash "$MULTI" 2>&1)
+# BLOX_HSTATS_DEBUG_LOG (see engines/rx/h-stats.sh's own dbg()): opt-in trace of the ownership check's raw
+# inputs, every curl's exit code + response body, and each phase's budget/decision - never touched by a real
+# Hive rig (nothing here sets this var in production), only by this test's own diagnostics-on-failure below.
+S11_DEBUG_LOG="$T/s11_debug.log"; : > "$S11_DEBUG_LOG"
+res=$(BLOX_DIR="$BLOX_DIR" BLOX_STATE_DIR="$T/state" BLOX_PROCFS_ROOT="$S11_PROC" BLOX_HSTATS_DEBUG_LOG="$S11_DEBUG_LOG" bash "$MULTI" 2>&1)
 kill "$S11_API_PID" 2>/dev/null; wait "$S11_API_PID" 2>/dev/null
 
 lineA=$(grep '^A ' <<< "$res"); lineB=$(grep '^B ' <<< "$res"); lineC=$(grep '^C ' <<< "$res")
 lineD=$(grep '^D ' <<< "$res"); lineE=$(grep '^E ' <<< "$res")
-if [[ $lineA == "A khs=[0] algo=rx/0 PORT=[1]" ]]; then ok "one shell, step A (rx, API down): khs=0, algo=rx/0, PORT=1"; else bad "one shell, step A" "$lineA"; fi
-if [[ $lineB == "B khs=[500.00] algo=rx/0 PORT=[4357]" ]]; then ok "one shell, step B (rx, API up): REAL khs=500.00, PORT updated to 4357"; else bad "one shell, step B (rx, API up): real khs, PORT=4357" "$lineB"; fi
+s11_fail=0
+# On any failure below, the FULL rx debug trace from THIS EXACT run (ownership check inputs, every curl's exit
+# code + response, per-phase budget/decision - see engines/rx/h-stats.sh's dbg() calls) plus the fake API's own
+# stdout/stderr are dumped to stderr, once, after all 5 assertions - not per-assertion (this run only executes
+# once; re-running it would not reproduce a timing-sensitive CI-only failure, only the ORIGINAL run's own trace
+# can ever show what actually happened) and not on success (keeps a green CI log quiet).
+s11_dump_diagnostics() {
+	{
+		echo "---- one shell, steps A-E: FULL raw output ----"; printf '%s\n' "$res"
+		echo "---- fake_xmrig_api.py (port 4357) stdout/stderr ----"; cat "$T/s11_api.out" 2>/dev/null
+		echo "---- rx h-stats.sh debug trace (BLOX_HSTATS_DEBUG_LOG) ----"
+		if [[ -s $S11_DEBUG_LOG ]]; then cat "$S11_DEBUG_LOG"; else echo "(empty - dbg() never fired: BLOX_HSTATS_DEBUG_LOG itself did not reach the sourced h-stats.sh, or every dbg call site was skipped)"; fi
+		echo "---- end diagnostics ----"
+	} >&2
+}
+if [[ $lineA == "A khs=[0] algo=rx/0 PORT=[1]" ]]; then ok "one shell, step A (rx, API down): khs=0, algo=rx/0, PORT=1"; else bad "one shell, step A" "$lineA"; s11_fail=1; fi
+if [[ $lineB == "B khs=[500.00] algo=rx/0 PORT=[4357]" ]]; then ok "one shell, step B (rx, API up): REAL khs=500.00, PORT updated to 4357"; else bad "one shell, step B (rx, API up): real khs, PORT=4357" "$lineB"; s11_fail=1; fi
 if [[ $lineC == "C khs=[0] stats=[] PORT=[4357]" ]]; then
 	ok "one shell, step C (-> verus): verus's OWN empty answer - step B's khs=500.00/algo NEVER leaked through"
 else
-	bad "one shell, step C (-> verus): no leftover from step B (khs=500.00, algo rx/0)" "$lineC"
+	bad "one shell, step C (-> verus): no leftover from step B (khs=500.00, algo rx/0)" "$lineC"; s11_fail=1
 fi
 if [[ $lineD == "D khs=[0] algo=rx/arq PORT=[2]" ]]; then
 	ok "one shell, step D (rx/arq, API down again): reflects the NEW algo/port, not step A's (rx/0, PORT=1) or step B's (PORT=4357)"
 else
-	bad "one shell, step D: reflects new algo/port only, no staleness" "$lineD"
+	bad "one shell, step D: reflects new algo/port only, no staleness" "$lineD"; s11_fail=1
 fi
-if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus again): still verus's own empty answer, no leftover from step D"; else bad "one shell, step E: no leftover from step D" "$lineE"; fi
+if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus again): still verus's own empty answer, no leftover from step D"; else bad "one shell, step E: no leftover from step D" "$lineE"; s11_fail=1; fi
+(( s11_fail )) && s11_dump_diagnostics
 
 if [[ -n $S11_API_PID ]] && kill -0 "$S11_API_PID" 2>/dev/null; then
 	bad "no leaked fake-API child process at suite end" "still alive: $S11_API_PID"

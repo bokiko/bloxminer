@@ -94,7 +94,16 @@ PROC=${BLOX_PROCFS_ROOT:-/proc}          # /proc path prefix; tests only
 PKG=${BLOX_DIR:-/hive/miners/custom/bloxminer}
 PORT=${BLOX_API_PORT:-${API_PORT:-4069}}
 VER="$CUSTOM_VERSION (xmrig 6.26.0)"
-algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null); [[ -n $algo ]] || algo="rx/0"
+algo=$(jq -r '.pools[0].algo // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null)
+# Validated against the exact shape every real rx algo has (h-common.sh's RX_ALGOS: rx/0, rx/wow, rx/arq,
+# rx/graft, rx/sfx, rx/yada) rather than trusted as-is: config.json is normally written by our OWN h-config.sh,
+# which already validates against that list, but this file reads it back independently and must not assume
+# that write path is the only way config.json could ever come to hold this field - a corrupt/hand-edited file
+# is not a threat model this cares about, but $algo is interpolated RAW (no jq --arg) into the plain-printf
+# emergency fallback JSON below (fallback(), and the mktemp-failure block just after this), which must never
+# depend on jq being available - so anything containing a `"` or `\` there would hand back invalid JSON right
+# when a valid, honest answer matters most. A fixed, always-safe default replaces anything that does not match.
+[[ $algo =~ ^rx/[a-z0-9]+$ ]] || algo="rx/0"
 
 STATEDIR=${BLOX_STATE_DIR:-}
 if [[ -z $STATEDIR ]]; then [[ -d /run/hive ]] && STATEDIR=/run/hive || STATEDIR=$PKG; fi
@@ -108,8 +117,24 @@ export PROC PKG PORT VER algo STATEFILE ENRICHFILE CUSTOM_LOG_BASENAME
 # The whole collection lives in one function library file so the parent's own fallback path (used only when
 # the LIB/OUTFILE/HANDSHAKE temp files themselves cannot be created) and the timed child (the real work) run
 # the exact same code - nothing is duplicated or re-typed.
+# dbg <msg> - appends a timestamped line to $BLOX_HSTATS_DEBUG_LOG, iff that variable is set (never on a real
+# Hive rig - opt-in only, for a test/CI investigation). A plain `>>` append, no subshell; short-circuits to a
+# single [[ ]] test (no fork at all) when unset, so this can be called freely without a production-path cost.
+# Defined twice (here, for the parent's own pre/post-launch decisions, and again inside LIBEOF below for run()
+# itself, which executes in an isolated child that does not inherit this shell's functions) - not exported,
+# since bash cannot export a function across an exec'd `bash -c` the way it can a plain fork; both copies are
+# kept in lockstep by hand, deliberately tiny, so that is not a maintenance burden.
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s rx[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
+export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
+
 LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-rx-hstats-lib.XXXXXX") || {
-	khs=0; stats=$(printf '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo")
+	dbg "LIB mktemp FAILED - emergency fallback, no fork"
+	# printf -v, not stats=$(printf ...): a command substitution forks a subshell regardless of the command
+	# run inside it being a builtin - and this whole block exists BECAUSE mktemp (a fork) just failed, i.e.
+	# exactly the resource-pressure state a further fork here could fail in too, leaving $stats empty rather
+	# than this defined fallback. printf -v assigns in the current shell, no fork at all.
+	khs=0
+	printf -v stats '{"hs":[0],"hs_units":"khs","temp":[null],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' "$VER" "$algo"
 	return 0 2>/dev/null || exit 0
 }
 cat > "$LIB" <<'LIBEOF'
@@ -121,6 +146,8 @@ cat > "$LIB" <<'LIBEOF'
 # builtin, "SECONDS.ffffff") turns into a plain integer microsecond count via string slicing; every subsequent
 # check is `$(( ))` arithmetic. Out-parameter convention ($REPLY), never `$(...)` - a command substitution
 # forks a subshell regardless of whether the function body itself does.
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s rx[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }   # see the parent's own copy of this function for the full rationale
+
 now_us() {   # sets $REPLY = now, integer microseconds since epoch
 	local t=${EPOCHREALTIME:-}
 	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
@@ -193,13 +220,18 @@ note_state() {   # $1 = ok | unverified | shallow | unavailable; logs only on a 
 }
 
 fallback() {   # $1 = a single row's temperature (bloxsense pkg_temp, JSON number or the literal "null"), default
-	# null - shell-only (printf, a builtin - no fork, no jq): this is the safety net called when things are
-	# ALREADY going wrong, so it must not itself depend on jq being installed/working (see the LIB-creation-
-	# failure path below, which uses this exact same plain-printf pattern for the same reason). $VER/$algo are
-	# both internal, jq-produced-or-constant strings, never raw external/network input - safe to interpolate.
+	# null - shell-only (printf -v, a builtin, assigning with NO subshell/fork at all - not even `$(printf ...)`,
+	# which forks a subshell to capture output regardless of printf itself being a builtin): this is the safety
+	# net called when things are ALREADY going wrong (including under the exact resource pressure that can make
+	# a fork itself fail), so it must not itself depend on jq being installed/working (see the LIB-creation-
+	# failure path above, which uses this exact same plain-printf-v pattern for the same reason), nor on a fork
+	# succeeding. $VER is built from CUSTOM_VERSION, a fixed constant in this package's own shipped
+	# h-manifest.conf, never user/pool-controlled; $algo is regex-validated at the top of this file (see its
+	# own assignment) to match rx's fixed algo shape before it ever reaches here - both safe to interpolate raw
+	# into this hand-built JSON.
 	khs=0
-	stats=$(printf '{"hs":[0],"hs_units":"khs","temp":[%s],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' \
-		"${1:-null}" "$VER" "$algo")
+	printf -v stats '{"hs":[0],"hs_units":"khs","temp":[%s],"ar":[0,0],"uptime":0,"ver":"%s","algo":"%s"}' \
+		"${1:-null}" "$VER" "$algo"
 }
 
 # write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
@@ -232,8 +264,10 @@ valid_backends() {
 run() {
 	local port_hex inode owner_pid owned fd_dir sum uptime acc rej khs_fresh pidstart enrich_temp
 	local back threads naff sense pkg_temp power_raw percore task_set api_set rows
+	local exe_link curl_rc
 
-	remaining_us; have_budget_us "$REPLY" || { note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
+	remaining_us; dbg "run() entry: remaining_us=$REPLY"
+	have_budget_us "$REPLY" || { dbg "run() entry: OUT OF BUDGET before even the ownership check"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
 
 	# ---- API ownership: /proc/net/tcp -> inode -> pid -> exe (the whole scan is inside the timed child)
 	port_hex=$(printf '%04X' "$PORT")
@@ -249,8 +283,12 @@ run() {
 			owner_pid=${fd_dir#"$PROC"/}; owner_pid=${owner_pid%%/*}
 		fi
 	fi
-	owned=0
-	if [[ -n $owner_pid ]] && [[ $(readlink "$PROC/$owner_pid/exe" 2>/dev/null) == "$PKG/xmrig" ]]; then owned=1; fi
+	owned=0; exe_link=""
+	if [[ -n $owner_pid ]]; then
+		exe_link=$(readlink "$PROC/$owner_pid/exe" 2>/dev/null)
+		[[ $exe_link == "$PKG/xmrig" ]] && owned=1
+	fi
+	dbg "ownership: PORT=$PORT port_hex=$port_hex inode=${inode:-<none>} owner_pid=${owner_pid:-<none>} exe_link=${exe_link:-<none>} expected=$PKG/xmrig owned=$owned"
 	if (( ! owned )); then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
 
 	# ================================================================ PHASE A (mandatory, cheap, this poll)
@@ -258,9 +296,11 @@ run() {
 	# SINGLE jq call, not three) to /2/summary, which already carries the aggregate hashrate, accepted/rejected
 	# and uptime - real-Hive evidence (1 CPU, 32 threads all saturating it) is that every avoided fork here
 	# matters, so this phase forks only what curl/find/awk/readlink/jq themselves cannot be done without.
-	remaining_us; have_budget_us "$REPLY" || { note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
+	remaining_us; dbg "phase A: entry remaining_us=$REPLY"
+	have_budget_us "$REPLY" || { dbg "phase A: OUT OF BUDGET before the curl call"; note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; }
 	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"   # 0.5 s ceiling
-	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null)
+	sum=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/summary" 2>/dev/null); curl_rc=$?
+	dbg "phase A: curl --max-time $REPLY /2/summary rc=$curl_rc len=${#sum} body=${sum:0:300}"
 
 	local parsed
 	parsed=$(jq -r '
@@ -270,6 +310,7 @@ run() {
 			  ((((.hashrate.total[0]?) // 0) | n0) / 1000 * 100 | round / 100) ] | @tsv
 		else empty end
 	' <<< "$sum" 2>/dev/null)
+	dbg "phase A: jq parsed=${parsed:-<empty>}"
 	if [[ -z $parsed ]]; then note_state unavailable; fallback ""; write_result "$khs" "$stats"; return 0; fi
 	IFS=$'\t' read -r uptime acc rej khs_fresh <<< "$parsed"
 	int "$uptime" || uptime=${uptime%%.*}; int "$uptime" || uptime=0
@@ -298,6 +339,7 @@ run() {
 		--argjson up "$uptime" --arg ver "$VER" --arg algo "$algo" \
 		'{hs: [$k], hs_units: "khs", temp: [$t], ar: [$a, $r], uptime: $up, ver: $ver, algo: $algo}')
 	write_result "$khs" "$stats"
+	dbg "phase A: DONE khs=$khs stats=${stats:0:200}"
 	# note_state is NOT called here: Phase A's write is provisional (Phase B usually improves on it in the
 	# very same poll), and logging "shallow" unconditionally on every poll - even ones where Phase B goes on to
 	# succeed exactly as it did last poll too - would turn "logs only on a real transition" into "logs twice a
@@ -306,15 +348,18 @@ run() {
 
 	# ================================================================ PHASE B (optional enrichment)
 	[[ -n ${BLOX_HSTATS_TEST_PHASEB_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_PHASEB_DELAY"   # tests only
-	remaining_us; have_budget_us "$REPLY" || { note_state shallow; return 0; }
+	remaining_us; dbg "phase B: entry remaining_us=$REPLY"
+	have_budget_us "$REPLY" || { dbg "phase B: SKIPPED - out of budget, Phase A's khs=$khs stands"; note_state shallow; return 0; }
 	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"
-	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null)
-	jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back" || { note_state shallow; return 0; }
+	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null); curl_rc=$?
+	dbg "phase B: curl --max-time $REPLY /2/backends rc=$curl_rc len=${#back} body=${back:0:300}"
+	jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back" || { dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; }
 
 	threads=$(jq -c '[.[] | select(.type == "cpu") | .threads[]?] // []' <<< "$back" 2>/dev/null)
 	[[ -n $threads ]] || threads='[]'
 	naff=$(jq 'length' <<< "$threads" 2>/dev/null); int "$naff" || naff=0
-	if (( naff == 0 )); then note_state shallow; return 0; fi   # legitimate: no pool job yet, benign - Phase A's total stands
+	dbg "phase B: naff=$naff"
+	if (( naff == 0 )); then dbg "phase B: SKIPPED - naff==0 (no pool job yet), Phase A's khs=$khs stands"; note_state shallow; return 0; fi   # legitimate: no pool job yet, benign - Phase A's total stands
 
 	# ---- sensors: whatever is left, capped at min(remaining, 1.0 s) - bloxsense's own RAPL sample is ~0.55 s
 	remaining_us
@@ -404,6 +449,7 @@ run() {
 		d = b - a; if (d < 0) d = -d
 		exit !(d <= 0.10 * a)
 	}' && consistent=1
+	dbg "phase B: complete=$complete phaseb_total=$phaseb_total khs_fresh(phaseA)=$khs_fresh consistent=$consistent -> $([[ $complete == true && $consistent == 1 ]] && echo 'REPLACING with phase B' || echo 'Phase A khs stands')"
 	if [[ $complete == true && $consistent == 1 ]]; then
 		# Phase B's total AND its own stats replace Phase A's - never a mixed payload (Phase A's number with
 		# Phase B's rows, or vice versa): either Phase B is trusted whole, or Phase A's whole result stands.
@@ -423,6 +469,7 @@ run() {
 		{ printf 'ts=%s\npid=%s\nstart=%s\ntemp=%s\n' "$REPLY" "$owner_pid" "$pidstart" "$pkg_temp" \
 			> "$ENRICHFILE.tmp" && mv -f "$ENRICHFILE.tmp" "$ENRICHFILE"; } 2>/dev/null
 	fi
+	dbg "run() EXIT: final khs=$khs stats=${stats:0:200}"
 }
 LIBEOF
 
@@ -484,31 +531,38 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
 	}
 
-	# These alarm sleeps must never inherit this script's own stdout/stderr: when h-stats.sh itself is run
-	# inside a command substitution (as Hive's agent, and every test here, does), an orphaned background job
-	# that still holds that pipe's write end open blocks the CALLER waiting on it, even after everything else
-	# has finished - regardless of how carefully it is killed/reaped below. Redirecting away from the start
-	# closes that hole outright, and was needed in practice (an un-redirected alarm reproduced exactly this).
-	# The sleep duration is whatever remains of the SAME $DEADLINE_US right now, not a fresh $BUDGET_US - the
-	# setsid+exec above already spent some of the shared budget, and this alarm must not hand it back.
-	remaining_us; us_to_secstr "$REPLY"; ALARM_SLEEP=$REPLY
-	{ sleep "$ALARM_SLEEP"; } > /dev/null 2>&1 & ALARM=$!
-	wait -n "$CPID" "$ALARM" 2>/dev/null
+	# Bounded poll for $CPID, NOT `wait -n "$CPID" "$ALARM"` on a background alarm sleep: that construct can
+	# block for the FULL remaining budget even when $CPID has ALREADY exited, specifically when the invoking
+	# shell was itself started via `bash -c` (exactly how every poll in tests/hive/test_rx_under_load.sh and
+	# tests/hive/test_dispatcher.sh's "one shell" section invoke this file) rather than as a script file - a
+	# real, reproducible bash job-control quirk, isolated in an earlier round (see git history for
+	# finalize_rx_hugepages_bounded in h-common.sh, the first place this was found and fixed the same way).
+	# A poll loop against $DEADLINE_US directly (via the same forkless remaining_us/have_budget_us this whole
+	# file already uses for every other timing decision) has no such invocation-context dependency: it costs
+	# nothing extra when $CPID finishes promptly (the loop's very first check exits it) and never waits any
+	# longer than the alarm-based version would have in the worst case either way. No alarm process at all any
+	# more, so the "must never inherit this script's own stdout/stderr" hazard the old alarm sleep carried
+	# (an orphaned background job holding a command-substitution pipe's write end open, hanging the CALLER even
+	# after everything else finished - reproduced once in practice) cannot recur either.
+	dbg "parent: launched CPID=$CPID, entering bounded poll"
+	while still_running; do
+		remaining_us; have_budget_us "$REPLY" || break
+		sleep 0.05
+	done
+	remaining_us; dbg "parent: poll loop exited, remaining_us=$REPLY still_running=$(still_running && echo yes || echo no)"
 	# Checked by whether ANYTHING remains (in the validated group, or else just $CPID), not just whether
 	# $CPID itself is still alive: $CPID is a plain bash process that dies immediately from a TERM, even when
 	# a SIGTERM-ignoring descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look
 	# like "done" while such a descendant survives as an orphan.
 	if still_running; then
-		# the budget alarm fired first, not the collection itself: escalate against the validated group when
-		# one is available (reaching every descendant, including a nested `timeout --foreground` and whatever
-		# it is guarding), else against $CPID alone - never a guessed or unconfirmed group
+		dbg "parent: still_running=true after the poll loop - out of budget, escalating TERM"
+		# the budget ran out, not the collection itself: escalate against the validated group when one is
+		# available (reaching every descendant, including a nested `timeout --foreground` and whatever it is
+		# guarding), else against $CPID alone - never a guessed or unconfirmed group
 		escalate TERM
-		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 		sleep "$KILL_GRACE"
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it
-	else
-		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 	fi
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"

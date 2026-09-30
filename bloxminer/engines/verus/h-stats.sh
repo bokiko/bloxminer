@@ -293,19 +293,25 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
 	}
 
-	# Sleep duration is whatever remains of the SAME $DEADLINE_US right now, not a fresh $BUDGET_US - the
-	# setsid+exec above already spent some of the shared budget, and this alarm must not hand it back.
-	remaining_us; us_to_secstr "$REPLY"; ALARM_SLEEP=$REPLY
-	{ sleep "$ALARM_SLEEP"; } > /dev/null 2>&1 & ALARM=$!
-	wait -n "$CPID" "$ALARM" 2>/dev/null
+	# Bounded poll for $CPID, NOT `wait -n "$CPID" "$ALARM"` on a background alarm sleep: that construct can
+	# block for the FULL remaining budget even when $CPID has ALREADY exited, specifically when the invoking
+	# shell was itself started via `bash -c` (exactly how every poll in tests/hive/test_verus_under_load.sh
+	# invokes this file: `bash -c '. "$BLOX_DIR/h-stats.sh"; ...'`) rather than as a script file - a real,
+	# reproducible bash job-control quirk (isolated the same way for the RandomX engine's own h-common.sh,
+	# finalize_rx_hugepages_bounded - see that function's own history for the full repro). A poll loop against
+	# $DEADLINE_US directly (via the same forkless remaining_us/have_budget_us this whole file already uses for
+	# every other timing decision) has no such invocation-context dependency: it costs nothing extra when
+	# $CPID finishes promptly (the loop just exits on its very first check) and never waits any longer than
+	# the alarm-based version would have in the worst case either way.
+	while still_running; do
+		remaining_us; have_budget_us "$REPLY" || break
+		sleep 0.05
+	done
 	if still_running; then
 		escalate TERM
-		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 		sleep "$KILL_GRACE"
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null
-	else
-		kill "$ALARM" 2>/dev/null; wait "$ALARM" 2>/dev/null
 	fi
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
