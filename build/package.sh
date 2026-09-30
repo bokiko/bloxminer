@@ -29,6 +29,26 @@ p_verus() { sed -n "s|^$1=||p" "$VERUS_PROV"; }
 [[ $(p_verus patch_sha256) == "$(sha256sum "$ROOT/build/bloxminer.patch" | cut -d' ' -f1)" ]] || { echo "verus provenance patch_sha256 does not match this repo's build/bloxminer.patch"; exit 1; }
 [[ $(p_verus version) == "$VER" ]] || { echo "verus provenance version ($(p_verus version)) does not match package version $VER"; exit 1; }
 
+# PR #2 follow-up review (Codex): "Verify the pinned Verus revision before packaging" - every check above is
+# self-consistency (does the provenance describe the binary/patch/version actually being shipped?), never
+# "is this the revision this release is actually PINNED to?" build/build.sh lets UPSTREAM/COMMIT be overridden
+# via env (for its own testing), so an outdir built from some OTHER revision could still pass every check above
+# and ship as $VER - the hashing-identity proof (tools/hashing-identity.sh, SOURCE.md) only covers the pinned
+# revision, never an arbitrary one. Read the pin straight out of build/build.sh's own UPSTREAM/COMMIT defaults
+# (never a second, hand-duplicated literal here - same principle as the HELPERS walk below) and refuse unless
+# the provenance's recorded upstream/upstream_commit actually match it. COMMIT is matched as a prefix (build.sh
+# pins the short form, e.g. e28e183; the provenance records `git rev-parse HEAD`'s full 40-char resolution of it).
+# shellcheck disable=SC2016   # single quotes on purpose: these are literal sed patterns, not shell expansions
+PIN_V_UPSTREAM=$(sed -n 's/^UPSTREAM=\${UPSTREAM:-\(.*\)}$/\1/p' "$ROOT/build/build.sh")
+# shellcheck disable=SC2016
+PIN_V_COMMIT=$(sed -n 's/^COMMIT=\${COMMIT:-\([^}]*\)}.*/\1/p' "$ROOT/build/build.sh")
+[[ -n $PIN_V_UPSTREAM && -n $PIN_V_COMMIT ]] || { echo "build/build.sh: could not parse its own pinned UPSTREAM/COMMIT defaults - refusing to package"; exit 1; }
+[[ $(p_verus upstream) == "$PIN_V_UPSTREAM" ]] || { echo "verus provenance upstream ($(p_verus upstream)) does not match build/build.sh's pinned UPSTREAM ($PIN_V_UPSTREAM) - refusing to package"; exit 1; }
+case "$(p_verus upstream_commit)" in
+	"$PIN_V_COMMIT"*) ;;
+	*) echo "verus provenance upstream_commit ($(p_verus upstream_commit)) does not match build/build.sh's pinned COMMIT ($PIN_V_COMMIT) - refusing to package"; exit 1 ;;
+esac
+
 # ---------------------------------------------------------------- verify: RandomX engine, freshly built (donate0
 # + branding patches both applied by build/build-rx.sh; its own build.provenance travels with the outdir)
 XBIN="$RX_OUT/xmrig"; XSENSE="$RX_OUT/bloxsense"; RXPROV="$RX_OUT/build.provenance"
@@ -39,6 +59,33 @@ p_rx() { sed -n "s|^$1=||p" "$RXPROV"; }
 [[ $(p_rx patch_sha256) == "$(sha256sum "$ROOT/build/donate0.patch" | cut -d' ' -f1)" ]] || { echo "rx provenance patch_sha256 does not match this repo's build/donate0.patch"; exit 1; }
 [[ $(p_rx branding_patch_sha256) == "$(sha256sum "$ROOT/build/branding.patch" | cut -d' ' -f1)" ]] || { echo "rx provenance branding_patch_sha256 does not match this repo's build/branding.patch"; exit 1; }
 [[ $(p_rx blox_display_version) == "$VER" ]] || { echo "rx provenance blox_display_version ($(p_rx blox_display_version)) does not match package version $VER"; exit 1; }
+
+# PR #2 follow-up review (Codex): same pin-verification gap as the Verus block above, on the RandomX side -
+# xmrig upstream/tag/commit and the three dependency (libuv/hwloc/OpenSSL) versions+hashes are all read straight
+# out of build/build-rx.sh's own literals (never hand-duplicated here), never out of the provenance's own
+# self-reported values alone.
+PIN_X_UPSTREAM=$(sed -n 's/^UPSTREAM=//p' "$ROOT/build/build-rx.sh")
+PIN_X_TAG=$(sed -n 's/^TAG=//p' "$ROOT/build/build-rx.sh")
+PIN_X_COMMIT=$(sed -n 's/^COMMIT=\([^[:space:]#]*\).*/\1/p' "$ROOT/build/build-rx.sh")
+[[ -n $PIN_X_UPSTREAM && -n $PIN_X_TAG && -n $PIN_X_COMMIT ]] || { echo "build/build-rx.sh: could not parse its own pinned UPSTREAM/TAG/COMMIT - refusing to package"; exit 1; }
+[[ $(p_rx upstream) == "$PIN_X_UPSTREAM" ]] || { echo "rx provenance upstream ($(p_rx upstream)) does not match build/build-rx.sh's pinned UPSTREAM ($PIN_X_UPSTREAM) - refusing to package"; exit 1; }
+[[ $(p_rx upstream_tag) == "$PIN_X_TAG" ]] || { echo "rx provenance upstream_tag ($(p_rx upstream_tag)) does not match build/build-rx.sh's pinned TAG ($PIN_X_TAG) - refusing to package"; exit 1; }
+[[ $(p_rx upstream_commit) == "$PIN_X_COMMIT" ]] || { echo "rx provenance upstream_commit ($(p_rx upstream_commit)) does not match build/build-rx.sh's pinned COMMIT ($PIN_X_COMMIT) - refusing to package"; exit 1; }
+
+PIN_UV_VER=$(sed -n 's/^UV_VER=//p' "$ROOT/build/build-rx.sh")
+PIN_UV_SHA256=$(sed -n 's/^UV_SHA256=//p' "$ROOT/build/build-rx.sh")
+PIN_HWLOC_VER=$(sed -n 's/^HWLOC_VER=//p' "$ROOT/build/build-rx.sh")
+PIN_HWLOC_SHA256=$(sed -n 's/^HWLOC_SHA256=//p' "$ROOT/build/build-rx.sh")
+PIN_SSL_VER=$(sed -n 's/^SSL_VER=//p' "$ROOT/build/build-rx.sh")
+PIN_SSL_SHA256=$(sed -n 's/^SSL_SHA256=//p' "$ROOT/build/build-rx.sh")
+[[ -n $PIN_UV_VER && -n $PIN_UV_SHA256 && -n $PIN_HWLOC_VER && -n $PIN_HWLOC_SHA256 && -n $PIN_SSL_VER && -n $PIN_SSL_SHA256 ]] \
+	|| { echo "build/build-rx.sh: could not parse its own pinned dependency versions/hashes - refusing to package"; exit 1; }
+[[ $(p_rx dep.libuv.version) == "$PIN_UV_VER" ]] || { echo "rx provenance dep.libuv.version ($(p_rx dep.libuv.version)) does not match build/build-rx.sh's pinned UV_VER ($PIN_UV_VER) - refusing to package"; exit 1; }
+[[ $(p_rx dep.libuv.sha256) == "$PIN_UV_SHA256" ]] || { echo "rx provenance dep.libuv.sha256 does not match build/build-rx.sh's pinned UV_SHA256 - refusing to package"; exit 1; }
+[[ $(p_rx dep.hwloc.version) == "$PIN_HWLOC_VER" ]] || { echo "rx provenance dep.hwloc.version ($(p_rx dep.hwloc.version)) does not match build/build-rx.sh's pinned HWLOC_VER ($PIN_HWLOC_VER) - refusing to package"; exit 1; }
+[[ $(p_rx dep.hwloc.sha256) == "$PIN_HWLOC_SHA256" ]] || { echo "rx provenance dep.hwloc.sha256 does not match build/build-rx.sh's pinned HWLOC_SHA256 - refusing to package"; exit 1; }
+[[ $(p_rx dep.openssl.version) == "$PIN_SSL_VER" ]] || { echo "rx provenance dep.openssl.version ($(p_rx dep.openssl.version)) does not match build/build-rx.sh's pinned SSL_VER ($PIN_SSL_VER) - refusing to package"; exit 1; }
+[[ $(p_rx dep.openssl.sha256) == "$PIN_SSL_SHA256" ]] || { echo "rx provenance dep.openssl.sha256 does not match build/build-rx.sh's pinned SSL_SHA256 - refusing to package"; exit 1; }
 
 # build/build-rx.sh records a sha256 for EVERY entry of its own HELPERS array at build time (as
 # helper.<path>.sha256 lines in $RXPROV) - not just the three bloxsense sources: the two donate0/branding
@@ -164,13 +211,16 @@ SRC
 
 This is the SOURCE bundle: ccminer/ and xmrig/ already contain each upstream tree at the commit above with its
 patch(es) already applied (build/bloxminer.patch; build/donate0.patch + build/branding.patch) - no network
-access or upstream checkout is needed to inspect or rebuild either engine from this bundle alone. bloxminer/
+access or upstream checkout is needed to INSPECT either engine's exact source from this bundle alone. bloxminer/
 here holds the HiveOS integration scripts (dispatcher + both engines' gated scripts) this bundle's own
 build/package.sh needs to reassemble a full binary package; they are the exact files shipped in the companion
-binary package. To rebuild the engine binaries: run build/build.sh (Verus engine, Ubuntu 22.04) and
-build/build-rx.sh (RandomX engine, Ubuntu 22.04) as root in a stock container/chroot; each clones its own
-upstream at the pinned tag/commit, verifies it, applies its patch(es), and builds exactly as described above.
-bloxsense is built the same way: plain -O2, static.
+binary package. REBUILDING the engine binaries is a separate step that does need network access: run
+build/build.sh (Verus engine, Ubuntu 22.04) and build/build-rx.sh (RandomX engine, Ubuntu 22.04) as root in a
+stock container/chroot; each RE-FETCHES its own pinned upstream (monkins1010/ccminer; xmrig/xmrig) via git
+clone at the tag/commit above, verifies it, applies its patch(es), and builds exactly as described above.
+build/build-rx.sh additionally downloads three dependency archives (libuv, hwloc, OpenSSL 3 - versions and
+URLs in build.provenance above) and verifies each against its pinned sha256 before building. bloxsense is built
+the same way: plain -O2, static, no network needed (no upstream, no deps).
 SRC2
 	else
 		cat <<'SRC3'

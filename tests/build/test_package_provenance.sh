@@ -106,6 +106,18 @@ gen_synthetic_outdirs() {   # $1 = verus outdir, $2 = rx outdir - see the header
 	x_tag=$(sed -n 's/^TAG=//p' "$ROOT/build/build-rx.sh")
 	x_commit=$(sed -n 's/^COMMIT=\([^[:space:]#]*\).*/\1/p' "$ROOT/build/build-rx.sh")
 	[[ -n $x_upstream && -n $x_tag && $x_commit =~ ^[0-9a-f]{40}$ ]] || { echo "gen_synthetic_outdirs: could not read UPSTREAM/TAG/COMMIT from build/build-rx.sh" >&2; return 1; }
+	# dependency pins (libuv/hwloc/OpenSSL): read straight out of build/build-rx.sh, same as upstream/tag/commit
+	# above - package.sh's own new pin checks (PR #2 follow-up review) compare against these same literals, so a
+	# genuinely faithful synthetic provenance must report them too, not just the upstream/tag/commit triple.
+	local x_uv_ver x_uv_sha x_hwloc_ver x_hwloc_sha x_ssl_ver x_ssl_sha
+	x_uv_ver=$(sed -n 's/^UV_VER=//p' "$ROOT/build/build-rx.sh")
+	x_uv_sha=$(sed -n 's/^UV_SHA256=//p' "$ROOT/build/build-rx.sh")
+	x_hwloc_ver=$(sed -n 's/^HWLOC_VER=//p' "$ROOT/build/build-rx.sh")
+	x_hwloc_sha=$(sed -n 's/^HWLOC_SHA256=//p' "$ROOT/build/build-rx.sh")
+	x_ssl_ver=$(sed -n 's/^SSL_VER=//p' "$ROOT/build/build-rx.sh")
+	x_ssl_sha=$(sed -n 's/^SSL_SHA256=//p' "$ROOT/build/build-rx.sh")
+	[[ -n $x_uv_ver && -n $x_uv_sha && -n $x_hwloc_ver && -n $x_hwloc_sha && -n $x_ssl_ver && -n $x_ssl_sha ]] || \
+		{ echo "gen_synthetic_outdirs: could not read UV_VER/HWLOC_VER/SSL_VER (or their sha256) from build/build-rx.sh" >&2; return 1; }
 
 	gen_fake_binary "$xout/xmrig" "synthetic xmrig binary for CI provenance testing"
 	gen_fake_binary "$xout/bloxsense" "synthetic bloxsense binary for CI provenance testing"
@@ -116,6 +128,12 @@ gen_synthetic_outdirs() {   # $1 = verus outdir, $2 = rx outdir - see the header
 		echo "patch_sha256=$(sha256sum "$ROOT/build/donate0.patch" | cut -d' ' -f1)"
 		echo "branding_patch_sha256=$(sha256sum "$ROOT/build/branding.patch" | cut -d' ' -f1)"
 		echo "blox_display_version=$ver"
+		echo "dep.libuv.version=$x_uv_ver"
+		echo "dep.libuv.sha256=$x_uv_sha"
+		echo "dep.hwloc.version=$x_hwloc_ver"
+		echo "dep.hwloc.sha256=$x_hwloc_sha"
+		echo "dep.openssl.version=$x_ssl_ver"
+		echo "dep.openssl.sha256=$x_ssl_sha"
 		echo "xmrig_sha256=$(sha256sum "$xout/xmrig" | cut -d' ' -f1)"
 		echo "bloxsense_sha256=$(sha256sum "$xout/bloxsense" | cut -d' ' -f1)"
 		# HELPERS: parsed straight out of build/build-rx.sh's own array (same extraction test 12 below already
@@ -230,6 +248,21 @@ sed -i.bak 's/^version=.*/version=2.1.0/' "$V6/bloxminer-O3.provenance"
 O="$T/bad-verus-ver"; run_pkg "$V6" "$RX_OUT" "$O"
 if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "version" <<< "$out"; then ok "tampered verus provenance version -> package.sh refuses"; else bad "tampered verus provenance version -> package.sh refuses" "rc=$rc out=$out"; fi
 
+# ---- 6b: verus provenance's upstream no longer matches build/build.sh's own pinned UPSTREAM -> refuses. A
+#      different upstream URL could otherwise carry an entirely different (and entirely self-consistent -
+#      binary_sha256/patch_sha256/version above would all still match) revision straight into a release.
+V6B="$T/verus-bad-upstream"; copy_outdir "$VERUS_OUT" "$V6B"
+sed -i.bak 's|^upstream=.*|upstream=https://github.com/attacker/ccminer.git|' "$V6B/bloxminer-O3.provenance"
+O="$T/bad-verus-upstream"; run_pkg "$V6B" "$RX_OUT" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned UPSTREAM" <<< "$out"; then ok "tampered verus provenance upstream -> package.sh refuses"; else bad "tampered verus provenance upstream -> package.sh refuses" "rc=$rc out=$out"; fi
+
+# ---- 6c: verus provenance's upstream_commit no longer matches build/build.sh's own pinned COMMIT -> refuses.
+#      Same class as 6b: a build from some OTHER (self-consistent) revision must not ship as this release.
+V6C="$T/verus-bad-commit"; copy_outdir "$VERUS_OUT" "$V6C"
+sed -i.bak 's/^upstream_commit=.*/upstream_commit=0000000000000000000000000000000000000000/' "$V6C/bloxminer-O3.provenance"
+O="$T/bad-verus-commit"; run_pkg "$V6C" "$RX_OUT" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned COMMIT" <<< "$out"; then ok "tampered verus provenance upstream_commit -> package.sh refuses"; else bad "tampered verus provenance upstream_commit -> package.sh refuses" "rc=$rc out=$out"; fi
+
 # ---- 7: tampered RandomX binary bytes -> refuses
 X7="$T/rx-bad-bin"; copy_outdir "$RX_OUT" "$X7"; flip_byte "$X7/xmrig"
 O="$T/bad-rx"; run_pkg "$VERUS_OUT" "$X7" "$O"
@@ -252,6 +285,42 @@ X10="$T/rx-bad-dispver"; copy_outdir "$RX_OUT" "$X10"
 sed -i.bak 's/^blox_display_version=.*/blox_display_version=1.2.3/' "$X10/build.provenance"
 O="$T/bad-rx-dispver"; run_pkg "$VERUS_OUT" "$X10" "$O"
 if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "blox_display_version" <<< "$out"; then ok "tampered rx provenance blox_display_version -> package.sh refuses"; else bad "tampered rx provenance blox_display_version -> package.sh refuses" "rc=$rc out=$out"; fi
+
+# ---- 10b/10c/10d: rx provenance's upstream/upstream_tag/upstream_commit no longer match build/build-rx.sh's
+#      own pinned UPSTREAM/TAG/COMMIT -> refuses, same class as 6b/6c but for the RandomX side.
+X10B="$T/rx-bad-upstream"; copy_outdir "$RX_OUT" "$X10B"
+sed -i.bak 's|^upstream=.*|upstream=https://github.com/attacker/xmrig|' "$X10B/build.provenance"
+O="$T/bad-rx-upstream"; run_pkg "$VERUS_OUT" "$X10B" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned UPSTREAM" <<< "$out"; then ok "tampered rx provenance upstream -> package.sh refuses"; else bad "tampered rx provenance upstream -> package.sh refuses" "rc=$rc out=$out"; fi
+
+X10C="$T/rx-bad-tag"; copy_outdir "$RX_OUT" "$X10C"
+sed -i.bak 's/^upstream_tag=.*/upstream_tag=v99.0.0/' "$X10C/build.provenance"
+O="$T/bad-rx-tag"; run_pkg "$VERUS_OUT" "$X10C" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned TAG" <<< "$out"; then ok "tampered rx provenance upstream_tag -> package.sh refuses"; else bad "tampered rx provenance upstream_tag -> package.sh refuses" "rc=$rc out=$out"; fi
+
+X10D="$T/rx-bad-commit"; copy_outdir "$RX_OUT" "$X10D"
+sed -i.bak 's/^upstream_commit=.*/upstream_commit=0000000000000000000000000000000000000000/' "$X10D/build.provenance"
+O="$T/bad-rx-commit"; run_pkg "$VERUS_OUT" "$X10D" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned COMMIT" <<< "$out"; then ok "tampered rx provenance upstream_commit -> package.sh refuses"; else bad "tampered rx provenance upstream_commit -> package.sh refuses" "rc=$rc out=$out"; fi
+
+# ---- 10e/10f/10g: rx provenance's dep.libuv/.hwloc/.openssl version+sha256 no longer match build/build-rx.sh's
+#      own pinned UV_VER/UV_SHA256 etc. -> refuses (only the version half is tampered per case; either half
+#      diverging from the pin is the same real risk - a dependency swapped for one with a known vulnerability
+#      or a backdoor, self-consistent with its own provenance entry but not with what build-rx.sh actually pins).
+X10E="$T/rx-bad-uv"; copy_outdir "$RX_OUT" "$X10E"
+sed -i.bak 's/^dep.libuv.version=.*/dep.libuv.version=9.9.9/' "$X10E/build.provenance"
+O="$T/bad-rx-uv"; run_pkg "$VERUS_OUT" "$X10E" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned UV_VER" <<< "$out"; then ok "tampered rx provenance dep.libuv.version -> package.sh refuses"; else bad "tampered rx provenance dep.libuv.version -> package.sh refuses" "rc=$rc out=$out"; fi
+
+X10F="$T/rx-bad-hwloc"; copy_outdir "$RX_OUT" "$X10F"
+sed -i.bak 's/^dep.hwloc.sha256=.*/dep.hwloc.sha256=0000000000000000000000000000000000000000000000000000000000000000/' "$X10F/build.provenance"
+O="$T/bad-rx-hwloc"; run_pkg "$VERUS_OUT" "$X10F" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned HWLOC_SHA256" <<< "$out"; then ok "tampered rx provenance dep.hwloc.sha256 -> package.sh refuses"; else bad "tampered rx provenance dep.hwloc.sha256 -> package.sh refuses" "rc=$rc out=$out"; fi
+
+X10G="$T/rx-bad-ssl"; copy_outdir "$RX_OUT" "$X10G"
+sed -i.bak 's/^dep.openssl.version=.*/dep.openssl.version=9.9.9/' "$X10G/build.provenance"
+O="$T/bad-rx-ssl"; run_pkg "$VERUS_OUT" "$X10G" "$O"
+if [[ $rc != 0 && ! -f $O/bloxminer-3.0.0.tar.gz ]] && grep -qF "pinned SSL_VER" <<< "$out"; then ok "tampered rx provenance dep.openssl.version -> package.sh refuses"; else bad "tampered rx provenance dep.openssl.version -> package.sh refuses" "rc=$rc out=$out"; fi
 
 # ---- 11: bundled bloxsense SOURCE tampered by one byte (the binary and its own build.provenance are both
 #      untouched - only the source this repo is about to ship next to that binary changed) -> refuses. package.sh
