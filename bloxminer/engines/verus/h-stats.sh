@@ -233,9 +233,19 @@ run() {
 	}' && consistent=1
 	(( consistent )) || return 0
 
-	khs=$khs_b
+	# Built into a LOCAL variable first, validated, and only THEN assigned to $khs/$stats and written - never
+	# straight into the globals/$OUTFILE. This composition is 5 jq forks deep (the outer call plus 4 nested
+	# command substitutions for hs/temp/fan/bus) - any one of them failing (a transient fork/exec failure
+	# under resource pressure - see rx/h-stats.sh's own history of this exact class of bug) would otherwise
+	# leave $stats empty/malformed while $khs already held a real, positive number (khs_b, assigned before
+	# this): write_result would then atomically overwrite Phase A's own already-good, already-written OUTFILE
+	# with invalid JSON, and the PARENT's read-back guard (which only ever sees $OUTFILE) would have no choice
+	# but to discard the whole thing and report the safe fallback 0 - destroying a real positive rate Phase A
+	# had already safely captured. Validating here, before touching $khs/$stats/$OUTFILE, is what prevents
+	# that; a caught failure leaves BOTH the globals and the file exactly as Phase A already left them.
 	n=${#hs[@]}
-	stats=$(jq -nc \
+	local new_stats
+	new_stats=$(jq -nc \
 		--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
 		--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
 		--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
@@ -244,7 +254,13 @@ run() {
 		'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
 		  algo: "verushash", ver: $ver}
 		 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
-	write_result "$khs" "$stats"
+	if jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+		(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
+	then
+		khs=$khs_b
+		stats=$new_stats
+		write_result "$khs" "$stats"
+	fi   # else: final stats composition failed - Phase A's already-written result stands, untouched
 }
 LIBEOF
 

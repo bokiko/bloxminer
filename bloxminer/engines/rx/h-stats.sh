@@ -482,13 +482,36 @@ run() {
 	if [[ $complete == true && $consistent == 1 ]]; then
 		# Phase B's total AND its own stats replace Phase A's - never a mixed payload (Phase A's number with
 		# Phase B's rows, or vice versa): either Phase B is trusted whole, or Phase A's whole result stands.
-		khs=$phaseb_total
-		stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
+		# Built into a LOCAL variable first, validated, and only THEN assigned to $khs/$stats and written -
+		# never straight into the globals/$OUTFILE. This composition is 4 jq forks deep (the outer call plus
+		# 3 nested command substitutions for hs/temp/ar) - any one of them failing (the same transient
+		# fork/exec-under-resource-pressure class Codex's review already found twice elsewhere in this file)
+		# would otherwise leave $stats empty/malformed while $khs already held a real, positive number:
+		# write_result would then atomically overwrite Phase A's own already-good, already-written OUTFILE
+		# with `{"khs":"500.00","stats":}` - syntactically invalid JSON - and the PARENT's own read-back guard
+		# (which only ever sees $OUTFILE, never these in-process variables) would have no choice but to
+		# discard the whole thing and report the safe fallback 0, destroying a real positive rate Phase A had
+		# already safely captured. Validating here, before ever touching $khs/$stats/$OUTFILE, is what
+		# actually prevents that - a caught failure below leaves BOTH the globals and the file exactly as
+		# Phase A already left them.
+		local new_stats
+		[[ -n ${BLOX_HSTATS_TEST_FORCE_STATS_FAIL:-} ]] && power_raw='BROKEN'   # tests only: not valid JSON,
+			# so the --argjson below fails fatally - simulates the transient jq/fork failure this whole
+			# validate-before-write guard exists for, without weakening anything it guards against
+		new_stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
 			--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
 			--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
 			'{hs: $hs, hs_units: "khs", temp: $temp, ar: $ar, uptime: $uptime, ver: $ver, algo: $algo}
 			 + (if ($power | type) == "number" and $power > 0 then {cpu_power: $power} else {} end)')
-		write_result "$khs" "$stats"
+		if jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
+		then
+			khs=$phaseb_total
+			stats=$new_stats
+			write_result "$khs" "$stats"
+		else
+			dbg "phase B: FAILED - final stats composition invalid/empty (was: '$new_stats') - Phase A's khs=$khs_fresh stands, OUTFILE left untouched"
+		fi
 	fi   # else: Phase A's already-written result (khs_fresh + its own stats) stands, completely untouched
 
 	# enrichment cache: TEMPERATURE only, keyed by this xmrig instance (pid + its own /proc start time) - see

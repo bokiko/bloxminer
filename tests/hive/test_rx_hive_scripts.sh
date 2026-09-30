@@ -248,6 +248,36 @@ stats_case "realistic /2/summary WITH hashrate.total (unlike every SUM_OK-family
 	20032 "$SUM_WITH_HASHRATE" "$BACK_SMALL" \
 	'.khs == "2.00" and .stats.hs == [2] and .stats.uptime == 50 and .stats.ar == [2, 0]'
 
+# Codex (final review of 5fa769c): Phase B's own FINAL stats composition (khs=$phaseb_total already assigned,
+# then a 4-jq-fork-deep `stats=$(jq -nc ...)`) used to write straight into $khs/$stats/$OUTFILE with no
+# validation - if that composition itself failed (the same transient jq/fork-under-resource-pressure class
+# already found and fixed twice elsewhere in this file), $stats would come back empty while $khs already held
+# a real positive number, and write_result would atomically clobber Phase A's own already-good OUTFILE with
+# `{"khs":"2.00","stats":}` - invalid JSON - discarding a real positive rate down to the parent's safe-but-
+# wrong fallback 0. Reproduces that EXACT failure (not a contrived one: $BLOX_HSTATS_TEST_FORCE_STATS_FAIL
+# forces $power_raw to a non-JSON string, which is exactly what a failed/garbled bloxsense read could also
+# produce, making the real `--argjson power "$power_raw"` call fail fatally, the same way a transient fork
+# failure would) with Phase A positive (reusing the exact fixture above) and proves Phase A's positive result
+# is what the parent actually returns - never 0, never invalid JSON silently swallowed.
+S_DEBUG="$T/force_stats_fail_debug.log"; : > "$S_DEBUG"
+reset_proc; listen 20033 1033 "$BLOX_DIR/xmrig"
+jq -n --argjson s "$SUM_WITH_HASHRATE" --argjson b "$BACK_SMALL" '{summary: $s, backends: $b}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_xmrig_api.py" 20033 "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+grep -q ready "$T/api.out" || bad "Phase B final composition failure -> Phase A's positive result must stand" "fake API did not start: $(cat "$T/api.out" 2>/dev/null)"
+for _ in $(seq 20); do curl -fsS --max-time 1 -o /dev/null "http://127.0.0.1:20033/2/summary" && break; sleep 0.05; done
+res=$(BLOX_API_PORT=20033 BLOX_HSTATS_TEST_FORCE_STATS_FAIL=1 BLOX_HSTATS_DEBUG_LOG="$S_DEBUG" \
+	bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+if [[ $(jq -r '.khs == "2.00" and (.stats.hs | type) == "array"' <<< "$res" 2>/dev/null) == true ]] \
+	&& grep -q "FAILED - final stats composition invalid" "$S_DEBUG"
+then
+	ok "Phase B's own final stats composition failing (forced, resource-pressure-shaped): Phase A's positive khs=2.00 is what the parent returns, never 0 or invalid JSON"
+else
+	bad "Phase B final composition failure -> Phase A's positive result must stand" "res=$res debug=$(cat "$S_DEBUG" 2>/dev/null)"
+fi
+
 BACK_NULLS=$(python3 - <<'PY'
 import json
 threads = [{"affinity": c, "hashrate": [None, None, None]} for c in range(4)]
