@@ -99,6 +99,25 @@ write_smaps() {   # $1=pid $2=Private_Hugetlb (2 MB pages) $3=Shared_Hugetlb (2 
 }
 write_smaps_partial() { mkdir -p "$PROC/$1"; printf 'Rss:                 512 kB\nPss:                 512 kB\n' > "$PROC/$1/smaps_rollup"; }
 
+# ---- PR #2 follow-up review round 2 (Codex): "Restore the 2 MB reservation in 1 GB mode" - the FULL
+#      /proc/<pid>/smaps (never smaps_rollup, which sums Private_Hugetlb/Shared_Hugetlb across every page size
+#      a process maps with no way to separate them again) _hp_xmrig_2mb_need_pages now reads, with TWO
+#      synthetic VMAs: one 2 MB-hugetlb-backed (KernelPageSize 2048 - what this package's own reservation is
+#      responsible for, typically RandomX's own JIT code buffer in 1gb-pages mode) and one 1 GB-hugetlb-backed
+#      (KernelPageSize 1048576 - RandomX's own dataset, an entirely separate pool this package never touches) -
+#      proving the 2 MB-only measurement correctly counts the first and excludes the second.
+write_smaps_full() {   # $1=pid $2=2 MB pages (KernelPageSize 2048) $3=1 GB pages (KernelPageSize 1048576, default 0)
+	mkdir -p "$PROC/$1"
+	local kb2 kb1
+	kb2=$(( ${2:-0} * 2048 )); kb1=$(( ${3:-0} * 1048576 ))
+	{
+		printf '7f0000000000-7f0000200000 rw-p 00000000 00:00 0\n'
+		printf 'Rss:              %8d kB\nPss:              %8d kB\nKernelPageSize:      2048 kB\nMMUPageSize:         2048 kB\nPrivate_Hugetlb:  %8d kB\nShared_Hugetlb:         0 kB\n' "$kb2" "$kb2" "$kb2"
+		printf '7f1000000000-7f1040000000 rw-p 00000000 00:00 0\n'
+		printf 'Rss:              %8d kB\nPss:              %8d kB\nKernelPageSize:   1048576 kB\nMMUPageSize:      1048576 kB\nPrivate_Hugetlb:  %8d kB\nShared_Hugetlb:         0 kB\n' "$kb1" "$kb1" "$kb1"
+	} > "$PROC/$1/smaps"
+}
+
 # ---- fake xmrig API: one CPU thread reporting real hashrate, a CONTROLLABLE "hugepages":[allocated,total] on
 #      /2/summary (xmrig.backend.cpu.CpuBackend.cpp:471) - Round 5b: kept ONLY as a readiness signal
 #      (allocated==total) by finalize_rx_hugepages, never again as the source of the "need" value.
@@ -319,26 +338,72 @@ fi
 attempt_restore
 if ! sysctl_called; then ok "boot_id mismatch: never restored (final != 1)"; else bad "boot_id mismatch: never restored" "$(cat "$SYSCTL_LOG")"; fi
 
-# ================================================================== 9. 1gb-pages guard: smaps_rollup's
-#    Hugetlb byte counters mix 1GB/2MB pages with no way to tell them apart (see h-common.sh's documented
-#    limitation) - never finalize, logged exactly once (final -> "conflict"), never restored. (No smaps fixture
-#    needed - this guard fires before finalize_rx_hugepages ever reads smaps_rollup.)
+# ================================================================== 9. PR #2 follow-up review round 2
+#    (Codex): "Restore the 2 MB reservation in 1 GB mode" - 1gb-pages used to mean giving up on this whole
+#    session outright (permanent conflict, 2 MB pages pinned until reboot) - now it finalizes/restores the
+#    2 MB pool normally, using ONLY the 2 MB-only portion of what XMRig actually mapped (smaps, not
+#    smaps_rollup - see _hp_xmrig_2mb_need_pages's own header). 1 GB pages themselves stay entirely
+#    user-managed (README.md's own documented behaviour, unchanged).
+#
+# 9a. cur == prelim (the common case): a small 2 MB-only footprint (1 page, e.g. RandomX's own JIT code
+#     buffer) that fits comfortably within what was already free (free0=1200) needs nothing extra beyond the
+#     dispatcher's own initial reservation - a LARGE separate 1 GB-backed VMA (40 x 1 GB, RandomX's own
+#     dataset) is present in the same smaps fixture and must be correctly EXCLUDED from the measurement.
 setup_pkg; write_rx_config true   # randomx."1gb-pages": true
-setup_proc 1201 1200 boot-HHH
-mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HHH\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+setup_proc 1200 1200 boot-HH1
+write_smaps_full "$OWNER_PID" 1 40   # 1 x 2 MB page (JIT buffer) + 40 x 1 GB pages (dataset, must be excluded)
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HH1\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
 start_api 1200 1200 500
 poll
-n1=$(log_count "1gb-pages is enabled")
+if [[ $(hp_field final) == 1 && $(hp_field ours) == 1200 ]]; then
+	ok "1gb-pages: 2 MB-only footprint (1 page, 1 GB dataset excluded) -> finalizes (final=1, ours=1200=prelim, nothing extra needed)"
+else
+	bad "1gb-pages: 2 MB-only footprint -> finalizes (ours=1200)" "$(cat "$HUGEFILE" 2>/dev/null)"
+fi
+stop_api
+attempt_restore
+if sysctl_called && grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then
+	ok "1gb-pages: the 2 MB reservation IS restored on Verus (original prior 0) - 1 GB pages stay user-managed, untouched by this restore"
+else
+	bad "1gb-pages: 2 MB reservation restored on Verus" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "1gb-pages: ownership record removed (restore verified successful)"; else bad "1gb-pages: ownership record removed" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# 9b. 2 MB-only footprint is legitimately ZERO (e.g. the JIT buffer itself also landed in the 1 GB pool) - NOT
+#     a failure, still finalizes (need=0 is valid here, unlike the non-1gb-pages case).
+setup_pkg; write_rx_config true
+setup_proc 1200 1200 boot-HH2
+write_smaps_full "$OWNER_PID" 0 41   # 0 x 2 MB pages, everything (41 x 1 GB) in the separate 1 GB pool
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HH2\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500
 poll
 stop_api
-n2=$(log_count "1gb-pages is enabled")
-if [[ $(hp_field final) == conflict && $n1 == 1 && $n2 == 1 ]]; then
-	ok "1gb-pages enabled: never finalizes, logged exactly once, not every poll"
+if [[ $(hp_field final) == 1 && $(hp_field ours) == 1200 ]]; then
+	ok "1gb-pages: 2 MB-only footprint of exactly 0 -> still finalizes (need=0 is legitimate here, not a failure)"
 else
-	bad "1gb-pages enabled: never finalizes, logged once" "final=$(hp_field final) n1=$n1 n2=$n2 log=$(cat "$LOGFILE" 2>/dev/null)"
+	bad "1gb-pages: 2 MB-only footprint of 0 -> finalizes" "$(cat "$HUGEFILE" 2>/dev/null)"
+fi
+
+# 9c. smaps entirely unreadable in 1gb-pages mode -> the new, distinct failure path (never finalize, logged
+#     once, record kept) - the OLD blanket "1gb-pages is enabled" guard is gone; this is now the SAME class of
+#     fail-safe every other unreadable-mapping case already gets, just from smaps instead of smaps_rollup.
+setup_pkg; write_rx_config true
+setup_proc 1201 1200 boot-HH3
+# no write_smaps_full call at all - /proc/$OWNER_PID/smaps does not exist
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-HH3\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500
+poll
+n1=$(log_count "could not read a complete 2 MB-only huge-page mapping")
+poll
+stop_api
+n2=$(log_count "could not read a complete 2 MB-only huge-page mapping")
+if [[ $(hp_field final) == conflict && $n1 == 1 && $n2 == 1 ]]; then
+	ok "1gb-pages: smaps unreadable -> never finalizes, logged exactly once, not every poll"
+else
+	bad "1gb-pages: smaps unreadable -> never finalizes, logged once" "final=$(hp_field final) n1=$n1 n2=$n2 log=$(cat "$LOGFILE" 2>/dev/null)"
 fi
 attempt_restore
-if ! sysctl_called; then ok "1gb-pages enabled: never restored (final != 1)"; else bad "1gb-pages enabled: never restored" "$(cat "$SYSCTL_LOG")"; fi
+if ! sysctl_called; then ok "1gb-pages: smaps unreadable -> never restored (final != 1)"; else bad "1gb-pages: smaps unreadable -> never restored" "$(cat "$SYSCTL_LOG")"; fi
 
 # ================================================================== 10. a failed sysctl write's EXIT STATUS
 #    lied (exit 0) but never actually touched vm.nr_hugepages - the Round 5 readback verification catches this

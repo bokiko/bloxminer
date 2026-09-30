@@ -502,7 +502,12 @@ boot*, and `vm.nr_hugepages` still equals exactly the value BloxMiner left it at
 the meantime). If either condition fails — no finalized record, a different boot, or the live value has moved
 — BloxMiner leaves `vm.nr_hugepages` untouched and logs why, rather than guessing. **1 GB pages are never
 auto-restored**, under any condition (this covers 2 MB huge pages only); if you turn on `1gb-pages` in Extra
-config, plan to manage that reservation yourself.
+config, plan to manage that reservation yourself. This is true even while `1gb-pages` is active: the
+dispatcher's own `hugepages -rx` call always reserves the 2 MB pool regardless of that setting (RandomX's own
+1 GB pool is separate and entirely independent of it), and BloxMiner still measures, finalizes and restores
+*that* 2 MB reservation normally — it just measures the 2 MB-only portion of what XMRig actually mapped
+(typically just RandomX's own JIT code buffer, which 1 GB pages do not necessarily cover) rather than XMRig's
+combined 1 GB+2 MB total, which cannot be split back apart once mixed.
 
 A finalized record is only ever trusted within the SAME boot it was written in (`boot_id` from
 `/proc/sys/kernel/random/boot_id`, checked both when finalizing and again before every restore) - it lives on

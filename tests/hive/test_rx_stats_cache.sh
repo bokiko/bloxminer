@@ -71,7 +71,12 @@ start_api() {
 	: > "$T/api.out"
 	python3 "$HERE/fake_xmrig_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
 	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
-	grep -q ready "$T/api.out" || { echo "SKIP: fake API did not (re)start: $(cat "$T/api.out")"; exit 0; }
+	# PR #2 follow-up review round 2 (Codex): "audit every other SKIP path for the same" - this used to be the
+	# ONLY file in tests/hive/ treating a fake-API startup race as SKIP+exit 0 (silently exiting the WHOLE
+	# suite as a SUCCESS); every other file (test_rx_hive_scripts.sh, test_verus_hive_scripts.sh,
+	# test_rx_under_load.sh) treats the identical situation as bad() - a recorded, visible FAIL that lets the
+	# rest of the suite keep running, never a silent pass. Matches that established convention.
+	grep -q ready "$T/api.out" || { bad "start_api: fake API did not (re)start" "$(cat "$T/api.out")"; return; }
 }
 
 # Every summary fixture's hashrate.total EXACTLY matches its paired backends fixture's per-thread sum, so

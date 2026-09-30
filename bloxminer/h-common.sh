@@ -328,6 +328,40 @@ _hp_xmrig_need_pages() {
 	echo $(( (priv + shared) / hpkb ))
 }
 
+# _hp_xmrig_2mb_need_pages <owner pid> - PR #2 follow-up review (Codex): like _hp_xmrig_need_pages above, but
+# ISOLATES the standard-size (2 MB on every observed rig, via _hp_hugepage_size_kb - never hardcoded) huge-page
+# portion of what that ownership-verified xmrig process actually has mapped, from its FULL /proc/<pid>/smaps -
+# never smaps_rollup, which sums Private_Hugetlb/Shared_Hugetlb across EVERY page size a process maps, with no
+# way to separate them again (exactly the limitation finalize_rx_hugepages's own 1gb-pages handling used to
+# give up entirely over). Each VMA entry in the full smaps file carries its OWN KernelPageSize (2048 for a
+# 2 MB-hugetlb-backed VMA, 1048576 for a 1 GB-hugetlb-backed one, 4 for an ordinary page) - only VMAs whose
+# KernelPageSize equals the pool `hugepages -rx`/nr_hugepages actually manages are summed, so a RandomX dataset
+# mapped via 1 GB pages (a DIFFERENT, independently-managed pool this package never touches) is correctly
+# excluded, leaving only whatever this package's own 2 MB reservation is actually responsible for - typically
+# just RandomX's own JIT code buffer in 1gb-pages mode (see _hp_xmrig_need_pages's own header comment: that
+# buffer is allocated by a SEPARATE path from the main dataset and is not necessarily steered by 1gb-pages at
+# all). Prints nothing on any read failure (missing/unreadable smaps, no readable Hugepagesize, not a whole
+# number of pages) - the caller treats that exactly like _hp_xmrig_need_pages's own failure mode. Legitimately
+# prints 0 when nothing was mapped through the 2 MB pool at all (e.g. the JIT buffer itself also landed in the
+# 1 GB pool) - callers must NOT treat 0 as a failure here the way _hp_xmrig_need_pages's own callers do.
+# ONE awk pass (no per-VMA fork) - smaps has many more lines than smaps_rollup, but still only one process's
+# own VMAs (a handful for xmrig), never a system-wide scan.
+_hp_xmrig_2mb_need_pages() {
+	local f="${BLOX_PROCFS_ROOT:-/proc}/$1/smaps" hpkb sum
+	[[ -r $f ]] || return 0
+	hpkb=$(_hp_hugepage_size_kb)
+	[[ $hpkb =~ ^[0-9]+$ && $hpkb -gt 0 ]] || return 0
+	sum=$(awk -v want="$hpkb" '
+		/^KernelPageSize:/ { ksize = $2 + 0 }
+		/^Private_Hugetlb:/ { if (ksize == want) sum += $2 + 0 }
+		/^Shared_Hugetlb:/  { if (ksize == want) sum += $2 + 0 }
+		END { print sum + 0 }
+	' "$f" 2>/dev/null)
+	[[ $sum =~ ^[0-9]+$ ]] || return 0
+	(( sum % hpkb == 0 )) || return 0   # not a whole number of pages - inconsistent, never guess
+	echo $(( sum / hpkb ))
+}
+
 # _hp_rewrite <final> [ours] - atomically rewrites the record, keeping prior/prelim/free0/boot/start_uptime as
 # they already are and setting only `final` (and `ours`, when given - only ever passed on a successful finalisation).
 # tmp+mv, same atomicity convention as every other write in this file.
@@ -583,14 +617,17 @@ finalize_rx_hugepages() {
 	[[ $hp_allocated =~ ^[0-9]+$ && $hp_total =~ ^[0-9]+$ && $hp_total -gt 0 ]] || return 0
 	(( hp_allocated == hp_total )) || return 0   # dataset/scratchpads still being allocated - retry next poll
 
-	# ---- documented limitation: 1 GB-pages aggregates into the same smaps_rollup Hugetlb byte counters with no
-	# way to tell 2 MB pages and 1 GB pages apart, so dividing by _hp_hugepage_size_kb below would not correctly
-	# recover a 2 MB-page count either - this package's arithmetic does not apply; never finalize this session.
-	if [[ $(jq -r '(.randomx["1gb-pages"] // false)' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null) == true ]]; then
-		log_hugepages_note "BloxMiner: RandomX 1gb-pages is enabled - XMRig's actual huge-page mapping mixes 1GB/2MB units, so this package's finalization arithmetic does not apply; never finalizing this rx session, ownership record kept"
-		_hp_rewrite conflict
-		return 0
-	fi
+	# ---- PR #2 follow-up review (Codex): "Restore the 2 MB reservation in 1 GB mode" - 1gb-pages used to mean
+	# giving up on this whole session outright (permanent "conflict", record kept forever, 2 MB pages pinned
+	# until reboot). But the dispatcher's own `hugepages -rx` call ALWAYS reserves the 2 MB pool regardless of
+	# this setting - Hive's helper does not know or care about XMRig's own, entirely separate 1 GB pool - so
+	# that 2 MB reservation still deserves the exact same tracking/restore this package already gives the
+	# non-1gb-pages case; only the MEASUREMENT needs to change, to isolate the 2 MB-only portion of what XMRig
+	# actually mapped (see _hp_xmrig_2mb_need_pages's own header for how). 1 GB pages themselves stay entirely
+	# user-managed, exactly as documented in README.md's "Huge pages" section - none of this package's own
+	# arithmetic below ever concerns anything but the 2 MB pool `hugepages -rx`/nr_hugepages manages.
+	local onegb=0
+	[[ $(jq -r '(.randomx["1gb-pages"] // false)' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null) == true ]] && onegb=1
 
 	local prior prelim free0 start_uptime
 	prior=$(_hp_field prior); prelim=$(_hp_field prelim); free0=$(_hp_field free0); start_uptime=$(_hp_field start_uptime)
@@ -614,13 +651,25 @@ finalize_rx_hugepages() {
 	fi
 
 	# ---- Round 5b: KERNEL TRUTH of what this exact, ownership-verified xmrig process actually has mapped -
-	# never a foreign pid's smaps_rollup (owner_pid was already positively confirmed above), never the API's
-	# own (incomplete) self-report. Missing/unreadable/incomplete -> fail safe, log once, never finalize.
-	local need_pages; need_pages=$(_hp_xmrig_need_pages "$owner_pid")
-	if [[ ! $need_pages =~ ^[0-9]+$ || $need_pages -le 0 ]]; then
-		log_hugepages_note "BloxMiner: could not read a complete huge-page mapping from /proc/$owner_pid/smaps_rollup (Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
-		_hp_rewrite conflict
-		return 0
+	# never a foreign pid's smaps_rollup/smaps (owner_pid was already positively confirmed above), never the
+	# API's own (incomplete) self-report. Missing/unreadable/incomplete -> fail safe, log once, never finalize.
+	# In 1gb-pages mode, the 2 MB-only measurement legitimately CAN be 0 (e.g. the JIT buffer itself also
+	# landed in the 1 GB pool) - only an outright read failure is an error there, unlike the normal case.
+	local need_pages
+	if (( onegb )); then
+		need_pages=$(_hp_xmrig_2mb_need_pages "$owner_pid")
+		if [[ ! $need_pages =~ ^[0-9]+$ ]]; then
+			log_hugepages_note "BloxMiner: 1gb-pages is enabled and could not read a complete 2 MB-only huge-page mapping from /proc/$owner_pid/smaps (KernelPageSize/Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
+			_hp_rewrite conflict
+			return 0
+		fi
+	else
+		need_pages=$(_hp_xmrig_need_pages "$owner_pid")
+		if [[ ! $need_pages =~ ^[0-9]+$ || $need_pages -le 0 ]]; then
+			log_hugepages_note "BloxMiner: could not read a complete huge-page mapping from /proc/$owner_pid/smaps_rollup (Private_Hugetlb/Shared_Hugetlb/Hugepagesize missing, unreadable, or not a whole number of pages) - never finalizing this rx session, record kept"
+			_hp_rewrite conflict
+			return 0
+		fi
 	fi
 
 	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" cur
@@ -631,7 +680,8 @@ finalize_rx_hugepages() {
 	local predicted=$(( prelim + short ))
 
 	if [[ $cur != "$predicted" ]]; then
-		log_hugepages_note "BloxMiner: vm.nr_hugepages ($cur) does not match XMRig's own predicted reservation (prelim $prelim + max(0, need $need_pages - free0 $free0) = $predicted, need from /proc/$owner_pid/smaps_rollup) once the dataset finished allocating - something else changed it during the startup window; never finalizing this rx session, record kept"
+		local need_src="/proc/$owner_pid/smaps_rollup"; (( onegb )) && need_src="/proc/$owner_pid/smaps, 2 MB-only"
+		log_hugepages_note "BloxMiner: vm.nr_hugepages ($cur) does not match XMRig's own predicted reservation (prelim $prelim + max(0, need $need_pages - free0 $free0) = $predicted, need from $need_src) once the dataset finished allocating - something else changed it during the startup window; never finalizing this rx session, record kept"
 		_hp_rewrite conflict
 		return 0
 	fi

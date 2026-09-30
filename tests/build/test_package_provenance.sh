@@ -34,6 +34,21 @@ HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 VERUS_OUT=${1:-${BLOX_VERUS_OUT:-}}
 RX_OUT=${2:-${BLOX_RX_OUT:-}}
 SYNTH_DIR=""
+# PR #2 follow-up review round 2 (Codex): "Fail CI when the provenance hermetic check fails" - the hermetic
+# check below (and the outdir-completeness check just before it) used to print SKIP and exit 0 UNCONDITIONALLY,
+# never checking BLOX_CI at all - so a genuinely broken synthetic-outdir generation (a bug in
+# gen_synthetic_outdirs, or a future repo change it does not yet account for) would silently SKIP this whole
+# 25-case suite in CI instead of failing it, exactly the class of bug BLOX_CI/skip_or_fail exists to prevent
+# (see tests/hive/test_config_diff.sh's own identical helper, same rationale, same name - shared convention
+# across this repo's test suite, not a one-off).
+skip_or_fail() {   # $1 = reason - SKIP normally, FAIL under BLOX_CI
+	if [[ -n ${BLOX_CI:-} ]]; then
+		echo "FAIL: $1 (BLOX_CI is set - a SKIP here would silently stop this gate from ever running in CI)"
+		exit 1
+	fi
+	echo "SKIP: $1"
+	exit 0
+}
 gen_synthetic_outdirs() {   # $1 = verus outdir, $2 = rx outdir - see the header comment above for the full
 	# rationale. Fails loudly (never silently) on any network/tooling problem: under BLOX_CI, that must FAIL
 	# the whole suite (the point of this function existing), never fall through to a SKIP that looks the same
@@ -122,13 +137,12 @@ if [[ -z $VERUS_OUT || -z $RX_OUT ]]; then
 			exit 1
 		fi
 	else
-		echo "SKIP: no build outdirs given - pass <verus-out> <rx-out> as arguments, or set BLOX_VERUS_OUT/BLOX_RX_OUT (or BLOX_CI=1 to generate synthetic ones - see this file's own header comment). This test needs build/build.sh and build/build-rx.sh output for the EXACT commit/tree under test; it never falls back to a shared or previously-built default location."
-		exit 0
+		skip_or_fail "no build outdirs given - pass <verus-out> <rx-out> as arguments, or set BLOX_VERUS_OUT/BLOX_RX_OUT (or BLOX_CI=1 to generate synthetic ones - see this file's own header comment). This test needs build/build.sh and build/build-rx.sh output for the EXACT commit/tree under test; it never falls back to a shared or previously-built default location."
 	fi
 fi
 trap '[[ -n $SYNTH_DIR ]] && rm -rf "$SYNTH_DIR"' EXIT
-[[ -f $VERUS_OUT/bloxminer-O3 && -f $VERUS_OUT/bloxminer-O3.provenance && -f $VERUS_OUT/libomp.so.5 && -f $RX_OUT/xmrig && -f $RX_OUT/bloxsense && -f $RX_OUT/build.provenance ]] || {
-	echo "SKIP: build outdirs not found or incomplete ($VERUS_OUT / $RX_OUT)"; exit 0; }
+[[ -f $VERUS_OUT/bloxminer-O3 && -f $VERUS_OUT/bloxminer-O3.provenance && -f $VERUS_OUT/libomp.so.5 && -f $RX_OUT/xmrig && -f $RX_OUT/bloxsense && -f $RX_OUT/build.provenance ]] || \
+	skip_or_fail "build outdirs not found or incomplete ($VERUS_OUT / $RX_OUT)"
 
 # Hermetic check: prove these outdirs actually match $ROOT (the tree under test) BEFORE using them as the
 # "known good" baseline for every tamper case below. The cheapest, always-in-sync way to prove this is to
@@ -141,9 +155,11 @@ trap '[[ -n $SYNTH_DIR ]] && rm -rf "$SYNTH_DIR"' EXIT
 HERMCHECK_DIR=$(mktemp -d)
 if ! HERMCHECK_OUT=$(bash "$ROOT/build/package.sh" "$VERUS_OUT" "$RX_OUT" "$HERMCHECK_DIR" 2>&1); then
 	rm -rf "$HERMCHECK_DIR"
-	echo "SKIP: $VERUS_OUT / $RX_OUT do not match the tree under test ($ROOT) - build/package.sh refused:"
-	echo "$HERMCHECK_OUT"
-	exit 0
+	# PR #2 follow-up review round 2 (Codex): this used to print SKIP and exit 0 unconditionally here - under
+	# BLOX_CI, a genuinely broken synthetic-outdir generation (this exact hermetic check existing to catch)
+	# would then silently SKIP the entire suite instead of failing it. skip_or_fail now decides.
+	skip_or_fail "$VERUS_OUT / $RX_OUT do not match the tree under test ($ROOT) - build/package.sh refused:
+$HERMCHECK_OUT"
 fi
 rm -rf "$HERMCHECK_DIR"
 
