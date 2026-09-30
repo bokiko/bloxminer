@@ -585,6 +585,7 @@ bloxsense_says "$(fake_topo_json 4)"   # restore a fast bloxsense for anything a
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 reset_proc   # no fake API for this one at all (BLOX_API_PORT below points at nothing listening) - only now_us()
 	# itself is under test here, and a connection-refused Phase A curl fails fast, well within budget
+# shellcheck disable=SC2016  # single quotes on purpose: expanded by the inner bash, not here
 now_us_fallback=$(BLOX_API_PORT=19999 timeout 5 bash -c '
 	unset EPOCHREALTIME
 	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1

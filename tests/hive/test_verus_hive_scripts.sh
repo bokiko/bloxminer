@@ -199,6 +199,7 @@ fi
 #      to real microseconds) - the pre-fix concatenation would be off by roughly 1000x, nowhere near this
 #      tolerance. See the RandomX engine's own test suite for the identical assertion on its copy of now_us().
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+# shellcheck disable=SC2016  # single quotes on purpose: expanded by the inner bash, not here
 now_us_fallback=$(BLOX_API_PORT=19999 timeout 5 bash -c '
 	unset EPOCHREALTIME
 	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1

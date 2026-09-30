@@ -1023,6 +1023,7 @@ if [[ $lineE == "E khs=[0] stats=[]" ]]; then ok "one shell, step E (-> verus ag
 # pre-fix concatenation would be off by roughly 1000x, nowhere near this tolerance. See both engines' own test
 # suites for the identical assertion on their own now_us().
 setup_pkg
+# shellcheck disable=SC2016  # single quotes on purpose: expanded by the inner bash, not here
 deadline_us_fallback=$(timeout 5 bash -c '
 	unset EPOCHREALTIME
 	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1
