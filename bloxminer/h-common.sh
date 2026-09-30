@@ -359,7 +359,7 @@ log_hugepages_note() {
 # says. The only real question a pre-existing record raises is what "prior" - the TRUE pre-rx baseline this
 # whole mechanism exists to protect - should be for THIS new session.
 #
-# PR #2 follow-up review (Codex), three rounds:
+# PR #2 follow-up review (Codex), four rounds:
 #
 # (round 1) An existing record that is still final=0 used to be left COMPLETELY untouched (a "still starting,
 # never touch it" guard) - wrong: if the API never became reachable within HUGEPAGES_STARTUP_WINDOW_S (5 min)
@@ -398,6 +398,17 @@ log_hugepages_note() {
 # recorded the settled value) - only rebase, for either state, when boot differs or current is LOWER than
 # what this package itself is known to have reserved.
 #
+# (round 4) Round 3's `current >= prelim` relaxation for a final=0 record is only actually consistent with the
+# policy that justifies it while the OLD record's own session is STILL inside its own exclusive-ownership
+# startup window - finalize_rx_hugepages itself would already have marked an EXPIRED one "conflict" on its
+# very next poll, had one ever happened (see HUGEPAGES_STARTUP_WINDOW_S above). Once expired, nothing this
+# package still controls can explain a further raise: an operator could just as easily have raised
+# vm.nr_hugepages in the meantime, and the relaxed `>=` would wrongly vouch for THAT as if it were XMRig's own
+# startup, letting a later Verus restore land on a value from before the operator's own change. Fixed: the
+# relaxation only applies when same boot AND `now_uptime - start_uptime <= HUGEPAGES_STARTUP_WINDOW_S` (the
+# record's own session is still, provably, within the window it was ever granted); an expired final=0 record
+# falls back to exact equality (current == prelim) - the same standard a settled final=1 record already uses.
+#
 # Either way: after "prior" is settled, this runs Hive's `hugepages -rx` if present (see the top comment for
 # why), then reads vm.nr_hugepages ("prelim") and HugePages_Free ("free0") again, plus the current boot_id and
 # (Round 5c) /proc/uptime ("start_uptime" - the exclusive-ownership window's own clock, see the top-of-section
@@ -422,7 +433,9 @@ note_rx_hugepages_start() {
 				local rec_ours; rec_ours=$(_hp_field ours)
 				[[ $rec_ours =~ ^[0-9]+$ && $cur == "$rec_ours" ]] && owned=1
 			elif [[ $rec_final == 0 ]]; then
-				local rec_prelim; rec_prelim=$(_hp_field prelim)
+				local rec_prelim rec_start_uptime now_uptime in_window=0
+				rec_prelim=$(_hp_field prelim); rec_start_uptime=$(_hp_field start_uptime)
+				now_uptime=$(_hp_uptime_seconds)
 				# Round 5g (Codex): a plain equality check here was too strict. XMRig's OWN huge-page
 				# allocation, on top of whatever `hugepages -rx` already reserved, only ever RAISES
 				# vm.nr_hugepages further during its own normal startup - never lowers it - and that startup
@@ -433,7 +446,28 @@ note_rx_hugepages_start() {
 				# accepted as owned, consistent with the policy the window already grants. Only `current <
 				# prelim` (something took pages away since - an operator, a different reservation, anything
 				# that could not have come from XMRig's own startup raising the count) fails to vouch for it.
-				[[ $rec_prelim =~ ^[0-9]+$ ]] && (( cur >= rec_prelim )) && owned=1
+				#
+				# Round 6 (Codex): that relaxation is only actually consistent with the policy while the OLD
+				# record's own session is STILL inside its startup window - finalize_rx_hugepages itself would
+				# already have marked an expired one "conflict" on its very next poll, had one happened (see
+				# the window check above). Once expired, nothing this package still controls can explain a
+				# further raise: an operator could just as easily have raised vm.nr_hugepages in the meantime,
+				# and the relaxed `>=` would wrongly vouch for THAT as if it were XMRig's own startup, letting
+				# Verus later restore a value from before the operator's own change. So the relaxation applies
+				# only when same boot AND `now_uptime - start_uptime <= HUGEPAGES_STARTUP_WINDOW_S`; an expired
+				# final=0 record falls back to exact equality (current == prelim), same standard as a settled
+				# final=1 record.
+				if [[ $rec_start_uptime =~ ^[0-9]+$ && $now_uptime =~ ^[0-9]+$ ]] \
+					&& (( now_uptime - rec_start_uptime <= HUGEPAGES_STARTUP_WINDOW_S )); then
+					in_window=1
+				fi
+				if [[ $rec_prelim =~ ^[0-9]+$ ]]; then
+					if (( in_window )); then
+						(( cur >= rec_prelim )) && owned=1
+					else
+						[[ $cur == "$rec_prelim" ]] && owned=1
+					fi
+				fi
 			fi   # "conflict", or anything else unrecognised (corrupt/legacy, no final= at all): never provably
 			     # owned - always rebase below, nothing here is trustworthy enough to check against
 		fi

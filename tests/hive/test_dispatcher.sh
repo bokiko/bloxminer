@@ -410,7 +410,7 @@ if ! sysctl_called; then ok "verus with no record -> no sysctl call"; else bad "
 #      instance's own rollback would refuse (only ever touches final=0), and a later Verus start's own
 #      current==ours check would fail forever - ~2.4 GiB pinned exactly like the original bug. Fixed:
 #      note_rx_hugepages_start now REOPENS a final=1 (or corrupt/legacy) record for a fresh note - keeping the
-#      ORIGINAL "prior" (when still provably ours - see 6f/6g/6h below for the round-2/round-3 follow-up on that) but
+#      ORIGINAL "prior" (when still provably ours - see 6f/6g/6h/6i below for the round-2/3/4 follow-up on that) but
 #      refreshing prelim/free0/boot/start_uptime and resetting final=0. A still-starting final=0 record is
 #      ALSO refreshed the same way now (the "rx restarted" case tested above) - the only case left completely
 #      untouched is no longer "any existing record", it is "none of the above apply" (nothing to refresh at all).
@@ -540,6 +540,53 @@ else
 	bad "restart-after-raise then verus: restores to the TRUE original prior (0)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
 fi
 if [[ ! -e $HUGEFILE ]]; then ok "restart-after-raise then verus: ownership record removed (restore verified successful)"; else bad "restart-after-raise then verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# ---- 6i. PR #2 follow-up review round 4 (Codex): "Rebase expired unfinished reservations before restarts" -
+#      6h's own `current >= prelim` relaxation for a final=0 record is only actually consistent with the policy
+#      that justifies it while the OLD record's own session is STILL inside its exclusive-ownership startup
+#      window - finalize_rx_hugepages itself would already have marked an EXPIRED one "conflict" on its very
+#      next poll, had one happened. Once expired, an operator's own raise is just as plausible as XMRig's own
+#      startup, and the relaxed `>=` would wrongly vouch for it, letting a later Verus restore land on a value
+#      from BEFORE the operator's own change. Simulates exactly that: a final=0 record (prelim=1200) already
+#      PAST the startup window (start_uptime=100 vs the fixture's own static now=1000 - 900s old, past the
+#      300s window - same staleness technique as 6f), whose live value has since moved to 1300 - HIGHER than
+#      prelim, so the OLD (buggy) `>=` check would have wrongly kept vouching for it, but this is no longer
+#      XMRig's own in-window startup raise, it is an operator's own change - a restart must REBASE prior to
+#      the operator's own current value (1300), never preserve the stale original (0), and a later Verus start
+#      must restore to the OPERATOR's value, never the stale one.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 0 > "$PROCFILE"; restore_stub_xmrig
+printf 'prior=0\nprelim=1200\nfree0=100\nboot=boot-TEST-CONSTANT\nstart_uptime=100\nfinal=0\n' > "$HUGEFILE"   # an unfinished final=0 record from long ago, already past the 300s window (fixture's static now=1000)
+echo 1300 > "$PROCFILE"   # an OPERATOR (not XMRig) raises nr_hugepages while the (expired) session sat unfinished
+HUGEPAGES_TARGET=1301; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # rx "restarts", reopening the expired record
+rec_expired_rebase=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_expired_rebase") == 1300 ]]; then
+	ok "expired final=0 + operator raise (1200 -> 1300) then rx restart: prior REBASED to the operator's own value (1300), never the stale original (0)"
+else
+	bad "expired final=0 + operator raise then rx restart: prior rebased to the operator's own value" "$rec_expired_rebase"
+fi
+finalize_record_for_test   # the restarted instance finalizes with its OWN live value (whatever PROCFILE now is)
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run   # verus start
+if grep -q "nr_hugepages=1300" "$SYSCTL_LOG" 2>/dev/null; then
+	ok "expired final=0 + operator raise then rx restart then verus: restores to the OPERATOR's own value (1300), never the stale original (0)"
+else
+	bad "expired final=0 + operator raise then rx restart then verus: restores to the operator's own value (1300)" "$(cat "$SYSCTL_LOG" 2>/dev/null)"
+fi
+if [[ ! -e $HUGEFILE ]]; then ok "expired final=0 + operator raise then rx restart then verus: ownership record removed (restore verified successful)"; else bad "expired final=0 + operator raise then rx restart then verus: ownership record removed" "still present: $(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# ---- 6j. Regression guard: an IN-WINDOW restart-after-raise (6h's own scenario) must still preserve the true
+#      original prior - Round 4's window check must not accidentally tighten the in-window case back to exact
+#      equality. Identical to 6h, just re-run here immediately after 6i to prove the two code paths (in-window
+#      vs expired) are independently correct, not one accidentally overwriting the other's behaviour.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 0 > "$PROCFILE"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=0, prelim=1200, start_uptime=1000 (fixture's static now), not yet finalized
+echo 1201 > "$PROCFILE"   # XMRig's own startup raises nr_hugepages further, still same boot, still inside the window (elapsed 0s)
+HUGEPAGES_TARGET=1202; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run   # restart lands here, still in-window: current(1201) >= prelim(1200) -> still provably owned
+rec_inwindow=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_inwindow") == 0 ]]; then
+	ok "regression guard: IN-WINDOW restart-after-raise still preserves the TRUE original prior (0), Round 4's window check did not break 6h"
+else
+	bad "regression guard: in-window restart-after-raise still preserves prior (0)" "$rec_inwindow"
+fi
 
 # ---- rx from a 0 baseline, finalized -> verus restores to 0 (not just non-zero values are handled correctly)
 echo 0 > "$PROCFILE"; rm -f "$HUGEFILE"

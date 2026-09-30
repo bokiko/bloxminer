@@ -492,7 +492,9 @@ edit, a watchdog restart, the API briefly unreachable) is expected and stays ful
 recognizes the reservation as its own (nothing else touched `vm.nr_hugepages` in the meantime, same boot) and
 keeps tracking the original pre-RandomX baseline for the eventual restore, even as XMRig's own value climbs
 further during its own startup. Only something that lowers `vm.nr_hugepages` below what BloxMiner itself
-reserved, or a reboot, breaks that continuity — and falls under "unsupported" above.
+reserved, a reboot, or the startup window itself having already lapsed before the restart happens, breaks that
+continuity — each falls under "unsupported"/"no restore" above, and BloxMiner rebases to whatever is on the box
+at that point rather than trusting a value from before an expired window's own guarantee ran out.
 
 **Restore conditions, on switching to the Verus engine.** The reservation is only ever restored automatically
 when **both** are true: the RandomX engine's reservation was finalized (confirmed, as above) in the *same
