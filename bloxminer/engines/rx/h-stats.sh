@@ -496,7 +496,13 @@ run() {
 		d = b - a; if (d < 0) d = -d
 		exit !(d <= 0.10 * a)
 	}' && consistent=1
-	dbg "phase B: complete=$complete phaseb_total=$phaseb_total khs_fresh(phaseA)=$khs_fresh consistent=$consistent -> $([[ $complete == true && $consistent == 1 ]] && echo 'REPLACING with phase B' || echo 'Phase A khs stands')"
+	# Codex (review of ec164c8): a `dbg "... $(...)"` argument is built by bash BEFORE dbg() is ever called,
+	# so its own internal `[[ -n $BLOX_HSTATS_DEBUG_LOG ]]` short-circuit does not stop that fork on every
+	# production poll - only guarding the CALL, argument construction included, behind the same check does.
+	# Every dbg() call in both engines was audited for a forking argument; this and the two others found
+	# (below, and the parent wrapper's own "poll loop exited") are the only three - the rest interpolate only
+	# plain variables/parameter expansions (${x:0:200}, $?, ${#x}), which are forkless already.
+	[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "phase B: complete=$complete phaseb_total=$phaseb_total khs_fresh(phaseA)=$khs_fresh consistent=$consistent -> $([[ $complete == true && $consistent == 1 ]] && echo 'REPLACING with phase B' || echo 'Phase A khs stands')"
 	if [[ $complete == true && $consistent == 1 ]]; then
 		# Phase B's total AND its own stats replace Phase A's - never a mixed payload (Phase A's number with
 		# Phase B's rows, or vice versa): either Phase B is trusted whole, or Phase A's whole result stands.
@@ -528,7 +534,7 @@ run() {
 		[[ -n ${BLOX_HSTATS_TEST_FORCE_STATS_FAIL:-} ]] && power_raw='BROKEN'   # tests only: not valid JSON,
 			# so the --argjson below fails fatally - simulates the transient jq/fork failure this whole
 			# validate-before-write guard exists for, without weakening anything it guards against
-		dbg "phase B: composing final stats - hs_src=$(jq -c '[.[].khs]' <<< "$rows" 2>&1) temp_src=$(jq -c '[.[].temp]' <<< "$rows" 2>&1) acc=$acc rej=$rej uptime=$uptime ver=$VER algo=$algo power_raw=$power_raw"
+		[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "phase B: composing final stats - hs_src=$(jq -c '[.[].khs]' <<< "$rows" 2>&1) temp_src=$(jq -c '[.[].temp]' <<< "$rows" 2>&1) acc=$acc rej=$rej uptime=$uptime ver=$VER algo=$algo power_raw=$power_raw"
 		if new_stats=$(jq -nc --argjson hs "$(jq -c '[.[].khs]' <<< "$rows")" --argjson temp "$(jq -c '[.[].temp]' <<< "$rows")" \
 				--argjson ar "$(jq -nc --argjson a "$acc" --argjson r "$rej" '[$a, $r]')" --argjson uptime "$uptime" \
 				--arg ver "$VER" --arg algo "$algo" --argjson power "$power_raw" \
@@ -637,7 +643,8 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		remaining_us; have_budget_us "$REPLY" || break
 		sleep 0.05
 	done
-	remaining_us; dbg "parent: poll loop exited, remaining_us=$REPLY still_running=$(still_running && echo yes || echo no)"
+	remaining_us
+	[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "parent: poll loop exited, remaining_us=$REPLY still_running=$(still_running && echo yes || echo no)"
 	# Checked by whether ANYTHING remains (in the validated group, or else just $CPID), not just whether
 	# $CPID itself is still alive: $CPID is a plain bash process that dies immediately from a TERM, even when
 	# a SIGTERM-ignoring descendant of its (e.g. a stuck bloxsense) does not - checking only $CPID would look

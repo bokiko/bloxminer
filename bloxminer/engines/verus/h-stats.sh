@@ -58,7 +58,17 @@ VPORT=${BLOX_API_PORT:-4068}   # a distinct name from the rx engine's own top-le
 	# "one shell" cases), and a name collision would leak one engine's last value into the other's.
 export VPORT CUSTOM_VERSION CUSTOM_CONFIG_FILENAME ENGINE_VERSION
 
+# dbg <msg> - see the RandomX engine's own h-stats.sh for the full rationale (identical pattern, added here
+# too once this engine's own write_result() gained a failure path worth being able to see): appends a
+# timestamped line to $BLOX_HSTATS_DEBUG_LOG iff that variable is set (never on a real Hive rig), a single
+# [[ ]] test - no fork at all - when unset. Every call site guards its OWN argument construction the same way
+# whenever that argument would otherwise fork (e.g. a command substitution) - dbg()'s internal check alone
+# only stops the write, not a fork bash already performed while building the string to pass it.
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s verus[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
+export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
+
 LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-verus-hstats-lib.XXXXXX") || {
+	dbg "LIB mktemp FAILED - emergency fallback"
 	khs=0; stats=""
 	return 0 2>/dev/null || exit 0
 }
@@ -67,6 +77,8 @@ cat > "$LIB" <<'LIBEOF'
 # RandomX engine's own h-stats.sh for the full rationale (same real-Hive evidence, same fix, applied here too
 # for consistency and extra margin even though this engine's own field()-fork removal already measured well
 # within budget on a real saturated rig).
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s verus[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }   # see the parent's own copy of this function for the full rationale
+
 now_us() {   # sets $REPLY = now, integer microseconds since epoch
 	local t=${EPOCHREALTIME:-}
 	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
@@ -112,9 +124,29 @@ field() {
 # write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
 # after Phase A (the mandatory, always-fresh single-row answer) and again after Phase B if it improves on it -
 # never the other way around, and never with anything but data this exact poll just collected.
+# Codex (review of ec164c8): this used to be `printf '%s' "$(jq -nc ...)" > "$tmp" && mv -f "$tmp" "$OUTFILE"` -
+# if the jq command substitution failed (the same transient jq/fork-under-resource-pressure class already
+# found and fixed in this exact function on the RandomX engine's own h-stats.sh), `$(...)` comes back empty,
+# `printf '%s' ""` still successfully writes a ZERO-BYTE file (a trivially successful redirect, not a failure
+# the `&&` could ever catch), and `mv -f` then unconditionally replaces $OUTFILE - an earlier phase's own
+# already-good result - with that empty file. The parent's own read-back would then have no choice but to
+# report the safe-but-wrong fallback 0. jq's own output is now captured into a plain variable FIRST and
+# checked (jq's own exit status, non-empty, looks like a JSON object) - only a call that passes all three
+# ever reaches the write; anything else leaves $OUTFILE exactly as an earlier phase left it, logged via dbg().
 write_result() {
-	local tmp="$OUTFILE.w.$$"
-	{ printf '%s' "$(jq -nc --arg k "$1" --arg s "$2" '{khs: $k, stats: $s}')" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
+	local tmp="$OUTFILE.w.$$" out rc
+	if [[ -n ${BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL:-} ]]; then
+		out=""; rc=1   # tests only: deterministically simulates jq itself failing (a fork/exec failure, or
+			# jq genuinely unavailable) inside THIS function specifically, independent of whether a caller's
+			# own upstream composition succeeded - exercises this guard directly, on every host the same way
+	else
+		out=$(jq -nc --arg k "$1" --arg s "$2" '{khs: $k, stats: $s}' 2>&1); rc=$?
+	fi
+	if (( rc != 0 )) || [[ -z $out ]] || [[ $out != "{"*"}" ]]; then
+		dbg "write_result: REFUSED - jq failed or produced empty/non-object output (rc=$rc, was: '$out') - \$OUTFILE left as-is"
+		return 1
+	fi
+	{ printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
 
 # Sets $khs/$stats and writes $OUTFILE at least once (Phase A) - identical field/API logic to BloxMiner
@@ -295,7 +327,9 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
 		run
-	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>&1 &
+	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
+	# stderr from everything inside run() goes to $BLOX_HSTATS_DEBUG_LOG when debugging, /dev/null otherwise -
+	# see the RandomX engine's own h-stats.sh for the full rationale (identical pattern).
 	CPID=$!
 
 	validated_pgid() {   # see the RandomX engine's own h-stats.sh for the full rationale (identical pattern)

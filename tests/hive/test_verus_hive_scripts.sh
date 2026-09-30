@@ -165,6 +165,29 @@ else
 	bad "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing" "$res"
 fi
 
+# ---- write_result's OWN guard (Codex, review of ec164c8): this used to be
+# `printf '%s' "$(jq -nc ...)" > "$tmp" && mv -f "$tmp" "$OUTFILE"` - if jq's OWN command substitution failed
+# (a fork/exec failure, independent of whatever the CALLER's own upstream composition did), `$(...)` comes
+# back empty, `printf '%s' ""` still writes a trivially-successful zero-byte file, and `mv -f` then
+# unconditionally replaced $OUTFILE - an already-good prior result - with that empty file. Tests THIS
+# function directly (not through run()'s own upstream validation, which is a separate, shallower guard) via
+# BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL, deterministically the same way on every host: a real positive
+# result is written first, then a forced-failing write_result call must leave that exact result standing.
+D_DEBUG="$T/write_result_debug.log"; : > "$D_DEBUG"
+res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG" bash -c '. "$BLOX_DIR/h-stats.sh"
+	write_result "11900.00" "a prior positive result"
+	before=$(cat "$OUTFILE" 2>/dev/null)
+	BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL=1 write_result "0" "should never reach OUTFILE"
+	after=$(cat "$OUTFILE" 2>/dev/null)
+	jq -nc --arg b "$before" --arg a "$after" "{before: \$b, after: \$a}"' 2>&1)
+if [[ $(jq -r '.before == .after and (.after | contains("a prior positive result"))' <<< "$res" 2>/dev/null) == true ]] \
+	&& grep -q "write_result: REFUSED" "$D_DEBUG"
+then
+	ok "write_result's own guard: a forced jq failure never overwrites an already-good prior result"
+else
+	bad "write_result's own guard: a forced jq failure never overwrites an already-good prior result" "res=$res debug=$(cat "$D_DEBUG" 2>/dev/null)"
+fi
+
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
 # leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
 for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
