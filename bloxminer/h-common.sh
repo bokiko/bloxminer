@@ -47,7 +47,14 @@ select_engine() {
 # decide how to fail closed otherwise. Never guesses/defaults to either engine.
 engine_from_config() {
 	command -v jq > /dev/null 2>&1 || return 1
-	[[ -n ${CUSTOM_CONFIG_FILENAME:-} && -r $CUSTOM_CONFIG_FILENAME ]] || return 1
+	# PR #2 follow-up review round 2 (Codex): `-s` (exists AND non-empty), not just `-r` (readable) - a
+	# zero-byte config.json used to reach the two jq -e checks below with an EMPTY file. jq 1.6 (GitHub
+	# Actions' own ubuntu-22.04 runners; see engines/rx/h-stats.sh's valid_summary()/valid_backends() for the
+	# full writeup) exits 0 ("successful") for `-e` against empty input - both checks would incorrectly report
+	# "found" on an empty file, setting BOTH has_rx and has_verus, which this function's own "both present ->
+	# ambiguous, reject" rule then happens to catch anyway (an accidental save, not a deliberate one - fixed
+	# properly here rather than relying on that coincidence surviving any future refactor of this function).
+	[[ -n ${CUSTOM_CONFIG_FILENAME:-} && -r $CUSTOM_CONFIG_FILENAME && -s $CUSTOM_CONFIG_FILENAME ]] || return 1
 	local has_rx=0 has_verus=0
 	jq -e 'has("randomx") and (.randomx | type == "object")' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1 && has_rx=1
 	jq -e '.algo == "verus"' "$CUSTOM_CONFIG_FILENAME" > /dev/null 2>&1 && has_verus=1
@@ -559,7 +566,12 @@ finalize_rx_hugepages() {
 
 	local sum
 	sum=$(curl -fsS --max-time 0.5 "http://127.0.0.1:$api_port/2/summary" 2>/dev/null)
-	jq -e 'type == "object"' > /dev/null 2>&1 <<< "$sum" || return 0
+	# PR #2 follow-up review round 2 (Codex): `[[ -n $sum ]] &&` first - same rationale as engine_from_config()
+	# above and engines/rx/h-stats.sh's valid_summary()/valid_backends() (jq 1.6's `-e` exits 0 on EMPTY input).
+	# An empty $sum (API not ready yet, or the 0.5 s curl timeout hit) used to pass this check on jq 1.6 instead
+	# of retrying next poll - the hp_allocated/hp_total regex checks just below happened to still catch it
+	# safely (jq on empty input produces empty output either way, without -e), but only by accident.
+	{ [[ -n $sum ]] && jq -e 'type == "object"' > /dev/null 2>&1 <<< "$sum"; } || return 0
 
 	# ---- readiness ONLY (Round 5b: no longer the source of the "need" value used below - see
 	# _hp_xmrig_need_pages's comment for why the API's own total undercounts by the RandomX JIT buffer).

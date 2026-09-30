@@ -217,6 +217,18 @@ if [[ -z $(cfgengine) ]]; then ok "missing config.json -> engine_from_config fai
 run_h_run_fail_closed "missing config.json"
 run_h_stats_fail_closed "missing config.json"
 
+# ---- PR #2 follow-up review round 2 (Codex): "audit every jq -e for the empty-input divergence" - a config.json
+# that EXISTS and is readable but is genuinely EMPTY (zero bytes - a real state, e.g. an interrupted write
+# racing a reader, or a tmp file renamed into place before ever being written to) used to reach
+# engine_from_config's own two jq -e checks with empty input. jq 1.6 (GitHub Actions' own ubuntu-22.04 runners
+# - see engines/rx/h-stats.sh's valid_summary()/valid_backends() for the full rationale) exits 0 on that,
+# setting BOTH has_rx and has_verus, which this function's own "both present -> ambiguous, reject" rule
+# happened to still catch (an accidental save - the explicit `-s` file-size check below closes it properly).
+: > "$CONF"
+if [[ -z $(cfgengine) ]]; then ok "empty (zero-byte) config.json -> engine_from_config fails closed (no output)"; else bad "empty (zero-byte) config.json -> engine_from_config fails closed (no output)" "$(cfgengine)"; fi
+run_h_run_fail_closed "empty (zero-byte) config.json"
+run_h_stats_fail_closed "empty (zero-byte) config.json"
+
 printf 'this is not json at all {{{' > "$CONF"
 if [[ -z $(cfgengine) ]]; then ok "garbage (invalid JSON) config.json -> fails closed"; else bad "garbage (invalid JSON) config.json -> fails closed" "$(cfgengine)"; fi
 run_h_run_fail_closed "garbage config.json"

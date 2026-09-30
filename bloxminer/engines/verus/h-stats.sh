@@ -159,6 +159,53 @@ write_result() {
 	{ printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
 
+# phase_a_stats_gate <candidate-stats-json> - sets $REPLY to a stats value safe to hand to write_result: the
+# candidate itself if it passes every check, otherwise an honest minimal object built from $khs/$acc/$rej/$up
+# (already-known scalars every caller of this function has validated before calling it). A single,
+# unconditional gate every Phase-A-class composition in this file (Phase A's own, and the pstall-in-Phase-B
+# branch, which shares the identical 4-nested-jq-into-one-outer-jq shape) passes through before ever reaching
+# write_result - "whatever happened upstream, what write_result gets is always a validated non-empty JSON
+# object or the minimal literal". This file's own write_result() cannot enforce that centrally the way the
+# RandomX engine's write_result() does (see this file's own write_result() header): an intentionally empty ""
+# is ALSO this file's legitimate "no stats" sentinel for the no-API-answer case (run()'s very first line), so
+# emptiness alone can never be centrally rejected there without breaking that - the distinction can only be
+# made HERE, at each Phase-A-class call site, which knows whether it is composing real stats or deliberately
+# signalling "none".
+#
+# PR #2 follow-up review round 2 (Codex): the first version of this gate used `jq -e '<filter>' <<< "$candidate"`
+# ALONE to detect an empty/invalid candidate - and that PASSED on ai02 (jq 1.7) but FAILED on GitHub Actions'
+# own ubuntu-22.04 runners (jq 1.6, the Ubuntu 22.04 apt package - confirmed in a real `ubuntu:22.04` Docker
+# container), reproducing the exact original bug (a positive khs with null/empty stats) in CI while ai02 showed
+# green. Root cause, confirmed empirically side by side: `jq -e '<any filter>' <<< ""` (EMPTY input - zero JSON
+# values to evaluate at all, nothing for -e to call false/null) exits 0 on jq 1.6 (vacuously "successful") but
+# exits 4 on jq 1.7+ - a real, version-dependent difference in how "-e with zero outputs" is treated, not
+# something either script can control. A non-empty but MALFORMED candidate does NOT have this problem (both
+# versions reliably fail -e on it: exit 4 vs 5 for identical malformed-but-brace-shaped input) - it is
+# specifically the EMPTY case this gate exists to catch that jq's own exit code cannot be trusted for. Fixed:
+# emptiness/shape is checked with a plain BASH pattern match FIRST (deterministic on every jq version, or even
+# with no jq installed at all) - jq -e is only ever reached once the candidate is already proven non-empty and
+# object-shaped, where both versions agree.
+phase_a_stats_gate() {
+	local candidate=$1
+	if [[ -n $candidate && $candidate == "{"*"}" ]] \
+		&& jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$candidate"
+	then
+		REPLY=$candidate
+		return 0
+	fi
+	dbg "phase_a_stats_gate: composition invalid/empty (was: '$candidate') - writing the honest minimal object instead, khs=$khs stands"
+	REPLY=$(jq -nc --argjson k "$khs" --argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" \
+		'{hs: [$k], hs_units: "khs", temp: [null], fan: [0], bus_numbers: [null], uptime: $uptime, ar: [$acc, $rej], algo: "verushash"}' 2>/dev/null)
+	if [[ -z $REPLY || $REPLY != "{"*"}" ]]; then
+		# even the minimal composition's own jq call failed (jq itself broken/missing, or still under the same
+		# resource pressure) - printf, no fork: $khs/$acc/$rej/$up are all already validated numeric (num()/
+		# int() above, or produced by this function itself), safe to interpolate raw; no string field (ver) is
+		# included here at all, avoiding any escaping risk from an untrusted string.
+		printf -v REPLY '{"hs":[%s],"hs_units":"khs","temp":[null],"fan":[0],"bus_numbers":[null],"uptime":%s,"ar":[%s,%s],"algo":"verushash"}' "$khs" "${up%.*}" "$acc" "$rej"
+	fi
+}
+
 # Sets $khs/$stats and writes $OUTFILE at least once (Phase A) - identical field/API logic to BloxMiner
 # 2.1.0/3.0.0's original design, split into a mandatory fresh-rate phase and an optional enrichment phase.
 run() {
@@ -195,15 +242,17 @@ run() {
 	# hs/temp/fan/bus) into ONE outer jq call, same shape as Phase B's own final composition below - and, same
 	# as that one, any single nested call failing (a transient fork/exec failure under resource pressure - see
 	# rx/h-stats.sh's and Phase B's own history of this exact class of bug) leaves $stats empty while $khs
-	# already holds a real, positive number. Unlike Phase B's own final composition, this used to be written
-	# UNCONDITIONALLY - write_result would wrap an empty $stats as a literal empty JSON string (`"stats":""`,
-	# not the empty/malformed shape write_result's own guard below can catch, since --arg always succeeds
-	# regardless of content) and the parent would report a positive khs with NO stats at all. Validated here,
-	# the same way Phase B's own final composition already is (see that one's own comment for the shared
-	# rationale), before ever reaching write_result. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL deterministically
-	# simulates a nested jq failure for tests, the same way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL already
-	# does for write_result() itself - forcing the exact downstream symptom directly is more reliable than
-	# trying to reproduce the actual fork-pressure root cause on demand.
+	# already holds a real, positive number. This used to be written UNCONDITIONALLY - write_result would wrap
+	# an empty $stats as a literal empty JSON string (`"stats":""`, not the empty/malformed shape write_result's
+	# own guard below can catch, since --arg always succeeds regardless of content) and the parent would report
+	# a positive khs with NO stats at all. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL deterministically simulates
+	# a nested jq failure for tests, the same way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL already does for
+	# write_result() itself - forcing the exact downstream symptom directly is more reliable than trying to
+	# reproduce the actual fork-pressure root cause on demand. Validated by phase_a_stats_gate() below, a single
+	# unconditional gate every Phase-A-class composition in this file passes through before ever reaching
+	# write_result - see that function's own header for why it no longer trusts jq -e ALONE to detect an empty
+	# candidate (a real, CI-only bug this exact test caught: GitHub Actions' own ubuntu-22.04 runners install
+	# jq 1.6, which behaves differently from jq 1.7+ for this exact check on empty input - see below).
 	if [[ -n ${BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL:-} ]]; then
 		stats=""
 	else
@@ -217,23 +266,7 @@ run() {
 			  algo: "verushash", ver: $ver}
 			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
 	fi
-	if ! jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
-			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$stats"; then
-		dbg "phase A: stats composition invalid/empty (was: '$stats') - writing the honest minimal object instead, khs=$khs stands"
-		# The honest minimal object: $khs (already a validated plain number, see num() above) and the other
-		# already-known scalars, in the SAME minimal shape DISPATCH_FALLBACK_STATS (bloxminer/h-stats.sh) uses
-		# for its own last-resort fallback - never silently dropping to an empty/missing stats while a real,
-		# positive khs is reported right next to it.
-		stats=$(jq -nc --argjson k "$khs" --argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" \
-			'{hs: [$k], hs_units: "khs", temp: [null], fan: [0], bus_numbers: [null], uptime: $uptime, ar: [$acc, $rej], algo: "verushash"}' 2>/dev/null)
-		if [[ $stats != "{"*"}" ]]; then
-			# even the minimal composition's own jq call failed (jq itself broken/missing, or still under the
-			# same resource pressure) - printf, no fork: $khs/$acc/$rej/$up are all already validated numeric
-			# (num()/int() above, or produced by this function itself), safe to interpolate raw; no string
-			# field (ver) is included here at all, avoiding any escaping risk from an untrusted string.
-			printf -v stats '{"hs":[%s],"hs_units":"khs","temp":[null],"fan":[0],"bus_numbers":[null],"uptime":%s,"ar":[%s,%s],"algo":"verushash"}' "$khs" "${up%.*}" "$acc" "$rej"
-		fi
-	fi
+	phase_a_stats_gate "$stats"; stats=$REPLY
 	write_result "$khs" "$stats"
 	(( stall == 1 )) && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
 	local khs_a=$khs   # Phase A's own total, kept aside - Phase B may add detail rows but may only ever
@@ -256,6 +289,9 @@ run() {
 		# pre-redesign semantics). It must OVERWRITE Phase A's FRESHKHS-based answer with an honest 0, never
 		# silently leave a positive number standing just because Phase A ran first.
 		khs=0; hs=(0); temps=("${ptemp:-null}")
+		# Same 4-nested-jq-into-one-outer-jq shape as Phase A's own composition above, same risk - routed
+		# through the same phase_a_stats_gate() (see its own header for the full rationale, including why a
+		# plain jq -e re-check alone is not enough on GitHub Actions' own jq 1.6 runners).
 		stats=$(jq -nc --argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
 			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
 			--argjson fan "$(jq -nc '[0]')" --argjson bus "$(jq -nc '[null]')" \
@@ -263,6 +299,7 @@ run() {
 			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
 			  algo: "verushash", ver: $ver}
 			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+		phase_a_stats_gate "$stats"; stats=$REPLY
 		write_result "$khs" "$stats"
 		return 0
 	fi

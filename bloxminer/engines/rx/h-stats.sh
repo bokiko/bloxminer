@@ -275,10 +275,18 @@ write_result() {
 	{ printf '{"khs":"%s","stats":%s}' "$1" "$2" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
 
-# schema validators: a reply that parses as JSON but does not look like XMRig's own shape is not used
-valid_summary() { jq -e 'type == "object" and (.version | type == "string")' > /dev/null 2>&1 <<< "$1"; }
+# schema validators: a reply that parses as JSON but does not look like XMRig's own shape is not used.
+# PR #2 follow-up review round 2 (Codex): `jq -e '<filter>' <<< "$1"` alone is not enough to reject an EMPTY
+# $1 on every jq version - GitHub Actions' own ubuntu-22.04 runners install jq 1.6 (Ubuntu 22.04's apt
+# package), and jq 1.6's `-e` exits 0 (success) for a filter run against EMPTY input (zero JSON values - `-e`
+# has nothing to call false/null against, so it is vacuously "true"); jq 1.7+ instead exits 4 for the identical
+# empty input - a real, confirmed version difference (see engines/verus/h-stats.sh's own phase_a_stats_gate()
+# for the full writeup and how it was found). A non-empty but malformed $1 does not have this problem (both
+# versions reliably fail -e on it). Both validators now check $1 is non-empty with a plain bash test FIRST -
+# deterministic on every jq version - before ever reaching jq -e.
+valid_summary() { [[ -n $1 ]] && jq -e 'type == "object" and (.version | type == "string")' > /dev/null 2>&1 <<< "$1"; }
 valid_backends() {
-	jq -e '
+	[[ -n $1 ]] && jq -e '
 		type == "array" and
 		(map(select(.type == "cpu")) as $c | ($c | length) <= 1 and
 		 ($c | all(.threads == null or (
@@ -383,7 +391,12 @@ run() {
 	cap_us "$REPLY" 500000; us_to_secstr "$REPLY"
 	back=$(curl -fsS --max-time "$REPLY" "http://127.0.0.1:$PORT/2/backends" 2>/dev/null); curl_rc=$?
 	dbg "phase B: curl --max-time $REPLY /2/backends rc=$curl_rc len=${#back} body=${back:0:300}"
-	jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back" || { dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; }
+	# PR #2 follow-up review round 2 (Codex): `[[ -n $back ]] &&` first - see valid_summary()/valid_backends()'s
+	# own header for the full rationale (jq 1.6's `-e` exits 0, "successful", on EMPTY input - an empty $back,
+	# e.g. a curl timeout/connection-refused, used to pass this check on jq 1.6 and reach the per-thread parsing
+	# below instead of the intended SKIP; downstream naff==0 happened to still catch it safely, but only by
+	# accident, and with the wrong diagnostic message).
+	{ [[ -n $back ]] && jq -e . > /dev/null 2>&1 <<< "$back" && valid_backends "$back"; } || { dbg "phase B: SKIPPED - backends reply not valid JSON/shape, Phase A's khs=$khs stands"; note_state shallow; return 0; }
 
 	threads=$(jq -c '[.[] | select(.type == "cpu") | .threads[]?] // []' <<< "$back" 2>/dev/null)
 	[[ -n $threads ]] || threads='[]'
@@ -402,7 +415,13 @@ run() {
 	else
 		note_state shallow; return 0
 	fi
-	jq -e . > /dev/null 2>&1 <<< "$sense" || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
+	# PR #2 follow-up review round 2 (Codex): `[[ -n $sense ]] &&` first - same rationale as the backends check
+	# above (jq 1.6's `-e` exits 0 on EMPTY input). An empty $sense (bloxsense killed before producing any
+	# output, or crashed silently) used to skip this fallback on jq 1.6, leaving $sense empty instead of the
+	# safe default object - pkg_temp/power_raw below have their own redundant bash-regex fallback, but the
+	# --argjson s "$sense" use further down does not: an empty $sense there is a hard --argjson error, not a
+	# graceful "not verified" outcome.
+	{ [[ -n $sense ]] && jq -e . > /dev/null 2>&1 <<< "$sense"; } || sense='{"cpus":[],"pkg_temp":null,"power_w":null,"ccd_reason":""}'
 	pkg_temp=$(jq -c '.pkg_temp' <<< "$sense")
 	# A jq failure (e.g. a transient fork/exec failure under resource pressure - the exact class of bug Codex's
 	# review of a714388 already found once, in the final result-reading step) would otherwise leave $pkg_temp

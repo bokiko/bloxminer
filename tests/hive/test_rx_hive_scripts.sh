@@ -308,6 +308,29 @@ bloxsense_says "$(fake_topo_json 4)"
 stats_case "positive summary + all-missing detail (backends empty) -> Phase A's positive total kept" \
 	20028 "$SUM_POS" "$(jq -nc '[]')" '.khs == "6.00" and .stats.hs == [6]'
 
+# ---- PR #2 follow-up review round 2 (Codex): "audit every jq -e for the empty-input divergence" - the
+# backends check above passes a well-formed EMPTY ARRAY ("[]"), never a genuinely EMPTY reply (a curl failure -
+# API not reachable for /2/backends specifically, even though /2/summary just answered fine moments earlier).
+# fake_xmrig_api.py answers HTTP 500 (empty body) when its own "backends" config value is JSON null - curl -f
+# then produces a truly empty $back, exactly the case valid_backends()'s own `[[ -n $1 ]] &&` guard exists for
+# (jq 1.6's `-e` exits 0 on empty input - see that function's own header for the full rationale). Must still
+# fall back cleanly to Phase A's own positive total, same outcome as the empty-array case above, but via the
+# intended SKIP path this time, not naff==0's own accidental rescue.
+reset_proc; listen 20029 1029 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+bloxsense_says "$(fake_topo_json 4)"
+stats_case "positive summary + backends endpoint unreachable (HTTP 500, truly empty reply) -> Phase A's positive total kept" \
+	20029 "$SUM_POS" "null" '.khs == "6.00" and .stats.hs == [6]'
+
+# ---- same review, the OTHER empty-input site in this file: $sense (bloxsense's own JSON output) genuinely
+# empty (bloxsense killed/crashed before producing anything - not the same as a well-formed-but-uninteresting
+# reply). Real backends this time (BACK_COMPLETE, already defined above) so Phase B gets far enough to reach
+# the sensors step at all.
+printf '#!/bin/sh\n' > "$BLOX_DIR/bloxsense"; chmod +x "$BLOX_DIR/bloxsense"   # produces NO output at all
+reset_proc; listen 20030 1030 "$BLOX_DIR/xmrig"; for c in $(seq 0 3); do task "t$c" "$c"; done
+stats_case "positive summary + bloxsense produces no output at all -> Phase A's positive total kept, no crash" \
+	20030 "$SUM_POS" "$BACK_COMPLETE" '.khs == "6.00"'
+bloxsense_says "$(fake_topo_json 4)"   # restore a normal bloxsense for anything after this point
+
 BACK_NEARZERO=$(python3 - <<'PY'
 import json
 threads = [{"affinity": c, "hashrate": [10.0, None, None]} for c in range(4)]   # complete, real, but tiny

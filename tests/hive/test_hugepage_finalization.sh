@@ -237,6 +237,32 @@ else
 	bad "khs still 0: no finalize, not logged" "final=$(hp_field final) log=$(cat "$LOGFILE" 2>/dev/null)"
 fi
 
+# ================================================================== 5b. PR #2 follow-up review round 2 (Codex):
+#    "audit every jq -e for the empty-input divergence" - finalize_rx_hugepages's own readiness curl
+#    (independent of the rx engine's own summary fetch earlier in the same poll) can return a genuinely EMPTY
+#    body: API not reachable at all this poll. `jq -e 'type == "object"' <<< "$sum" || return 0` used to rely
+#    on jq's own exit code alone to detect that - jq 1.6 (GitHub Actions' own ubuntu-22.04 runners; see
+#    engines/rx/h-stats.sh's valid_summary()/valid_backends() for the full rationale) exits 0 ("successful")
+#    for `-e` against empty input, which would have let this proceed past the guard with $sum empty instead of
+#    retrying next poll - the hp_allocated/hp_total regex checks just below happened to still catch it safely
+#    (jq without -e produces empty output on empty input on EITHER version, no divergence there), but only by
+#    accident. No API running at all this poll (both the engine's own summary fetch AND finalize's own
+#    independent one hit a dead port) - must not crash, must not finalize, must not log, record untouched.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-EE2
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-EE2\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+before=$(cat "$HUGEFILE")
+poll   # no start_api at all - both curls in this poll hit a dead port
+poll_khs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$out")
+after=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $poll_khs == 0 ]]; then ok "API entirely unreachable: h-stats.sh still reports a clean khs=0 (no crash)"; else bad "API entirely unreachable: h-stats.sh reports clean khs=0" "$out"; fi
+if [[ $(hp_field final) == 0 ]] && [[ ! -f $LOGFILE || $(log_count "predicted reservation") == 0 ]]; then
+	ok "API entirely unreachable (finalize's own summary curl empty): no finalize, not logged, retried next poll"
+else
+	bad "API entirely unreachable: no finalize, not logged" "final=$(hp_field final) log=$(cat "$LOGFILE" 2>/dev/null)"
+fi
+if [[ $before == "$after" ]]; then ok "API entirely unreachable: ownership record byte-identical (never touched)"; else bad "API entirely unreachable: record untouched" "before=[$before] after=[$after]"; fi
+
 # ================================================================== 6. foreign change DURING the startup window
 #    (readiness fully proven - API allocated==total, khs>0, smaps readable - but live != predicted): never
 #    finalize, logged EXACTLY ONCE (final -> "conflict", a terminal state never revisited), record kept; a

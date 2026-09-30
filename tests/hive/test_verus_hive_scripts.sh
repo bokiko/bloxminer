@@ -211,7 +211,7 @@ for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 D_DEBUG2="$T/phasea_debug.log"; : > "$D_DEBUG2"
 res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG2" BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL=1 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
 if [[ $(jq -r '.khs == "11900.00" and .stats.hs == [11900] and (.stats.temp | type) == "array"' <<< "$res" 2>/dev/null) == true ]] \
-	&& grep -q "phase A: stats composition invalid/empty" "$D_DEBUG2"
+	&& grep -q "phase_a_stats_gate: composition invalid/empty" "$D_DEBUG2"
 then
 	ok "Phase A: forced nested-jq failure -> honest minimal stats object (khs stands, never empty stats)"
 else
