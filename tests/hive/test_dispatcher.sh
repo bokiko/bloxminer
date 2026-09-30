@@ -621,33 +621,45 @@ else
 	bad "regression guard: in-window restart-after-raise still preserves prior (0)" "$rec_inwindow"
 fi
 
-# ---- 6k. PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - the exact
-#      counterexample. A final=1 record (prior=512, ours=1200) from a FINISHED 1st rx instance; an operator
-#      then raises nr_hugepages to 2000 (no longer provably ours - 6g's own scenario). A 2nd rx instance starts:
-#      note_rx_hugepages_start correctly determines "not owned" and must rebase prior to 2000 - but this time
-#      the REFRESHED record's own write (after `hugepages -rx` reserves, landing back on 1200 - the SAME value
-#      the OLD, now-superseded record's own "ours" already held) FAILS (MV_FAIL, standing in for a full/
-#      unwritable STATEDIR). Before this fix, the OLD record would have been left untouched by a failed write -
-#      final=1, prior=512, ours=1200 - EXACTLY matching the live value this SAME rx session's own reservation
-#      just produced, so a later Verus start's cur==ours check would have wrongly "confirmed" it and restored
-#      the stale 512, discarding the operator's real 2000 baseline entirely. Must instead: invalidate (remove)
-#      the OLD record BEFORE ever reserving - proven here by the record being GONE even though the refresh
-#      write itself still fails - so nothing stale is left for a later Verus start to wrongly trust.
+# ---- 6k. PR #2 follow-up review (Codex, 2 rounds): "Invalidate stale ownership before attempting refresh",
+#      then "Fail the RandomX start when tracking cannot be persisted" - the exact counterexample. A final=1
+#      record (prior=512, ours=1200) from a FINISHED 1st rx instance; an operator then raises nr_hugepages to
+#      2000 (no longer provably ours - 6g's own scenario). A 2nd rx instance starts: note_rx_hugepages_start
+#      correctly determines "not owned", invalidates the stale record, then reserves (`hugepages -rx` lands
+#      back on 1200 - the SAME value the OLD, now-superseded record's own "ours" already held) - but the
+#      REFRESHED record's own write then FAILS (MV_FAIL, standing in for a full/unwritable STATEDIR). Round 1
+#      only closed the "stale record left behind" half (proven: the old record is gone here too); round 2
+#      closes the other half found on THAT commit's own review - the reservation this session just made would
+#      otherwise be left completely untracked (no record, but nr_hugepages IS changed) with nothing left to
+#      ever finalize or restore it, pinning it until reboot. Must roll back to the TRUE prior (2000, the
+#      operator's own value - verified by readback) and refuse the whole rx start, exactly like a failed
+#      cpu_ok() - proven here by (a) no record at all, (b) nr_hugepages actually back at 2000, never left at
+#      1200 nor wrongly restored to the stale 512, and (c) only ONE `hugepages -rx` call (this dispatcher's
+#      own) - the engine's own second, unconditional call never happens because XMRig's exec is never reached.
 rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"; restore_stub_xmrig
 HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # 1st instance: prior=512, prelim=1200
 finalize_record_for_test   # 1st instance finalizes: final=1, ours=1200
 echo 2000 > "$PROCFILE"   # operator raises nr_hugepages - the 1st instance's record can no longer vouch for it
 stale_record=$(cat "$HUGEFILE")
-HUGEPAGES_TARGET=1200; MV_FAIL=1; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run; MV_FAIL=0   # 2nd instance: not owned (cur 2000 != ours 1200) -> must invalidate before reserving; its OWN refresh write then also fails
+HUGEPAGES_TARGET=1200; MV_FAIL=1; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run; MV_FAIL=0   # 2nd instance: not owned (cur 2000 != ours 1200) -> invalidates before reserving; its OWN refresh write then also fails -> rolls back, refuses
 if [[ ! -e $HUGEFILE ]]; then
-	ok "stale record invalidated before refresh (even though the refresh write itself then failed) - no record left at all, never the stale final=1/prior=512/ours=1200"
+	ok "stale record invalidated before refresh - no record left at all, never the stale final=1/prior=512/ours=1200"
 else
 	bad "stale record invalidated before refresh" "still present, and != stale: $(cat "$HUGEFILE") (was: $stale_record)"
 fi
-if grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then ok "stale-record-invalidate-then-write-fails: hugepages -rx still ran for this genuinely new session (XMRig starts fine either way)"; else bad "stale-record-invalidate-then-write-fails: hugepages -rx still ran" "$(cat "$SYSCTL_LOG")"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 2000 ]]; then
+	ok "record write also fails: vm.nr_hugepages rolled back to the OPERATOR's own true prior (2000), never left at 1200 nor the stale 512"
+else
+	bad "record write also fails: vm.nr_hugepages rolled back to the operator's own prior (2000)" "$(cat "$PROCFILE" 2>/dev/null)"
+fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then
+	ok "record write also fails: hugepages -rx called only ONCE - the 2nd instance never reached XMRig's own exec"
+else
+	bad "record write also fails: hugepages -rx called only once" "$(cat "$SYSCTL_LOG")"
+fi
+if grep -q "rolled back vm.nr_hugepages to 2000" "$T/log/bloxminer.log" 2>/dev/null; then ok "record write also fails: rollback logged"; else bad "record write also fails: rollback logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 # The critical assertion: a Verus start afterwards must NEVER restore the stale 512 - with no record at all,
-# restore_verus_hugepages has nothing to act on, which is exactly the safe outcome (never a wrong restore,
-# even though this particular rx->verus transition's own baseline is not automatically restored either).
+# restore_verus_hugepages has nothing to act on, which is exactly the safe outcome.
 : > "$SYSCTL_LOG"; hconfig "p:1" "W" "" "" ""; run_h_run
 if ! sysctl_called; then
 	ok "stale-record-invalidate-then-write-fails, then Verus start: NEVER restores the stale 512 (no record to act on)"
@@ -692,6 +704,31 @@ hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
 finalize_record_for_test
 hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; run_h_run
 if grep -q "nr_hugepages=0" "$SYSCTL_LOG" 2>/dev/null; then ok "verus after rx (0 baseline), finalized: restored to 0"; else bad "verus after rx (0 baseline), finalized: restored to 0" "$(cat "$SYSCTL_LOG" 2>/dev/null)"; fi
+
+# ---- PROACTIVE AUDIT: restore_verus_hugepages's own consuming _hp_invalidate fails (RM_FAIL) AFTER a genuinely
+#      successful, readback-verified restore - the restore write itself (the part that actually matters:
+#      vm.nr_hugepages) must still be correct; only the bookkeeping record's own removal fails, so it lingers -
+#      and must self-heal on the NEXT rx start (not be mistaken for something to restore AGAIN later).
+echo 512 > "$PROCFILE"; rm -f "$HUGEFILE" "$T/log/bloxminer.log"; restore_stub_xmrig
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run   # prior=512, prelim=1200
+finalize_record_for_test   # final=1, ours=1200
+hconfig "p:1" "W" "" "" ""; : > "$SYSCTL_LOG"; RM_FAIL=1 run_h_run; RM_FAIL=0
+if grep -q "nr_hugepages=512" "$SYSCTL_LOG" 2>/dev/null && [[ $(cat "$PROCFILE" 2>/dev/null) == 512 ]]; then
+	ok "restore succeeds but record removal fails: vm.nr_hugepages STILL correctly restored to 512 (the part that actually matters)"
+else
+	bad "restore succeeds but record removal fails: vm.nr_hugepages still restored to 512" "sysctl=$(cat "$SYSCTL_LOG") proc=$(cat "$PROCFILE" 2>/dev/null)"
+fi
+if [[ -e $HUGEFILE ]]; then ok "restore succeeds but record removal fails: the now-consumed record LINGERS (rm failed) rather than silently vanishing"; else bad "restore succeeds but record removal fails: record lingers" "MISSING"; fi
+if grep -q "could not remove the now-consumed ownership record" "$T/log/bloxminer.log" 2>/dev/null; then ok "restore succeeds but record removal fails: failure logged"; else bad "restore succeeds but record removal fails: failure logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+# self-heals: the NEXT rx start sees this lingering (final=1, prior=512, ours=1200) record; cur is now 512
+# (post-restore), which != ours (1200) -> not owned -> _hp_invalidate cleans it up before reserving again.
+HUGEPAGES_TARGET=1300; hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+rec_selfheal2=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_selfheal2") == 512 && $(sed -n 's/^prelim=//p' <<< "$rec_selfheal2") == 1300 ]]; then
+	ok "restore succeeds but record removal fails: lingering record self-heals on the NEXT rx start (invalidated, prior correctly rebased to 512)"
+else
+	bad "restore succeeds but record removal fails: lingering record self-heals on the next rx start" "$rec_selfheal2"
+fi
 
 # ---- something else changes nr_hugepages AFTER finalization (foreign write, e.g. another workload or an
 #      operator) -> the next Verus start must NEVER overwrite it: left untouched, the conflict is logged (own
@@ -743,8 +780,16 @@ rm -f "$HUGEFILE" "$T/log/bloxminer.log"; printf 'prior=512\nours=1200\nboot=boo
 if ! sysctl_called && [[ -e $HUGEFILE ]] && grep -q "could not read the current" "$T/log/bloxminer.log" 2>/dev/null; then ok "unreadable current value (final=1) -> no sysctl call, record retained, logged"; else bad "unreadable current value (final=1) -> no sysctl call, record retained, logged" "sysctl=$(cat "$SYSCTL_LOG") record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo GONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
 echo 512 > "$PROCFILE"
 
-# note_rx_hugepages_start itself must never WRITE a record with an invalid "prelim": simulate a `hugepages -rx`
-# that leaves the current value unreadable afterwards (e.g. a transient /proc glitch) - no record at all, logged
+# PR #2 follow-up review (Codex): "Fail the RandomX start when tracking cannot be persisted" - `hugepages -rx`
+# may well have just reserved real pages before any of prelim/free0/start_uptime/the record write is even
+# attempted; simply logging "no record written" and returning 0 (as this used to) let XMRig start anyway, on
+# top of that real reservation, with NOTHING left to ever finalize or restore it - pinned until reboot,
+# silently, not just until the write problem is fixed. Must instead roll back to the TRUE prior (verified by
+# readback, h-common.sh's own _hp_rollback_reservation) and refuse the WHOLE rx start (checked by
+# bloxminer/h-run.sh, same as cpu_ok()) - proven here by (a) the record staying absent, (b) nr_hugepages
+# actually back at the TRUE original prior (0), never left at whatever `hugepages -rx` set it to, and (c) only
+# ONE `hugepages -rx` call logged (this dispatcher's own) - never a second from engines/rx/h-run.sh's own
+# unconditional call, proving XMRig's own exec was never reached at all.
 rm -f "$HUGEFILE" "$T/log/bloxminer.log"
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
@@ -754,7 +799,9 @@ exit 0
 SH
 echo 0 > "$PROCFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ ! -e $HUGEFILE ]] && grep -q "rolled back vm.nr_hugepages to 0" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record, rollback logged"; else bad "note_rx_hugepages_start: unreadable post-reservation value (prelim) -> no record, rollback logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 0 ]]; then ok "unreadable prelim: vm.nr_hugepages actually rolled back to the TRUE original prior (0)"; else bad "unreadable prelim: vm.nr_hugepages rolled back to 0" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "unreadable prelim: hugepages -rx called only ONCE (this dispatcher's own) - the rx start never reached XMRig's own exec"; else bad "unreadable prelim: hugepages -rx called only once" "$(cat "$SYSCTL_LOG")"; fi
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
 echo "hugepages $*" >> "$SYSCTL_LOG"
@@ -766,9 +813,8 @@ exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
 
-# note_rx_hugepages_start must also never WRITE a record with an invalid "free0" (Round 5 - HugePages_Free is
-# the other value finalize_rx_hugepages's predicted-total formula needs): simulate a fake `hugepages -rx` that
-# leaves meminfo unreadable - no record at all, logged
+# Same class, "free0" (HugePages_Free) unreadable after a genuine reservation: simulate a fake `hugepages -rx`
+# that leaves meminfo unreadable - must roll back and refuse, exactly like the prelim case above.
 rm -f "$HUGEFILE" "$T/log/bloxminer.log" "$MEMINFO"
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
@@ -781,7 +827,9 @@ exit 0
 SH
 echo 0 > "$PROCFILE"
 hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
-if [[ ! -e $HUGEFILE ]] && grep -q "no ownership record written" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record written, logged"; else bad "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ ! -e $HUGEFILE ]] && grep -q "rolled back vm.nr_hugepages to 0" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record, rollback logged"; else bad "note_rx_hugepages_start: unreadable HugePages_Free (free0) -> no record, rollback logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 0 ]]; then ok "unreadable free0: vm.nr_hugepages actually rolled back to the TRUE original prior (0), not left at 1200"; else bad "unreadable free0: vm.nr_hugepages rolled back to 0" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "unreadable free0: hugepages -rx called only ONCE - the rx start never reached XMRig's own exec"; else bad "unreadable free0: hugepages -rx called only once" "$(cat "$SYSCTL_LOG")"; fi
 cat > "$FAKEBIN/hugepages" <<'SH'
 #!/bin/sh
 echo "hugepages $*" >> "$SYSCTL_LOG"
@@ -792,6 +840,38 @@ fi
 exit 0
 SH
 chmod +x "$FAKEBIN/hugepages"
+
+# Same class, "start_uptime" (/proc/uptime) unreadable after a genuine reservation - no existing coverage for
+# this specific field before this review round. Removing $PROCROOT/uptime entirely simulates it.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+UPTIME_BACKUP=$(cat "$PROCROOT/uptime" 2>/dev/null)
+rm -f "$PROCROOT/uptime"
+echo 0 > "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "rolled back vm.nr_hugepages to 0" "$T/log/bloxminer.log" 2>/dev/null; then ok "note_rx_hugepages_start: unreadable /proc/uptime (start_uptime) -> no record, rollback logged"; else bad "note_rx_hugepages_start: unreadable /proc/uptime (start_uptime) -> no record, rollback logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 0 ]]; then ok "unreadable start_uptime: vm.nr_hugepages actually rolled back to the TRUE original prior (0), not left at 1200"; else bad "unreadable start_uptime: vm.nr_hugepages rolled back to 0" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "unreadable start_uptime: hugepages -rx called only ONCE - the rx start never reached XMRig's own exec"; else bad "unreadable start_uptime: hugepages -rx called only once" "$(cat "$SYSCTL_LOG")"; fi
+printf '%s\n' "$UPTIME_BACKUP" > "$PROCROOT/uptime"   # restore for every test below
+
+# Same class, the fresh record's own temp-write+rename fails (full/unwritable STATEDIR, stubbed via MV_FAIL) -
+# prelim/free0/start_uptime all read fine, only persisting the record itself fails.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+echo 0 > "$PROCFILE"
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; MV_FAIL=1; : > "$SYSCTL_LOG"; run_h_run; MV_FAIL=0
+if [[ ! -e $HUGEFILE ]] && grep -q "rolled back vm.nr_hugepages to 0" "$T/log/bloxminer.log" 2>/dev/null; then ok "fresh rx start, record write fails (MV_FAIL): no record, rollback logged"; else bad "fresh rx start, record write fails (MV_FAIL): no record, rollback logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 0 ]]; then ok "record write fails: vm.nr_hugepages actually rolled back to the TRUE original prior (0), not left at 1200"; else bad "record write fails: vm.nr_hugepages rolled back to 0" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then ok "record write fails: hugepages -rx called only ONCE - the rx start never reached XMRig's own exec"; else bad "record write fails: hugepages -rx called only once" "$(cat "$SYSCTL_LOG")"; fi
+
+# PROACTIVE AUDIT: same class, but the ROLLBACK ITSELF also fails (sysctl fails) - _hp_rollback_reservation's
+# own "could not roll back" branch. vm.nr_hugepages stays at whatever the reservation left it (1200, never
+# rolled back to 0) - a real, logged-loudly "may remain pinned" outcome, never silent, and never a record left
+# behind that could later be mistaken for something trustworthy (none is written either way).
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+echo 0 > "$PROCFILE"
+HUGEPAGES_TARGET=1200; hconfig "p:1" "W" "" "" "rx/0"; MV_FAIL=1; SYSCTL_FAIL=1; : > "$SYSCTL_LOG"; run_h_run; MV_FAIL=0; SYSCTL_FAIL=0
+if [[ ! -e $HUGEFILE ]] && grep -q "could not roll back vm.nr_hugepages to 0" "$T/log/bloxminer.log" 2>/dev/null; then ok "record write fails AND the rollback itself fails: no record, failure-to-roll-back logged loudly"; else bad "record write fails AND rollback fails: no record, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 1200 ]]; then ok "record write fails AND rollback fails: vm.nr_hugepages stays at the reservation's own value (1200) - a real, logged 'may remain pinned' outcome, never silent"; else bad "record write fails AND rollback fails: vm.nr_hugepages stays at 1200" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+echo 0 > "$PROCFILE"   # clean slate for every test below
 
 # legacy (pre-Round-5) record: only prior=/ours=, no final= line at all - never trusted for a restore (missing
 # final never equals "1"), left untouched until the next reboot clears tmpfs; no migration code needed.
@@ -866,6 +946,46 @@ if grep -q "rolled back vm.nr_hugepages to 512" "$T/log/bloxminer.log" 2>/dev/nu
 else
 	bad "post-reservation failure: rollback logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"
 fi
+
+# ---- 6c-ii/6c-iii. PROACTIVE AUDIT (Codex, 5th hugepage-ownership review round): engines/rx/h-run.sh's own
+#      rollback_rx_hugepages_reservation (EXIT trap) used to log NOTHING at all when its own rollback attempt
+#      failed (sysctl itself failing/a readback mismatch, or a successful rollback whose own record-removal
+#      `rm` then failed) - silent, unlike every other write in this record's lifecycle. Fixed to log both
+#      failure modes explicitly (never a behaviour change: rc still bounded by the SAME provably-ours checks).
+#      Same missing-xmrig-binary trigger as 6c above, so the dispatcher's own reservation still happens first.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"
+rm -f "$BLOX_DIR/xmrig"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"
+SYSCTL_FAIL=1 run_h_run; SYSCTL_FAIL=0
+if [[ $(cat "$PROCFILE") == 1200 ]]; then ok "post-reservation failure, sysctl itself fails: nr_hugepages NEVER rolled back (still at the reservation's own prelim, 1200) - never a blind restore"; else bad "post-reservation failure, sysctl fails: nr_hugepages left at prelim (1200)" "$(cat "$PROCFILE")"; fi
+if [[ -e $HUGEFILE ]]; then ok "post-reservation failure, sysctl itself fails: ownership record RETAINED, not dropped on a failed rollback"; else bad "post-reservation failure, sysctl fails: ownership record retained" "MISSING"; fi
+if grep -q "could not roll back vm.nr_hugepages to 512" "$T/log/bloxminer.log" 2>/dev/null; then ok "post-reservation failure, sysctl itself fails: failure logged (previously silent)"; else bad "post-reservation failure, sysctl fails: failure logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"; echo 512 > "$PROCFILE"
+rm -f "$BLOX_DIR/xmrig"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"
+RM_FAIL=1 run_h_run; RM_FAIL=0
+if [[ $(cat "$PROCFILE") == 512 ]]; then ok "post-reservation failure, record removal fails: nr_hugepages STILL correctly rolled back to 512 (removal is a separate step from the verified sysctl write)"; else bad "post-reservation failure, record removal fails: nr_hugepages still rolled back to 512" "$(cat "$PROCFILE")"; fi
+if [[ -e $HUGEFILE ]]; then ok "post-reservation failure, record removal fails: record LINGERS (as expected - rm failed) rather than silently vanishing"; else bad "post-reservation failure, record removal fails: record lingers" "MISSING"; fi
+if grep -q "could not remove the now-consumed ownership record" "$T/log/bloxminer.log" 2>/dev/null; then ok "post-reservation failure, record removal fails: failure logged (previously silent)"; else bad "post-reservation failure, record removal fails: failure logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+# self-heals: the NEXT rx start sees this lingering (final=0, prior=512, prelim=1200) record, cur(512) != prelim
+# (1200) -> not owned -> h-common.sh's own _hp_invalidate cleans it up before reserving again. Restore the
+# working xmrig stub FIRST so this start actually succeeds (reaches real exec) - otherwise the ENGINE's own
+# rollback trap would fire yet again on the freshly-written record and this would end up testing THAT, not
+# self-healing of the leftover from above.
+cat > "$BLOX_DIR/xmrig" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$BLOX_DIR/xmrig"
+HUGEPAGES_TARGET=1300; hconfig "p:1" "W" "" "" "rx/wow"; : > "$SYSCTL_LOG"; run_h_run
+rec_selfheal=$(cat "$HUGEFILE" 2>/dev/null)
+if [[ $(sed -n 's/^prior=//p' <<< "$rec_selfheal") == 512 && $(sed -n 's/^prelim=//p' <<< "$rec_selfheal") == 1300 ]]; then
+	ok "post-reservation failure, record removal fails: lingering record self-heals on the NEXT rx start (invalidated, prior correctly rebased to 512)"
+else
+	bad "post-reservation failure, record removal fails: lingering record self-heals on the next rx start" "$rec_selfheal"
+fi
+
 # restore the working stub in case anything later in this file still expects it
 cat > "$BLOX_DIR/xmrig" <<'SH'
 #!/bin/sh

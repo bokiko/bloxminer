@@ -139,7 +139,8 @@ stop_api() { [[ -n $API_PID ]] && kill "$API_PID" 2>/dev/null; wait "$API_PID" 2
 #      binding is deliberately NOT modelled here (falls back to "unverified" per-thread rows) - irrelevant to
 #      hugepage finalization, which reads only $khs, the API's readiness fields, and smaps_rollup.
 poll() {
-	out=$(BLOX_DIR="$BLOX_DIR" BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT="$PORT" BLOX_STATE_DIR="$T/state" bash -c '
+	out=$(BLOX_DIR="$BLOX_DIR" BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT="$PORT" BLOX_STATE_DIR="$T/state" \
+		PATH="$FAKEBIN:$PATH" MV_FAIL="${MV_FAIL:-0}" bash -c '
 		. "$BLOX_DIR/h-stats.sh"
 		echo "khs=[$khs]"
 	' 2>&1)
@@ -161,6 +162,23 @@ for a in "$@"; do case $a in vm.nr_hugepages=*) echo "${a#vm.nr_hugepages=}" > "
 exit 0
 SH
 chmod +x "$FAKEBIN/sysctl"
+# PROACTIVE AUDIT (Codex, 5th hugepage-ownership review round): lets a dedicated test force finalize_rx_
+# hugepages's own _hp_rewrite (its record temp-write+rename) to fail, toggled independently of this box's real
+# filesystem permissions or whether the suite runs as root - same technique as tests/hive/test_dispatcher.sh's
+# own MV_FAIL stub. Scoped to the hugepages record's own filename ONLY - poll() sources the REAL top-level
+# h-stats.sh, which also runs the rx engine's own h-stats.sh collector, whose write_result() uses the exact
+# same tmp+mv convention for its OWN, unrelated $OUTFILE (Phase A/B result). A blanket "every mv fails" stub
+# (as first tried) broke THAT write too, so khs came back 0 and finalize_rx_hugepages's own khs>0 gate bailed
+# out before ever reaching the hugepage record write this is actually meant to test - a false "pass" for the
+# wrong reason. Defaults to passthrough (real mv) so poll()'s own many other callers are unaffected either way.
+cat > "$FAKEBIN/mv" <<'SH'
+#!/bin/sh
+if [ "${MV_FAIL:-0}" = "1" ]; then
+	for a in "$@"; do case $a in *bloxminer-hugepages*) exit 1 ;; esac; done
+fi
+exec /bin/mv "$@"
+SH
+chmod +x "$FAKEBIN/mv"
 SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG
 attempt_restore() {   # writes $SYSCTL_LOG (engine binary absent, so h-run.sh's own exit status is not meaningful)
 	write_verus_config
@@ -197,6 +215,33 @@ SYSCTL_FAIL=0 SYSCTL_LIE=0 attempt_restore
 if sysctl_called && grep -q "nr_hugepages=0" "$SYSCTL_LOG"; then ok "restore after finalization: real Verus start restores the ORIGINAL prior (0)"; else bad "restore after finalization: restores prior (0)" "$(cat "$SYSCTL_LOG")"; fi
 if [[ $(cat "$PROC/sys/vm/nr_hugepages") == 0 ]]; then ok "restore after finalization: live vm.nr_hugepages actually now 0"; else bad "restore after finalization: live value now 0" "$(cat "$PROC/sys/vm/nr_hugepages")"; fi
 if [[ ! -e $HUGEFILE ]]; then ok "restore after finalization: ownership record removed (readback verified)"; else bad "restore after finalization: record removed" "$(cat "$HUGEFILE")"; fi
+
+# ================================================================== 1b. PROACTIVE AUDIT (Codex, 5th hugepage-
+#    ownership review round): finalize_rx_hugepages's own _hp_rewrite (the final=1/ours=N write) can fail the
+#    exact same way note_rx_hugepages_start's own record write could (a full/unwritable STATEDIR) - stubbed
+#    here via MV_FAIL, same technique as tests/hive/test_dispatcher.sh. Unlike that case, this one needs no
+#    rollback: nothing was reserved BY THIS FUNCTION (finalize only ever confirms a reservation
+#    note_rx_hugepages_start already made and already persisted, successfully, earlier) - a failed write here
+#    just means the record stays exactly as it already was (final=0, same prior/prelim/free0/boot/start_uptime
+#    this SAME session already recorded correctly) - never a stale record from a DIFFERENT, superseded session
+#    the way the original bug's counterexample was. Proven here: the record survives byte-for-byte unchanged
+#    (still final=0) and a Verus start afterward still correctly refuses it (never finalized, never restorable).
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-AAB
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-AAB\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+record_before_mvfail=$(cat "$HUGEFILE")
+start_api 1200 1200 500000 || bad "fake xmrig API startup (case 1b)" "$(cat "$T/api.out" 2>/dev/null)"
+MV_FAIL=1 poll; MV_FAIL=0
+if [[ $(cat "$HUGEFILE" 2>/dev/null) == "$record_before_mvfail" ]]; then
+	ok "finalize_rx_hugepages's own record write fails (MV_FAIL): record survives UNCHANGED (still final=0, same session fields) - never a stale record from a different session"
+else
+	bad "finalize write fails: record survives unchanged" "$(cat "$HUGEFILE" 2>/dev/null) (was: $record_before_mvfail)"
+fi
+if grep -q "the finalized record could not be persisted" "$T/log/bloxminer.log" 2>/dev/null; then ok "finalize_rx_hugepages's own record write fails: failure logged"; else bad "finalize write fails: failure logged" "$(cat "$T/log/bloxminer.log" 2>/dev/null)"; fi
+stop_api
+attempt_restore
+if ! sysctl_called && [[ -e $HUGEFILE ]]; then ok "finalize write fails, then Verus start: never restores (record never actually reached final=1), kept for a later attempt"; else bad "finalize write fails, then Verus start: never restores" "$(cat "$SYSCTL_LOG")"; fi
 
 # ================================================================== 2. cask18's OWN shape: nonzero baseline
 #    (prior=1201, left over from an earlier, never-released session) still finalizes and restores correctly -

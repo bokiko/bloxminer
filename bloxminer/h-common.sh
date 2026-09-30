@@ -404,6 +404,36 @@ _hp_invalidate() {
 	return 0
 }
 
+# _hp_rollback_reservation <prior> <reason> - PR #2 follow-up review (Codex): "Fail the RandomX start when
+# tracking cannot be persisted". note_rx_hugepages_start's own `hugepages -rx` call can succeed (genuinely
+# reserving pages) even when this package then fails to record that fact (prelim/free0/start_uptime unreadable,
+# or the record's own temp-write+rename fails) - without this helper, that used to just log a note and return
+# 0: XMRig would then start on top of a real reservation with NO record at all, and since nothing tracks it,
+# nothing can ever finalize or restore it - the ~2.4 GiB stays pinned until a reboot, silently, forever, not
+# just until the write problem is fixed. Best-effort undoes that SAME reservation (sysctl back to <prior>,
+# verified by readback - never trusting sysctl's own exit status alone, the same standard restore_
+# verus_hugepages already applies to its own restore) and logs exactly which of the two outcomes happened -
+# rolled back cleanly, or (sysctl itself failing, or a readback mismatch) still possibly holding pages with no
+# record to ever release them, spelled out loudly rather than silently accepted. Every caller of this helper
+# returns 1 immediately afterward regardless of which outcome logged: even a CLEAN rollback here does not make
+# it safe to let rx proceed - engines/rx/h-run.sh would just reserve again, unconditionally, moments later
+# (see note_rx_hugepages_start's own header on why that call can never be prevented from here), recreating the
+# exact same untracked-reservation risk this helper exists to close. Refusing the whole rx start (the caller's
+# own return 1, checked by bloxminer/h-run.sh exactly like a failed cpu_ok()) is what actually prevents that
+# second, redundant reservation from ever happening.
+_hp_rollback_reservation() {
+	local prior=$1 reason=$2 proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" verify=""
+	if command -v sysctl > /dev/null 2>&1 && sysctl -q -w vm.nr_hugepages="$prior" 2>/dev/null; then
+		[[ -r $proc ]] && verify=$(<"$proc") 2>/dev/null
+		if [[ $verify == "$prior" ]]; then
+			log_hugepages_note "BloxMiner: $reason - rolled back vm.nr_hugepages to $prior (verified) and refusing to start rx this time, rather than leave an untracked reservation with no way to ever release it"
+			return 0
+		fi
+	fi
+	log_hugepages_note "BloxMiner: $reason - could not roll back vm.nr_hugepages to $prior (sysctl failed, or did not read back correctly: now=${verify:-<unreadable>}) - refusing to start rx this time; a reservation MAY remain pinned with no record to release it until a reboot or a manual \`sysctl vm.nr_hugepages=$prior\`"
+	return 1
+}
+
 # note_rx_hugepages_start - called just before exec'ing the rx engine. EVERY call means a genuinely NEW XMRig
 # process is about to start: h-run.sh's own final action is always an unconditional `exec ./xmrig` (this file's
 # own header), so Hive calling it again - a flight-sheet edit, a watchdog restart after a hang, the API being
@@ -579,34 +609,40 @@ note_rx_hugepages_start() {
 	prelim=""
 	[[ -r $proc ]] && prelim=$(<"$proc") 2>/dev/null
 	if [[ ! $prelim =~ ^[0-9]+$ ]]; then
-		log_hugepages_note "BloxMiner: could not read vm.nr_hugepages after reserving for rx ($proc unreadable/invalid) - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
-		return 0
+		# PR #2 follow-up review (Codex): "Fail the RandomX start when tracking cannot be persisted" - this
+		# `hugepages -rx` call above may well have just reserved real pages; giving up here with a bare "no
+		# record written" (as this used to) would let XMRig start on top of that reservation anyway, with
+		# NOTHING left to ever finalize or restore it - see _hp_rollback_reservation's own header. Roll back
+		# and refuse this rx start entirely instead.
+		_hp_rollback_reservation "$prior" "could not read vm.nr_hugepages after reserving for rx ($proc unreadable/invalid)"
+		return 1
 	fi
 	free0=$(_hp_free_hugepages)
 	if [[ ! $free0 =~ ^[0-9]+$ ]]; then
-		log_hugepages_note "BloxMiner: could not read HugePages_Free after reserving for rx (/proc/meminfo unreadable/invalid) - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
-		return 0
+		_hp_rollback_reservation "$prior" "could not read HugePages_Free after reserving for rx (/proc/meminfo unreadable/invalid)"
+		return 1
 	fi
 	# ROUND 5c: start_uptime anchors the exclusive-ownership window's own bound (HUGEPAGES_STARTUP_WINDOW_S) -
 	# same all-or-nothing treatment as prior/prelim/free0: no record at all if it cannot be read, rather than a
 	# record finalize_rx_hugepages could never safely bound.
 	start_uptime=$(_hp_uptime_seconds)
 	if [[ ! $start_uptime =~ ^[0-9]+$ ]]; then
-		log_hugepages_note "BloxMiner: could not read /proc/uptime after reserving for rx - no ownership record written; the next Verus start will leave vm.nr_hugepages untouched"
-		return 0
+		_hp_rollback_reservation "$prior" "could not read /proc/uptime after reserving for rx"
+		return 1
 	fi
 	boot=$(_hp_boot_id)
 	tmp="$HUGEPAGES_FILE.tmp.$$"
-	{ printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=0\n' \
+	if { printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=0\n' \
 		"$prior" "$prelim" "$free0" "$boot" "$start_uptime" > "$tmp"; } 2>/dev/null \
 		&& mv -f "$tmp" "$HUGEPAGES_FILE" 2>/dev/null
-	return 0   # PR #2 follow-up review audit: a failed write HERE (full/unwritable STATEDIR) is never worth
-		# blocking this rx session over, unlike the _hp_invalidate failure above - by this point any stale
-		# record was already either genuinely still ours (preserved, nothing to invalidate) or successfully
-		# removed (the "not owned" branch's own _hp_invalidate, already proven to have succeeded or this
-		# function would already have returned 1 before ever reaching here) - so a failed write here just
-		# means no record at all going forward, exactly the already-safe "next Verus start leaves
-		# vm.nr_hugepages untouched" outcome the three checks just above already accept for the same reason.
+	then
+		return 0
+	fi
+	# Same class as the three checks just above: the reservation already happened (prelim/free0/start_uptime
+	# were all read successfully - only persisting the record itself failed, e.g. a full/unwritable STATEDIR)
+	# - roll back and refuse, never let XMRig start on an untracked reservation.
+	_hp_rollback_reservation "$prior" "reserved for rx (prelim=$prelim) but could not persist the ownership record ($HUGEPAGES_FILE unwritable?)"
+	return 1
 }
 
 # finalize_rx_hugepages - called from the TOP-LEVEL h-stats.sh (never from here, never from h-run.sh), once per

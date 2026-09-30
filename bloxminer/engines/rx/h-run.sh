@@ -37,14 +37,32 @@ rollback_rx_hugepages_reservation() {
 	[[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
 	[[ $cur =~ ^[0-9]+$ && $cur == "$prelim" ]] || return 0   # anything else already changed it since this
 		# reservation - never a blind "restore anyway" on partial/stale information
+	local logf="${CUSTOM_LOG_BASENAME:-$statedir/bloxminer}.log"
 	if command -v sysctl > /dev/null 2>&1 && sysctl -q -w vm.nr_hugepages="$prior" 2>/dev/null; then
 		local verify=""; [[ -r $proc ]] && verify=$(<"$proc") 2>/dev/null
 		if [[ $verify == "$prior" ]]; then
-			rm -f "$f" 2>/dev/null   # only consumed once the restore is verified, by readback, to have succeeded -
-				# same convention as every other write in this record's lifecycle (h-common.sh)
-			{ printf '%s BloxMiner: rx start aborted before XMRig ever ran - rolled back vm.nr_hugepages to %s (was %s), record removed\n' \
-				"$(date '+%F %T' 2>/dev/null)" "$prior" "$prelim" >> "${CUSTOM_LOG_BASENAME:-$statedir/bloxminer}.log"; } 2>/dev/null
+			# PR #2 follow-up review (Codex) audit: only consumed once the restore is verified, by readback, to
+			# have succeeded - same convention as every other write in this record's lifecycle (h-common.sh). If
+			# removal itself fails (STATEDIR unwritable), the record lingers at final=0 describing a reservation
+			# that WAS genuinely rolled back (verified above) - never dangerous the way an un-invalidated STALE
+			# record was before h-common.sh's own _hp_invalidate existed: the next rx start's own
+			# note_rx_hugepages_start sees cur(==prior) != this record's own prelim, correctly determines "not
+			# owned", and invalidates this exact leftover itself before reserving again. Logged either way,
+			# purely for operator visibility, never a behaviour change.
+			if rm -f "$f" 2>/dev/null; then
+				{ printf '%s BloxMiner: rx start aborted before XMRig ever ran - rolled back vm.nr_hugepages to %s (was %s), record removed\n' \
+					"$(date '+%F %T' 2>/dev/null)" "$prior" "$prelim" >> "$logf"; } 2>/dev/null
+			else
+				{ printf '%s BloxMiner: rx start aborted before XMRig ever ran - rolled back vm.nr_hugepages to %s (was %s), but could not remove the now-consumed ownership record (%s) - a later rx start'"'"'s own invalidation will clear it before reserving again\n' \
+					"$(date '+%F %T' 2>/dev/null)" "$prior" "$prelim" "$f" >> "$logf"; } 2>/dev/null
+			fi
+		else
+			{ printf '%s BloxMiner: rx start aborted before XMRig ever ran, but the rollback write to %s did not read back correctly (now=%s) - record kept for a later attempt; a reservation may remain pinned until then\n' \
+				"$(date '+%F %T' 2>/dev/null)" "$prior" "${verify:-<unreadable>}" >> "$logf"; } 2>/dev/null
 		fi
+	else
+		{ printf '%s BloxMiner: rx start aborted before XMRig ever ran, but could not roll back vm.nr_hugepages to %s (sysctl missing or failed) - record kept for a later attempt; a reservation may remain pinned until then\n' \
+			"$(date '+%F %T' 2>/dev/null)" "$prior" >> "$logf"; } 2>/dev/null
 	fi
 	true
 }

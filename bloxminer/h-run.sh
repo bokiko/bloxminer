@@ -59,16 +59,22 @@ if [[ $engine == rx ]]; then
 		sleep 60
 		return 1 2>/dev/null || exit 1
 	fi
-	# PR #2 follow-up review (Codex): "Invalidate stale ownership before attempting refresh" - note_rx_
-	# hugepages_start now returns 1 (checked here, exactly like cpu_ok() just above) in exactly one case: an
-	# existing ownership record is stale (not provably this package's own current session) and could not be
-	# removed (h-common.sh's own _hp_invalidate). That check has to fail CLOSED here, not just inside that
-	# function: engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless of
-	# anything the dispatcher decided, so the ONLY way to actually keep vm.nr_hugepages untouched - rather
-	# than merely skipping THIS package's own tracking of a reservation that happens anyway - is to never
-	# reach that exec at all, same as a failed CPU gate already does one line above.
+	# PR #2 follow-up review (Codex): note_rx_hugepages_start now returns 1 (checked here, exactly like
+	# cpu_ok() just above) whenever it cannot establish a TRUSTWORTHY ownership record for this session - two
+	# distinct causes, both logged with their own specific reason in this package's own log
+	# (log_hugepages_note), never conflated into one message here: (1) "Invalidate stale ownership before
+	# attempting refresh" - an EXISTING record is stale and could not be removed (h-common.sh's own
+	# _hp_invalidate); nothing was reserved this call. (2) "Fail the RandomX start when tracking cannot be
+	# persisted" - `hugepages -rx` WAS already called and (best-effort) rolled back (h-common.sh's own
+	# _hp_rollback_reservation) because prelim/free0/start_uptime could not be read afterward, or the fresh
+	# record's own write failed. Either way this has to fail CLOSED here, not just inside that function:
+	# engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless of anything the
+	# dispatcher decided, so the ONLY way to actually keep vm.nr_hugepages from being reserved again right
+	# behind this check's back - rather than merely skipping THIS package's own tracking of a reservation
+	# that happens anyway - is to never reach that exec at all, same as a failed CPU gate already does one
+	# line above.
 	if ! note_rx_hugepages_start; then
-		fail "BloxMiner (RandomX engine): an existing huge-page ownership record is stale and could not be invalidated ($HUGEPAGES_FILE unwritable?) - refusing to start rather than risk a later Verus restore trusting it; see this package's own log"
+		fail "BloxMiner (RandomX engine): could not establish a trustworthy huge-page ownership record for this start (see this package's own log for the exact reason) - refusing to start rather than risk either a wrong later Verus restore or an untracked reservation with no way to release it"
 		sleep 60
 		return 1 2>/dev/null || exit 1
 	fi
