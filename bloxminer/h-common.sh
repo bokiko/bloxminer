@@ -563,6 +563,23 @@ _hp_read_baseline() {
 note_rx_hugepages_start() {
 	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp rc
 
+	# PR #2 follow-up review (Codex): "Handle absent huge-page support before requiring boot ID" - checked
+	# FIRST, before the boot_id requirement just below (and before anything else): if vm.nr_hugepages does not
+	# exist AT ALL, no one - not this package, not engines/rx/h-run.sh's own unconditional `hugepages -rx` call
+	# moments later - can reserve or track anything on this host (a minimal kernel, or a restricted container,
+	# with no hugetlbfs). boot_id's own validity is irrelevant to a host like this - there is nothing it would
+	# ever need to be matched against - so requiring it here, before this check, wrongly refused rx on exactly
+	# such a host whenever boot_id ALSO happened to be unreadable (both are plausible together on the same
+	# minimal/restricted environment): a pure functional regression, never a safety improvement, on a host that
+	# was never at risk in the first place. _hp_read_baseline's own OTHER two call sites, further down, already
+	# make this exact distinction for the SAME file read at a different moment (after an existing record's own
+	# ownership is decided) - this is the same policy, just also applied before boot_id, which did not exist as
+	# a concept the first time that distinction was added.
+	if [[ ! -e $proc ]]; then
+		log_hugepages_note "BloxMiner: $proc does not exist (no hugetlbfs support on this host?) - huge-page tracking is not possible here; letting rx start anyway, without it"
+		return 0
+	fi
+
 	# PR #2 follow-up review (Codex): "Require a boot ID before accepting the reservation" - read and validate
 	# ONCE, before anything else (including the existing-record ownership check just below, which also needs
 	# it): both finalize_rx_hugepages and restore_verus_hugepages require a non-empty, EXACT boot_id match
@@ -574,7 +591,8 @@ note_rx_hugepages_start() {
 	# throughout (the ownership check below, and the record write further down) is not just cheaper than the
 	# two separate reads this used to be, it is what closes the gap: there is only one place left that could
 	# ever disagree with itself. Checked here, before `hugepages -rx` ever runs, so a failure needs no rollback
-	# at all - nothing has been reserved yet.
+	# at all - nothing has been reserved yet. By this point vm.nr_hugepages is already known to EXIST (checked
+	# above), so a RandomX reservation really is possible on this host, and boot_id really is needed for it.
 	boot=$(_hp_boot_id)
 	if [[ -z $boot ]]; then
 		log_hugepages_note "BloxMiner: could not read ${BLOX_PROCFS_ROOT:-/proc}/sys/kernel/random/boot_id (unreadable or empty) - refusing to start rx rather than persist a record that could never be finalized or restored"

@@ -62,15 +62,18 @@ if [[ $engine == rx ]]; then
 	# PR #2 follow-up review (Codex): note_rx_hugepages_start now returns 1 (checked here, exactly like
 	# cpu_ok() just above) whenever it cannot establish a TRUSTWORTHY ownership record for this session - every
 	# cause is logged with its own specific reason in this package's own log (log_hugepages_note), never
-	# conflated into one message here. In increasing order of "how much has already happened": (1) the current
-	# boot_id itself could not be read ("Require a boot ID before accepting the reservation") - checked first,
-	# before anything else, nothing reserved yet; (2) an EXISTING record is stale and could not be removed
-	# ("Invalidate stale ownership before attempting refresh", h-common.sh's own _hp_invalidate) - nothing
-	# reserved this call either; (3) the PRE-reservation vm.nr_hugepages baseline itself could not be read
-	# ("Reject RandomX starts when the baseline is unreadable") - still before `hugepages -rx` ever runs (a
-	# baseline file that does not EXIST at all is a different, non-fatal case - see h-common.sh's own
-	# _hp_read_baseline for why that one still returns 0, not 1, and reaches here); (4) "Fail the RandomX start
-	# when tracking cannot be persisted" - `hugepages -rx` WAS already called and (best-effort) rolled back
+	# conflated into one message here. Note that an ABSENT vm.nr_hugepages (no hugetlbfs on this host at all -
+	# "Handle absent huge-page support before requiring boot ID") is checked first, before everything below,
+	# and is NOT one of these failure causes - that one still returns 0 (success): no one, on a host like that,
+	# can reserve or track anything either, so rx starts normally, just untracked. The four causes that DO
+	# return 1, in increasing order of "how much has already happened": (1) the current boot_id itself could
+	# not be read ("Require a boot ID before accepting the reservation") - checked right after the absent-
+	# hugetlbfs case above, before anything else, nothing reserved yet; (2) an EXISTING record is stale and
+	# could not be removed ("Invalidate stale ownership before attempting refresh", h-common.sh's own
+	# _hp_invalidate) - nothing reserved this call either; (3) the PRE-reservation vm.nr_hugepages baseline
+	# itself (already known to EXIST, by this point) is unreadable or not a plain number ("Reject RandomX
+	# starts when the baseline is unreadable") - still before `hugepages -rx` ever runs; (4) "Fail the RandomX
+	# start when tracking cannot be persisted" - `hugepages -rx` WAS already called and (best-effort) rolled back
 	# (h-common.sh's own _hp_rollback_reservation) because prelim/free0/start_uptime could not be read
 	# afterward, or the fresh record's own write failed. Every cause has to fail CLOSED here, not just inside
 	# that function: engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless

@@ -897,6 +897,30 @@ fi
 printf '%s\n' "$PROCFILE_BACKUP_CONTENT" > "$PROCFILE"   # restore for every test below (file re-created)
 echo 0 > "$PROCFILE"
 
+# ---- PR #2 follow-up review (Codex): "Handle absent huge-page support before requiring boot ID" - BOTH
+#      vm.nr_hugepages AND boot_id absent at once (a minimal kernel or restricted container plausibly lacks
+#      both). The absent-hugetlbfs case must be checked and take effect BEFORE the boot_id requirement, not
+#      after - checking boot_id first would have wrongly refused rx on a host that was never at risk (no one
+#      can reserve anything there either way, so boot_id's own validity is irrelevant). Same assertions as the
+#      hugetlbfs-only case above: no record, dispatcher's own hugepages -rx skipped, engine still reached.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+PROCFILE_BACKUP_CONTENT2=$(cat "$PROCFILE" 2>/dev/null); rm -f "$PROCFILE"
+BOOTFILE_BACKUP2=$(cat "$BOOTFILE" 2>/dev/null); : > "$BOOTFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "does not exist (no hugetlbfs support" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "both baseline AND boot_id absent: hugetlbfs-absent case wins, no record, logged once"
+else
+	bad "both baseline AND boot_id absent: hugetlbfs-absent case wins, no record, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then
+	ok "both baseline AND boot_id absent: hugepages -rx called exactly ONCE (the engine's own) - rx still starts, never wrongly refused over boot_id"
+else
+	bad "both baseline AND boot_id absent: hugepages -rx called exactly once (engine's own)" "$(cat "$SYSCTL_LOG")"
+fi
+printf '%s\n' "$PROCFILE_BACKUP_CONTENT2" > "$PROCFILE"   # restore for every test below (file re-created)
+printf '%s\n' "$BOOTFILE_BACKUP2" > "$BOOTFILE"
+echo 0 > "$PROCFILE"
+
 # ---- Same class, but the file EXISTS and is readable - hugetlbfs IS present, so a later `hugepages -rx` WILL
 #      genuinely reserve pages - with its content not a plain number (simulates both "corrupt content" and the
 #      unreadable case, which this harness - possibly running as root - cannot reliably simulate via
