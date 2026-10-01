@@ -11,9 +11,11 @@ BLOX_HP_T0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}   # Round 5c: this poll'
 	# can be bounded to whatever remains of the SHARED ~3.0 s poll budget once the engine's own collection below
 	# has run - see h-common.sh's finalize_rx_hugepages_bounded. Round 5e: bash 5's own builtin EPOCHREALTIME
 	# (no fork), falling back to `date +%s.%N` only if unset (an older bash).
-# ONE absolute deadline for the WHOLE poll, computed at the true entry point - before manifest/config parsing,
-# engine selection, or anything else below, all of which count against the shared budget just as much as the
-# engine's own collection does. Exported so the engine h-stats.sh sourced below inherits this SAME value
+# This poll's own start, in integer microseconds - the anchor for the ONE absolute deadline for the WHOLE
+# poll, captured at the true entry point - before manifest/config parsing, engine selection, or anything else
+# below, all of which count against the shared budget just as much as the engine's own collection does.
+# $DEADLINE_US itself is exported further down, once $engine is known (see there for why the split is no
+# longer a flat 2.4 s for both engines) - the engine h-stats.sh sourced below inherits that exported value
 # (its own DEADLINE_US computation is only a fallback for when it is sourced standalone, e.g. by a test, with
 # no dispatcher entry point above it to have set this already).
 # Round 5f (Codex): EPOCHREALTIME's own fraction is always exactly 6 digits (real microseconds) already, but
@@ -24,7 +26,6 @@ BLOX_HP_T0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}   # Round 5c: this poll'
 BLOX_HP_T0_FRAC="${BLOX_HP_T0#*.}000000"
 BLOX_HP_T0_US="${BLOX_HP_T0%%.*}${BLOX_HP_T0_FRAC:0:6}"
 unset BLOX_HP_T0_FRAC
-export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))   # 2.4 s of the shared 3.0 s budget - matches both engines' BUDGET_US
 # A minimal, valid, engine-agnostic stats object - not an empty string - for the two failure points below.
 # Neither engine's own VER/algo is reliably known at this level (the manifest/config that would provide them
 # is exactly what failed to load), and this must not depend on jq (the failure could BE jq missing) - plain
@@ -37,6 +38,26 @@ fi
 export BLOX_DIR
 
 engine=$(engine_from_config) || { khs=0; stats="$DISPATCH_FALLBACK_STATS"; return 0 2>/dev/null || exit 0; }
+
+# ONE absolute deadline for the WHOLE poll, now that $engine is known - exported so the engine h-stats.sh
+# sourced below inherits this SAME value (its own DEADLINE_US computation is only a fallback for when it is
+# sourced standalone - see there). rx gets a SMALLER share of the shared 3.0 s total than verus (1.95 s vs
+# 2.4 s): unlike verus, rx runs a POST-collection step after its own h-stats.sh returns (huge-page ownership
+# finalization, below) that needs a guaranteed, generous slice of its own, not merely whatever happens to be
+# left over after the collector's own worst-case TERM-then-KILL escalation. 1.95 s was chosen so that even in
+# that worst case (TERM at 1.95 s, KILL_GRACE 0.3 s later if TERM is ignored - see engines/rx/h-stats.sh's own
+# KILL_GRACE/BUDGET_US) the collector returns by T0+2.25 s, leaving finalize_rx_hugepages_bounded a guaranteed
+# 3.0 - 2.25 - 0.15 (its own RESERVE_US) = 0.6 s of real working time - comfortably above the ~0.2-0.27 s
+# finalize_rx_hugepages itself measures under full CPU saturation (one awk, one find, one curl, a few jq forks
+# - see tests/hive/test_hugepage_finalization.sh's timing-margin test). The OLD flat 2.4 s left only ~0.3 s in
+# that same worst case - 0.15 s of actual working time once RESERVE_US is subtracted, which a full-load repro
+# (tests/hive/test_rx_under_load.sh's own driver, see its PR description) measured finalizing in as few as
+# 3-4 of 30 attempts. verus has no analogous step and keeps the full 2.4 s unchanged.
+if [[ $engine == rx ]]; then
+	export DEADLINE_US=$(( BLOX_HP_T0_US + 1950000 ))
+else
+	export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))
+fi
 
 # shellcheck disable=SC1090   # $engine is one of exactly two known, fixed values (verus|rx), never external input
 . "$BLOX_DIR/engines/$engine/h-stats.sh"

@@ -91,4 +91,38 @@ elif [[ $engine == verus ]]; then
 fi
 
 export BLOX_DIR
+# PR #2 follow-up review (Codex) finding #2, applied here too ("check the dispatcher for the same exec-trap
+# assumption"): this file installs no EXIT trap of its own, but for rx it does not need one to have the SAME
+# leak - note_rx_hugepages_start just above already called `hugepages -rx` and wrote a final=0 ownership
+# record BEFORE this exec ever runs. engines/rx/h-run.sh's own EXIT trap (rollback_rx_hugepages_reservation)
+# only ever gets installed once THAT script itself starts running - if reaching it at all fails here (the
+# target missing, not executable, or some other wrong-architecture/corrupt-install reason exec(3) itself
+# rejects it), that trap never exists to catch anything, and without `execfail` a failed, non-interactive exec
+# also skips THIS shell's own cleanup entirely - the exact same mechanism documented in detail in engines/rx/
+# h-run.sh's own final exec (see there for the confirmed repro). The reservation note_rx_hugepages_start just
+# made would then be left permanently pinned with a record nothing is left running to ever finalize or roll
+# back. verus has no analogous risk: restore_verus_hugepages above only ever restores a PRIOR session's
+# already-finalized record, it does not reserve anything itself, so there is nothing fresh here to leak.
+shopt -s execfail
+# shellcheck disable=SC2093   # intentional: execfail above means a FAILED exec returns here instead of ending
+# the script (or, since this file may be sourced, the sourcing shell) - the explicit rollback/fail/return below
+# this exec is the whole point of this PR's own fix, not dead code shellcheck's own (execfail-unaware)
+# heuristic assumes it to be.
 exec "$BLOX_DIR/engines/$engine/h-run.sh"
+# Only ever reached if the exec above FAILED. A successful exec replaces this process outright and nothing
+# below this line ever runs - this mirrors engines/rx/h-run.sh's own final exec exactly, see there for why
+# `shopt -s execfail` is what makes this reachable at all for a non-interactive shell (also the only context
+# Hive ever runs or sources this file in).
+rc=$?
+shopt -u execfail   # this file documents itself as sourceable ("don't kill whatever sourced us") - a shell
+	# option set by `shopt` inside a sourced script would otherwise persist in the SOURCING shell even after
+	# the `return` below, which is exactly the kind of side effect beyond this one exec that contract forbids;
+	# unsetting it again here, now that the one exec it needed to cover has already happened, costs nothing.
+fail "BloxMiner: exec of $BLOX_DIR/engines/$engine/h-run.sh failed (rc=$rc) - missing, not executable, or not runnable (corrupt or wrong-architecture install?)"
+if [[ $engine == rx ]]; then
+	prior=$(_hp_field prior)
+	if [[ $prior =~ ^[0-9]+$ ]] && _hp_rollback_reservation "$prior" "rx could not be started at all (dispatcher's own exec into engines/rx/h-run.sh failed, rc=$rc)"; then
+		_hp_invalidate || log_hugepages_note "BloxMiner: rolled back vm.nr_hugepages to $prior but could not remove the now-consumed ownership record ($HUGEPAGES_FILE) - a later rx start's own invalidation will clear it before reserving again"
+	fi
+fi
+return 1 2>/dev/null || exit 1

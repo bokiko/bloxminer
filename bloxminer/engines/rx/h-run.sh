@@ -16,8 +16,8 @@ cd "${BLOX_DIR:-/hive/miners/custom/bloxminer}" || exit 1   # BLOX_DIR: tests on
 # reads the same small, stable key=value record format directly instead. That on-disk shape is a stable
 # contract between the two (five decades-old key=value lines), not logic that can drift the way a CPU flag
 # comparison could - every field name/semantics below matches h-common.sh's own _hp_field reader exactly.
-rollback_rx_hugepages_reservation() {
-	local rc=$?
+rollback_rx_hugepages_reservation() {   # $1, if given, overrides $? - see the final exec's own explicit call
+	local rc=${1:-$?}
 	(( rc == 0 )) && return 0   # only ever rolls back a FAILING start - a successful `exec` below replaces
 		# this process outright and this trap never runs at all in that case
 	local statedir=${BLOX_STATE_DIR:-}
@@ -112,7 +112,41 @@ fi
 # log file (config "log-file" = $CUSTOM_LOG_BASENAME.log) is append-only - XMRig itself never rotates it; the
 # size bound comes from Hive's own start-time gzip rotation plus its 15-minute `logtruncateall` cron (20 MB).
 # exec: Hive supervises the miner process itself and gets its exit status. On SUCCESS this replaces the
-# process image outright, so rollback_rx_hugepages_reservation's own EXIT trap above never runs; on the rare
-# remaining FAILURE mode (exec itself fails for a reason the executability check above did not catch, e.g. a
-# corrupt binary format) it does, for one more chance to roll back cleanly.
+# process image outright, so rollback_rx_hugepages_reservation's own EXIT trap above never runs at all.
+# PR #2 follow-up review (Codex) finding #2: the OLD comment here claimed a FAILED exec still ran the EXIT
+# trap "for one more chance to roll back cleanly" - that was simply wrong, and the exact same mechanism the
+# comment on the executability check above already documents correctly: a bash `exec` that fails to run its
+# target (non-interactively) replaces/terminates this process WITHOUT ever running an EXIT trap, confirmed the
+# same way (`trap 'echo ran' EXIT; : > bad; chmod +x bad; exec ./bad` never prints "ran" - `bad` is executable
+# but not a valid binary, the one failure mode the `-x` check above cannot catch: a present, executable, but
+# corrupt or wrong-architecture xmrig). Without a fix, that single remaining failure mode left the huge-page
+# reservation above permanently pinned with no path to release it - rollback_rx_hugepages_reservation existing
+# at all does not help if nothing ever calls it.
+# `shopt -s execfail` changes bash's own behaviour for exactly this one case: instead of exiting outright, a
+# failed exec simply returns control to this script (this is already bash's default for an INTERACTIVE shell,
+# which is why manual testing never caught this - only a non-interactive one, exactly how Hive runs this file,
+# needs the shopt). That makes the explicit rollback call and non-zero exit below reachable; without it,
+# neither would ever run for this failure mode, the same way the trap wouldn't.
+shopt -s execfail
+# shellcheck disable=SC2093   # intentional: execfail above means a FAILED exec returns here instead of ending
+# the script - the explicit rc/rollback/exit below this exec is the whole point of this PR's own fix, not dead
+# code shellcheck's own (execfail-unaware) heuristic assumes it to be.
 exec ./xmrig -c "$CUSTOM_CONFIG_FILENAME"
+# Only ever reached if the exec above FAILED (execfail turned what would otherwise be an immediate,
+# trap-skipping process exit into an ordinary return here) - a successful exec replaces this process outright
+# and nothing below this line ever runs. $? is the exec's own failure status (e.g. 126 - "cannot execute"),
+# captured immediately, before any other command can overwrite it.
+rc=$?
+msg="BloxMiner: exec of $PWD/xmrig failed (rc=$rc) - present and executable but not runnable (corrupt or wrong-architecture binary?)"
+echo "$msg" | tee -a "$CUSTOM_LOG_BASENAME.log"
+message error "$msg" 2>/dev/null
+# Explicitly invoke the SAME rollback logic the EXIT trap above runs - passing $rc directly rather than
+# relying on whatever `$?` happens to be by the time this call executes (the echo/tee/message calls above
+# would otherwise have already overwritten it with their own, unrelated exit statuses). The trap itself is
+# cleared first so it cannot ALSO fire a second time, redundantly, on the `exit` below (rollback is already
+# written to be safe to call more than once - a second call would just see its own first call's own cleanup
+# already done and no-op - but there is no reason to rely on that when a single, explicit call already covers
+# this exact, anticipated failure path).
+trap - EXIT
+rollback_rx_hugepages_reservation "$rc"
+exit "$rc"
