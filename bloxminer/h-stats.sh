@@ -41,19 +41,27 @@ engine=$(engine_from_config) || { khs=0; stats="$DISPATCH_FALLBACK_STATS"; retur
 
 # ONE absolute deadline for the WHOLE poll, now that $engine is known - exported so the engine h-stats.sh
 # sourced below inherits this SAME value (its own DEADLINE_US computation is only a fallback for when it is
-# sourced standalone - see there). rx gets a SMALLER share of the shared 3.0 s total than verus (1.95 s vs
-# 2.4 s): unlike verus, rx runs a POST-collection step after its own h-stats.sh returns (huge-page ownership
-# finalization, below) that needs a guaranteed, generous slice of its own, not merely whatever happens to be
-# left over after the collector's own worst-case TERM-then-KILL escalation. 1.95 s was chosen so that even in
-# that worst case (TERM at 1.95 s, KILL_GRACE 0.3 s later if TERM is ignored - see engines/rx/h-stats.sh's own
-# KILL_GRACE/BUDGET_US) the collector returns by T0+2.25 s, leaving finalize_rx_hugepages_bounded a guaranteed
-# 3.0 - 2.25 - 0.15 (its own RESERVE_US) = 0.6 s of real working time - comfortably above the ~0.2-0.27 s
-# finalize_rx_hugepages itself measures under full CPU saturation (one awk, one find, one curl, a few jq forks
-# - see tests/hive/test_hugepage_finalization.sh's timing-margin test). The OLD flat 2.4 s left only ~0.3 s in
-# that same worst case - 0.15 s of actual working time once RESERVE_US is subtracted, which a full-load repro
-# (tests/hive/test_rx_under_load.sh's own driver, see its PR description) measured finalizing in as few as
-# 3-4 of 30 attempts. verus has no analogous step and keeps the full 2.4 s unchanged.
-if [[ $engine == rx ]]; then
+# sourced standalone - see there, and note that fallback is a flat 2.4 s unconditionally: finalize_rx_hugepages_
+# bounded is only ever called from THIS dispatcher, below, never reachable from a standalone invocation, so
+# there is nothing there to reserve a share for).
+# PR #2 follow-up review (Codex) finding #1, round 2: "Fix it without losing either property" - a flat, always-
+# smaller rx share (the first fix for finding #1) traded one regression for another. finalize_rx_hugepages_
+# bounded only ever needs a real slice of its own WHILE the huge-page ownership record is still unfinalized
+# (final=0) - typically a handful of polls right after an rx start, never again once it succeeds (finalize_rx_
+# hugepages's own very first check is `final == 0 || return 0`, essentially free once that flips). Cutting the
+# collector's share EVERY poll, forever, cost it the one thing a full 2.4 s collector run earns under genuine
+# contention: per-core enrichment (Phase B's /2/backends + bloxsense pass) staying inside budget - this PR's
+# own repro (tests/hive/test_rx_under_load.sh's case 1) measured 16 rows degrading to 1 under a lower-core-
+# count host (fewer cores means the SAME fork/exec work is relatively more expensive, so Phase B needed more of
+# the collector's own 2.4 s, not less, under that load shape). Reserving the smaller share ONLY while
+# un-finalized keeps the fix scoped to exactly the polls that need it: rx gets 1.95 s (collector worst case
+# 2.25 s, leaving finalize_rx_hugepages_bounded a guaranteed 0.6 s - comfortably above the ~0.2-0.27 s it
+# measures needing under full CPU saturation: one awk, one find, one curl, a few jq forks) ONLY when a
+# hugepages record exists and is still final=0; the FULL 2.4 s (same as verus, same as before finding #1 was
+# ever raised) the moment it is finalized, or when no record exists at all (no hugetlbfs on this host - rx
+# runs untracked, finalize_rx_hugepages's own first check, `-e $HUGEPAGES_FILE`, is then instantly false, no
+# forks, so there is nothing to protect a share for either). verus has no analogous step and always gets 2.4 s.
+if [[ $engine == rx && -e $HUGEPAGES_FILE ]] && [[ $(_hp_field final) == 0 ]]; then
 	export DEADLINE_US=$(( BLOX_HP_T0_US + 1950000 ))
 else
 	export DEADLINE_US=$(( BLOX_HP_T0_US + 2400000 ))

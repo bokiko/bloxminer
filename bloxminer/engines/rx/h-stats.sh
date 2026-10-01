@@ -32,7 +32,7 @@
 # previously cost a real rig a hard fallback (~870 fds, all 32 threads mining, budget blown mid-scan under that
 # fork load; an idle dev box never showed it).
 # That child runs via `setsid`, its own dedicated session/process group, with an explicit TERM-then-KILL
-# escalation below targeting that whole group (SIGTERM at 1.95 s, SIGKILL at 2.25 s if that is ignored -
+# escalation below targeting that whole group (SIGTERM at 2.4 s, SIGKILL at 2.7 s if that is ignored -
 # unmaskable, so nothing outlives it) - plain `timeout` was tried first and found NOT reliable here: when the
 # collection nests its own `timeout` call for bloxsense, GNU timeout's own signal only ever reaches its direct
 # child, not that nested timeout's descendants, so a bloxsense (or curl) that ignores SIGTERM could survive as
@@ -88,10 +88,15 @@ if [[ -z ${DEADLINE_US:-} ]]; then
 	# `date +%s.%N` fallback's is 9; padding then truncating handles either, no fork).
 	__t_frac="${__t#*.}000000"
 	__t_us="${__t%%.*}${__t_frac:0:6}"
-	DEADLINE_US=$(( __t_us + 1950000 ))   # 1.95 s, not the 2.4 s verus/h-stats.sh uses - see the dispatcher's
-		# own h-stats.sh (where this is normally inherited from) for why rx alone needs a smaller collector
-		# share: the remaining 1.05 s of the 3.0 s total has to cover both this engine's own KILL_GRACE escalation
-		# AND leave finalize_rx_hugepages_bounded a guaranteed working slice afterward.
+	DEADLINE_US=$(( __t_us + 2400000 ))   # PR #2 follow-up review (Codex) finding #1, round 2: this fallback
+		# path is ONLY ever taken when this file is sourced standalone, with no dispatcher above it - and
+		# finalize_rx_hugepages_bounded (the thing a smaller share would protect) is only ever called from the
+		# dispatcher's own h-stats.sh, never reachable here, so there is nothing to reserve a share for. The
+		# dispatcher itself now only shrinks rx's share while a huge-page ownership record exists and is still
+		# unfinalized (see its own h-stats.sh) - a flat, always-smaller fallback here would just cost every
+		# standalone/test invocation its per-core enrichment headroom for no benefit, which is exactly the
+		# regression this round's own repro (tests/hive/test_rx_under_load.sh's case 1, run standalone, no
+		# dispatcher) caught.
 	unset __t __t_frac __t_us
 fi
 
@@ -618,15 +623,17 @@ LIBEOF
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"   # the parent also gets fallback()/note_state()/write_result() from here, for the LIB-creation-failure path
 
-BUDGET_US=1950000   # of the shared 3.0 s deadline - integer microseconds, kept in sync with $DEADLINE_US above
-                    # (exported for the child's own env, same as before; not itself read by remaining_us/
-                    # have_budget_us, which both work directly off $DEADLINE_US) - rx's own share, smaller than
-                    # verus's 2.4 s, so finalize_rx_hugepages_bounded is guaranteed a real slice afterward; see
-                    # the dispatcher's own h-stats.sh for the full derivation of this number.
-KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.25 s, leaving 0.75 s
-                    # of slack for this wrapper (and finalize_rx_hugepages_bounded afterward), so the whole run
-                    # stays under 3.0 s even in the worst case (SIGTERM ignored, waits out the full grace
-                    # period, then an unmaskable SIGKILL).
+BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for the forkless budget arithmetic
+                    # both this parent and the child (run(), via remaining_us) derive every timer from
+KILL_GRACE=0.3      # extra time after SIGTERM before SIGKILL - bounds the hard kill at 2.7 s, leaving 0.3 s of
+                    # slack for this wrapper, so the whole run stays under 3.0 s even in the worst case
+                    # (SIGTERM ignored, waits out the full grace period, then an unmaskable SIGKILL).
+                    # PR #2 follow-up review (Codex) finding #1, round 2: this is a NOMINAL value only - the
+                    # dispatcher's own h-stats.sh may export a smaller real $DEADLINE_US (1.95 s instead of
+                    # 2.4 s) while a huge-page ownership record is still unfinalized, which this constant does
+                    # not reflect (it is exported to the child's env but, like before, not itself read by
+                    # remaining_us/have_budget_us - both work directly off $DEADLINE_US, the one value that
+                    # actually governs timing either way). See the dispatcher's own h-stats.sh for why.
 # $DEADLINE_US itself was already computed at the very top of this file (inherited from the dispatcher, or a
 # standalone fallback) - not re-derived here, which would silently grant back whatever the manifest/PORT/LIB
 # setup above already spent.

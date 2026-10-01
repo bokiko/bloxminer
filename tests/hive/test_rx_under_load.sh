@@ -406,9 +406,10 @@ fi
 
 # ================================================================== case 4: PR #2 follow-up review (Codex)
 # finding #1 - "Reserve time for huge-page finalization". Case 3 above saturates all CPUs, but its fake
-# collector work is cheap enough to finish in a fraction of a second regardless - it never comes close to the
-# rx engine's own 1.95 s/2.25 s TERM-then-KILL deadline, so finalize_rx_hugepages_bounded always gets its full
-# nominal share there, poll 1 onward, on every commit tested (this PR's own reproduction: identical on
+# collector work is cheap enough to finish in a fraction of a second regardless - it never comes close to
+# EITHER of the rx engine's own TERM-then-KILL deadlines (1.95 s/2.25 s while unfinalized, 2.4 s/2.7 s once
+# finalized or untracked - see the dispatcher's own h-stats.sh), so finalize_rx_hugepages_bounded always gets
+# its full nominal share there, poll 1 onward, on every commit tested (this PR's own reproduction: identical on
 # a811b8d, before the fork-free deadline rewrite, and a769ed7, after it - NOT a regression from either). The
 # bot's actual concern was the collector's own WORST case: when it is still genuinely running at its own
 # deadline and has to be TERM'd then (if that is ignored) KILL'd, finalize only ever gets whatever is left of
@@ -421,11 +422,16 @@ fi
 # collector can never finish on its own; it is killed at the deadline, every single poll, with no exception.
 # A direct, isolated repro of finalize_rx_hugepages_bounded alone (this PR's own description) found it reached
 # final=1 in as few as 3-4 of 30 attempts when the worst-case margin was the OLD flat 300 ms (2.4 s collector +
-# 0.3 s KILL_GRACE out of 3.0 s) - this case reproduces the SAME ~15% rate (3/20) end to end on a769ed7, and
-# the fix (collector share cut to 1.95 s, worst case 2.25 s, leaving 0.75 s - bloxminer/h-stats.sh and
-# engines/rx/h-stats.sh) reaches 20/20 under the identical conditions. The record is reset to final=0 before
-# EVERY poll (N independent "first attempts", not one record carried across polls that only has to succeed
-# once) - a weaker "reaches final=1 at least once within N polls" assertion would not reliably fail on the OLD
+# 0.3 s KILL_GRACE out of 3.0 s) - this case reproduces the SAME ~15% rate (3-4/20) end to end on a769ed7, and
+# the fix (bloxminer/h-stats.sh: rx's collector share drops to 1.95 s, worst case 2.25 s, leaving 0.75 s - ONLY
+# while a huge-page record exists and is still unfinalized, which is every poll in THIS case, since the record
+# is deliberately reset below; the collector keeps its full, unchanged 2.4 s the moment a record finalizes or
+# when none exists at all, so this reduced share never costs a real session's per-core enrichment beyond its
+# first few, pre-finalization polls - see the dispatcher's own h-stats.sh for the full rationale, including the
+# round-2 regression this exact distinction fixes) reaches 20/20 under the identical conditions. The record is
+# reset to final=0 before EVERY poll (N independent "first attempts", not one record carried across polls that
+# only has to succeed once) - a weaker "reaches final=1 at least once within N polls" assertion would not
+# reliably fail on the OLD
 # code at a reasonable N (even a genuinely ~15%-per-attempt process succeeds at least once within, say, 10
 # tries roughly 75% of the time - not a dependable regression signal).
 PROC4="$T/proc4"; mkdir -p "$PROC4/sys/vm" "$PROC4/sys/kernel/random" "$PROC4/net"

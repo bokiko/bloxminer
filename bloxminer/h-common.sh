@@ -979,9 +979,12 @@ _hp_wait() {
 # this parameter used to be (PR #2 follow-up review, Codex - see ROUND 5f below)> - the ONLY way the
 # top-level h-stats.sh ever calls finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no
 # deadline of its own - it runs AFTER the rx engine's own h-stats.sh, which already spends up to its own
-# ~1.95-2.25 s budget under load (the dispatcher's own h-stats.sh deliberately gives rx a smaller share than
-# verus's 2.4 s, specifically so this function is guaranteed a real slice afterward - see there), so without a
-# bound here finalize's own work (a /proc/net/tcp scan, a curl call, a /proc/<pid>/smaps_rollup read) could
+# ~2.4-2.7 s budget under load in the common case (already finalized, or no huge-page record at all), or
+# ~1.95-2.25 s while a record exists and is still unfinalized - the dispatcher's own h-stats.sh deliberately
+# gives rx a smaller share than verus's 2.4 s for exactly those first few polls, so this function is guaranteed
+# a real slice to do its one-time verification work, without costing every later poll's per-core enrichment
+# headroom once it succeeds (see there for the full rationale and this round's own repro). Either way, without
+# a bound here finalize's own work (a /proc/net/tcp scan, a curl call, a /proc/<pid>/smaps_rollup read) could
 # push the WHOLE poll past whatever deadline Hive's watchdog enforces.
 # <deadline> is an ABSOLUTE point in time (h-stats.sh's own start time + its total poll budget, computed ONCE
 # at h-stats.sh's own entry - see there) - ROUND 5e (Codex) changed this from a "seconds remaining" SNAPSHOT to
