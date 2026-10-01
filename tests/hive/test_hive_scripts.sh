@@ -188,12 +188,19 @@ fi
 # BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL, deterministically the same way on every host: a real positive
 # result is written first, then a forced-failing write_result call must leave that exact result standing.
 D_DEBUG="$T/write_result_debug.log"; : > "$D_DEBUG"
+# $OUTFILE is pointed at a directory THIS test owns and keeps alive for its own duration, not the one the
+# `. h-stats.sh` sourcing below sets up internally: that one lives under its own per-poll $WORKDIR, which the
+# poll's own cleanup removes (rm -rf) by the time sourcing returns - a later call to write_result() reusing
+# that (by then nonexistent) path would silently fail to write anywhere at all, not exercise the guard this
+# case means to test.
+mkdir -p "$T/wr_test"
 res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG" bash -c '. "$BLOX_DIR/h-stats.sh"
+	OUTFILE="$1/out"
 	write_result "11900.00" "a prior positive result"
 	before=$(cat "$OUTFILE" 2>/dev/null)
 	BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL=1 write_result "0" "should never reach OUTFILE"
 	after=$(cat "$OUTFILE" 2>/dev/null)
-	jq -nc --arg b "$before" --arg a "$after" "{before: \$b, after: \$a}"' 2>&1)
+	jq -nc --arg b "$before" --arg a "$after" "{before: \$b, after: \$a}"' _ "$T/wr_test" 2>&1)
 if [[ $(jq -r '.before == .after and (.after | contains("a prior positive result"))' <<< "$res" 2>/dev/null) == true ]] \
 	&& grep -q "write_result: REFUSED" "$D_DEBUG"
 then
@@ -431,22 +438,15 @@ else
 	bad "repeated escalation-path polls: at most one transient zombie between polls, never accumulating" "res=$res"
 fi
 
-# ---- P2: a PARTIAL mktemp failure (OUTFILE succeeds, HANDSHAKE fails - e.g. /tmp runs out of inodes/quota
-# between the two calls) used to leak whichever ONE actually got created: mktemp creates the file immediately,
-# not just a name, and the old `else` branch only set result="" without removing it. This file is sourced
-# repeatedly by Hive's own long-lived agent, so a leak like that compounds every poll, worsening the exact
-# exhaustion that caused it. A PATH stub for `mktemp` forces exactly that split: fails any call whose own
-# template names the HANDSHAKE file ("-hs."), forwards every other call (LIB, OUTFILE) to the real mktemp
-# unchanged - a template-based match, not call-ordinal counting, so it is correct regardless of how many other
-# mktemp calls (LIB) happen first in the same poll.
-REAL_MKTEMP=$(command -v mktemp)
+# ---- P2: a mktemp failure (e.g. /tmp runs out of inodes/quota) must still fall back honestly and leak
+# nothing. LIB/OUTFILE/HANDSHAKE now share ONE mktemp -d'd working directory (fixed names inside it) rather
+# than one mktemp call each - see that mktemp -d's own header - so there is no longer a "one of several calls
+# fails" split to engineer: a PATH stub that fails `mktemp` outright (any call, any args) exercises the single
+# remaining failure point directly, caught by the emergency-fallback block at the very top of the file.
 STUBBIN_MKTEMP="$T/stubbin-mktemp"; mkdir -p "$STUBBIN_MKTEMP"
-cat > "$STUBBIN_MKTEMP/mktemp" <<STUBEOF
+cat > "$STUBBIN_MKTEMP/mktemp" <<'STUBEOF'
 #!/usr/bin/env bash
-for a in "\$@"; do
-	case "\$a" in *-hs.*) exit 1 ;; esac
-done
-exec "$REAL_MKTEMP" "\$@"
+exit 1
 STUBEOF
 chmod +x "$STUBBIN_MKTEMP/mktemp"
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
@@ -455,20 +455,19 @@ jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/rep
 : > "$T/api.out"
 python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
-before_out=$(ls "${TMPDIR:-/tmp}"/bloxminer-hstats-out.* 2>/dev/null)
+before_wd=$(ls -d "${TMPDIR:-/tmp}"/bloxminer-hstats.* 2>/dev/null)
 # One line per value, not "khs=[..]|stats=[..]" on one line: $stats is itself JSON and can contain "]" - a
 # single-line greedy sed capture for khs would (and once did, caught while verifying this very test) grab up to
 # the LAST "]" in the whole line, swallowing part of $stats into what was supposed to be just the khs value.
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(PATH="$STUBBIN_MKTEMP:$PATH" timeout 10 bash -c '. "$BLOX_DIR/h-stats.sh"; printf "KHS=%s\nSTATS=%s\n" "$khs" "$stats"' 2>"$T/mktemp_fail_stderr.log")
-after_out=$(ls "${TMPDIR:-/tmp}"/bloxminer-hstats-out.* 2>/dev/null)
-leaked_out=$(comm -13 <(sort <<< "$before_out") <(sort <<< "$after_out") 2>/dev/null)
+after_wd=$(ls -d "${TMPDIR:-/tmp}"/bloxminer-hstats.* 2>/dev/null)
+leaked_wd=$(comm -13 <(sort <<< "$before_wd") <(sort <<< "$after_wd") 2>/dev/null)
 khs_got=$(sed -n 's/^KHS=//p' <<< "$res")
-if [[ $khs_got == "0" ]] && [[ -z $leaked_out ]]; then
-	ok "partial mktemp failure (OUTFILE ok, HANDSHAKE fails): honest fallback, no leaked OUTFILE temp file"
+if [[ $khs_got == "0" ]] && [[ -z $leaked_wd ]]; then
+	ok "mktemp -d failure: honest fallback, no leaked working directory"
 else
-	bad "partial mktemp failure (OUTFILE ok, HANDSHAKE fails): honest fallback, no leaked OUTFILE temp file" \
-		"res=$res leaked=[$leaked_out]"
+	bad "mktemp -d failure: honest fallback, no leaked working directory" "res=$res leaked=[$leaked_wd]"
 fi
 
 # ---- P1: the MANDATORY `summary` call used to be capped at a flat 600 ms, same as the OPTIONAL `cores` call -
@@ -516,18 +515,32 @@ else
 	bad "summary never answers (10s, past the whole budget): bounded, honest 0, no hang" "elapsed=${elapsed}s res=$res"
 fi
 
-# ---- P1: with `summary` answering late (1.8-1.9 s) under GENUINE single-CPU saturation (not just this file's
-# own serial test harness), Phase A's own fast publish (write_result_fast(), gated by RESERVE_US - see both of
-# their own headers) must still land well inside budget on every poll, not just when the host happens to be
-# idle. Serializes against tests/hive/test_under_load.sh's own CPU-saturating cases via the SAME shared lock
-# file (see that test's own header for the full rationale) - this case saturates a real CPU too.
+# ---- P1: a summary that answers within D seconds of being REQUESTED (not of poll entry) must always be
+# published, even under GENUINE single-CPU saturation (not just this file's own serial test harness). An
+# earlier version of this case used a flat 1.85 s and failed 20/20 on GitHub's own 2-4 vCPU runners (and the
+# bot's 3-CPU review environment) even though it passed cleanly on ai02: 1.85 s was picked without accounting
+# for PARENT-side start-up (manifest parse, mktemp, setsid launch, handshake) ALSO running on a saturated CPU,
+# BEFORE the summary request is even sent - on a slower/more contended runner that start-up alone can approach
+# or exceed what was left of the budget after a 1.85 s delay, with no reserve value able to fix a delay chosen
+# without that in mind.
+#
+# D is derived from a real measurement, not guessed: BLOX_HSTATS_DEBUG_LOG timestamps bracketing poll entry to
+# the summary request being sent, 20 polls, taskset to ONE CPU with 2 competing busy loops (the same
+# saturation this case itself applies) - max 60.5 ms on ai02 (avg 58.3 ms), AFTER also cutting that start-up
+# cost itself (one mktemp -d instead of three separate mktemp calls; the heredoc written via a builtin `read`+
+# `printf` instead of forking `cat`; the parent's and the child's own pgid read from /proc/self/stat via a
+# builtin `read` instead of forking `ps`+`tr` - see h-stats.sh's own WORKDIR/pgid comments). Doubled for an
+# honest worst case on a slower 2-4 vCPU CI runner (~120 ms), D = 2.4 s budget - 0.12 s start-up margin -
+# 0.15 s RESERVE_US - 0.1 s extra margin = ~2.0 s; used as-is here. (Before the start-up cuts, the same
+# measurement was ~199 ms avg/205 ms max on ai02 - the 1.85 s this case used to test was already inside the
+# OLD start-up-unaware margin's danger zone, which is exactly how it passed on ai02 but not on a slower runner.)
 HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
 if [[ $HAVE_TASKSET == 1 ]]; then
 	exec 8>"${TMPDIR:-/tmp}/bloxminer-load-test.lock"
 	if flock -w 300 8; then
 		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 		PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
-		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 1.85 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 2.0 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
 		: > "$T/api.out"
 		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
@@ -547,18 +560,51 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		done
 		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done
 		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
-		flock -u 8
 		if [[ $n_zero == 0 && $n_over_cap == 0 ]]; then
-			ok "summary answers late (1.85s) under genuine single-CPU saturation, $i polls: no false zero, within hard cap"
+			ok "summary answers within D=2.0s under genuine single-CPU saturation, $i polls: no false zero, within hard cap"
 		else
-			bad "summary answers late (1.85s) under genuine single-CPU saturation, $i polls: no false zero, within hard cap" \
+			bad "summary answers within D=2.0s under genuine single-CPU saturation, $i polls: no false zero, within hard cap" \
 				"n_zero=$n_zero n_over_cap=$n_over_cap"
+		fi
+
+		# ---- the SAME genuine single-CPU saturation, but summary answers PAST the remaining budget (2.3 s -
+		# D's own 2.0 s plus margin, still well short of the full 2.4 s budget) - this must still be BOUNDED with
+		# an honest 0, never a hang: api()'s own cap_us() against the freshly-recomputed remaining_us is what
+		# protects this regardless of what D above is tuned to.
+		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+		PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 2.3 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+		: > "$T/api.out"
+		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+		SAT_PIDS=()
+		for _ in 1 2; do taskset -c 0 sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
+		sleep 0.3
+		n_zero_ok=0; n_hardfail=0; i=0
+		for i in $(seq 1 10); do
+			t0=$(date +%s.%N)
+			# shellcheck disable=SC2016   # expanded by the inner bash, not here
+			res=$(timeout 8 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
+			t1=$(date +%s.%N)
+			elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+			khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+			[[ $khs_got == "0" ]] && n_zero_ok=$((n_zero_ok+1))
+			awk -v e="$elapsed" 'BEGIN{exit !(e > 4.0)}' && { n_hardfail=$((n_hardfail+1)); echo "  poll $i: OVER HARD CAP (${elapsed}s)"; }
+		done
+		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done
+		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
+		flock -u 8
+		if [[ $n_zero_ok == "$i" && $n_hardfail == 0 ]]; then
+			ok "summary answers past the budget (2.3s) under genuine single-CPU saturation, $i polls: bounded, honest 0, no hang"
+		else
+			bad "summary answers past the budget (2.3s) under genuine single-CPU saturation, $i polls: bounded, honest 0, no hang" \
+				"n_zero_ok=$n_zero_ok/$i n_hardfail=$n_hardfail"
 		fi
 	else
 		echo "SKIP: could not acquire the shared load-test lock within 300s (stuck holder?)"
 	fi
 else
-	echo "SKIP: taskset not available - saturated-CPU timing case skipped"
+	echo "SKIP: taskset not available - saturated-CPU timing cases skipped"
 fi
 
 # ---- SECURITY: bash arithmetic contexts ($(( )), (( )), array subscripts, -eq/-lt/-gt/...) recursively

@@ -81,12 +81,28 @@ export VPORT CUSTOM_VERSION CUSTOM_CONFIG_FILENAME
 dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s h-stats[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
 export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
 
-LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-lib.XXXXXX") || {
-	dbg "LIB mktemp FAILED - emergency fallback"
+# ONE mktemp call for the whole poll's working directory (LIB here, OUTFILE/HANDSHAKE further below reuse the
+# SAME directory under fixed names) - not three separate mktemp calls, each forking the external `mktemp`
+# binary. Fixed names inside are safe: the directory itself gets a fresh, unpredictable name and mode 0700
+# (mktemp -d's own default) EVERY poll, never reused across polls, so there is nothing for a fixed name within
+# it to collide with or be raced for. Startup cost under saturation matters here specifically: see RESERVE_US's
+# own header and the test this change is paired with for the measurement that motivated it.
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/bloxminer-hstats.XXXXXX") || {
+	dbg "WORKDIR mktemp FAILED - emergency fallback"
 	khs=0; stats=""
 	return 0 2>/dev/null || exit 0
 }
-cat > "$LIB" <<'LIBEOF'
+LIB="$WORKDIR/lib"
+# Writes the heredoc directly into $LIB with a bash BUILTIN (`read` then `printf`), not `cat > "$LIB" <<EOF` -
+# `cat` is an external command (not a bash builtin), i.e. another fork on top of the mktemp one just avoided.
+# `IFS= read -r -d ''` reads the WHOLE heredoc into one variable with no process involved: `-d ''` stops only
+# at a NUL byte (none appear in this file, so it reads to EOF - its own non-zero exit status in that case is
+# expected and deliberately ignored via the trailing `|| :`); `IFS=` disables read's own default leading/
+# trailing-whitespace trimming, which would otherwise be free to eat indentation/blank lines at either end of
+# the captured text. `printf '%s'` (a bash builtin too) then writes it out byte-for-byte, exactly as `cat`
+# would have - the heredoc delimiter stays quoted ('LIBEOF'), so no variable expansion happens inside it either
+# way, from read or from printf.
+IFS= read -r -d '' LIBSRC <<'LIBEOF' || :
 # Budget arithmetic below is pure bash - NO FORK AT ALL (was `date` + `awk` on every single check).
 dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s h-stats[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }   # see the parent's own copy of this function for the full rationale
 
@@ -486,6 +502,8 @@ run() {
 	fi   # else: final stats composition failed - Phase A's already-written result stands, untouched
 }
 LIBEOF
+printf '%s' "$LIBSRC" > "$LIB"
+unset LIBSRC
 
 # shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
 . "$LIB"
@@ -499,21 +517,34 @@ KILL_GRACE=0.3
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at least once after Phase A and
 # again after Phase B if that also completes - never captured from the child's stdout (a single final print is
 # not used): a kill mid-Phase-B must never erase Phase A's already-written, honest answer.
-# Initialised empty FIRST, unconditionally, before either mktemp is even attempted - this file is sourced
-# repeatedly by Hive's own long-lived agent shell, and these are plain globals, so a stale non-empty path left
-# over from a PREVIOUS poll could otherwise be mistaken for this poll's own temp file below (and `rm -f`'d, or
-# worse, trusted) if either of the two mktemp calls here were ever skipped or reordered in the future.
+# Initialised empty FIRST, unconditionally, before either is even assigned - this file is sourced repeatedly by
+# Hive's own long-lived agent shell, and these are plain globals, so a stale non-empty path left over from a
+# PREVIOUS poll could otherwise be mistaken for this poll's own temp file below (and `rm -f`'d, or worse,
+# trusted) if either assignment were ever skipped or reordered in the future.
+# Fixed names inside the SAME $WORKDIR the LIB heredoc already created above (see that mktemp call's own
+# header for the full rationale: one mktemp -d for the whole poll, not a separate mktemp per file) - no mktemp
+# call of their own, so a PARTIAL failure between two independent mktemp calls (one file created, the other
+# not) can no longer happen at all: either $WORKDIR itself exists, in which case both these paths are valid, or
+# it does not, in which case this whole poll already returned via the WORKDIR mktemp's own failure branch
+# above and never reaches this line.
 OUTFILE=""; HANDSHAKE=""
-OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-out.XXXXXX") || OUTFILE=""
-HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-hs.XXXXXX") || HANDSHAKE=""
-PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+OUTFILE="$WORKDIR/out"
+HANDSHAKE="$WORKDIR/hs"
+# Fork-free pgid read: /proc/self/stat's 5th whitespace-separated field (pid, (comm), state, ppid, PGRP, ...) -
+# a bash builtin `read` against it, no `ps`/`tr` fork pair. Relies on this process's own comm never containing
+# a space (always "bash" here, never attacker-influenced), which a general-purpose parser of ANY process's
+# /proc/<pid>/stat could not assume, but is exactly true for our own always-known command name.
+read -r _ _ _ _ PARENT_PGID _ < /proc/self/stat 2>/dev/null
 export OUTFILE
 
 if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
-	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
+	# shellcheck disable=SC2016   # $1/$2 and the field vars below are the child bash's own, not this shell's
 	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
 		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
-		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
+		# Fork-free pgid read (/proc/self/stat - see the parent own copy of this exact technique, just above,
+		# for the full rationale) directly into a bash builtin printf, no $(...) subshell or ps/tr fork pair.
+		g=""; read -r _ _ _ _ g _ < /proc/self/stat 2>/dev/null
+		printf "%s" "$g" > "$2" 2>/dev/null
 		. "$1"
 		run
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
@@ -585,7 +616,6 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# trailing `wait "$CPID"` anywhere before the khs/stats extraction below would still let it stall the whole
 	# poll.
 	result=$(cat "$OUTFILE" 2>/dev/null)
-	rm -f "$OUTFILE" "$HANDSHAKE"
 	# No explicit `wait "$CPID"` at all, deliberately: SIGKILL has already terminated $CPID by this point
 	# (unblockable, immediate, regardless of this shell's own scheduling) - a trailing `wait` here would only be
 	# REAPING it (clearing the zombie), a bookkeeping step with no bearing on the answer already captured above,
@@ -602,17 +632,17 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# itself (BUDGET_US/KILL_GRACE) is unchanged; this was a reap ordering/boundedness bug, not a budget sizing
 	# one.
 else
-	# One of the two mktemp calls above can succeed even though the OTHER fails (e.g. /tmp runs out of
-	# inodes/quota between the two) - mktemp creates the file immediately, it does not just reserve a name, so
-	# a partial failure here would otherwise leak whichever ONE succeeded forever: this file is sourced
-	# repeatedly by Hive's own long-lived agent, so a leak like that compounds every single poll, directly
-	# worsening the exact exhaustion that caused it. `rm -f` on an empty string or an already-absent path is a
-	# safe no-op, so this is correct whether neither, either, or (impossible here, but handled identically)
-	# both ever got created.
-	rm -f "$OUTFILE" "$HANDSHAKE"
+	# OUTFILE/HANDSHAKE are now fixed names inside $WORKDIR (see that mktemp -d's own header) rather than each
+	# having its own separate mktemp call, so they can no longer independently succeed/fail - this branch is
+	# only reached when $WORKDIR itself was never created at all (its own mktemp -d failed, caught by the
+	# emergency-fallback block far above, which returns before this point is ever reached) - kept here as a
+	# defensive, always-safe fallback in case that invariant is ever broken by a future edit, not because this
+	# path is expected to be reachable today.
 	result=""
 fi
-rm -f "$LIB"
+# ONE cleanup for the whole poll's working directory (LIB/OUTFILE/HANDSHAKE all lived under it) - not a
+# separate rm per file. Safe even when $WORKDIR is empty (the mktemp -d failure path): `rm -rf ""` is a no-op.
+rm -rf "$WORKDIR"
 
 # Whatever $OUTFILE holds - Phase A's answer, or Phase B's richer one, or nothing at all if the child was
 # killed before Phase A even finished writing - is used as-is: no cache, no age bound, no re-verification,
