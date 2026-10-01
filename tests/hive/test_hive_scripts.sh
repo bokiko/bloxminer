@@ -322,12 +322,19 @@ jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/rep
 python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 t0=$(date +%s.%N)
+# Captures stdout ONLY (not 2>&1): with the unbounded reap removed (the fix under test), bash's OWN job
+# control reports the SIGKILLed child asynchronously - "... Killed ... setsid bash -c '...'" - on THIS bash -c
+# subshell's own stderr as it exits, since nothing here ever explicitly `wait`s for it (deliberately - see
+# h-stats.sh's own comment at that exact point). That notice is expected, harmless, and not something a real
+# Hive agent re-parses as data (it only ever reads $khs/$stats as plain bash variables in the same process) -
+# but mixing it into $res here (an earlier version of this test used 2>&1) corrupted the JSON this test itself
+# expects back. Kept on disk instead, for debugging only.
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 10 bash -c '
 	. "$BLOX_DIR/h-stats.sh"
 	children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
 	jq -nc --arg k "$khs" --arg s "$stats" --arg c "$children" "{khs: \$k, stats: \$s, children: \$c}"
-' 2>&1)
+' 2>"$T/sigterm_ignore_stderr.log")
 t1=$(date +%s.%N)
 elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 khs_got=$(jq -r '.khs // ""' <<< "$res" 2>/dev/null)
@@ -349,6 +356,9 @@ jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/rep
 : > "$T/api.out"
 python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# Stdout only, not 2>&1 - same reason as the single-poll case above (bash's own async "Killed" job-control
+# notice, once per poll that escalates here, would otherwise land on stderr mixed into $res and break the
+# plain-integer check below).
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 20 bash -c '
 	max=0
@@ -359,7 +369,7 @@ res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 20 bash -c '
 		(( n > max )) && max=$n
 	done
 	echo "$max"
-' 2>&1)
+' 2>"$T/sigterm_ignore_stderr2.log")
 if [[ $res =~ ^[0-9]+$ ]] && (( res <= 1 )); then
 	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (max=$res)"
 else
