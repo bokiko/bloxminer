@@ -153,12 +153,14 @@ BloxMiner options (in addition to the usual ccminer pool options):
 table every 60 s, so the HiveOS web **Miner log** stays readable:
 
 ```
-== BloxMiner 2.1.1 | 49.80 MH/s | A 32 R 0 | 136 W | 64 C | 365 kH/W | up 0h01m ==
+== BloxMiner 2.1.0 | 49.80 MH/s | A 32 R 0 | 136 W | 64 C | 365 kH/W | up 0h01m ==
  C00 3.11M   63C  C01 3.09M   63C  C02 3.12M   63C  C03 3.05M   63C  C04 3.12M   63C  C05 3.10M   63C
  C06 3.15M   63C  C07 3.11M   63C  C08 3.11M   63C  C09 3.11M   63C  C10 3.14M   63C  C11 3.10M   63C
  C12 3.11M   63C  C13 3.11M   63C  C14 3.13M   63C  C15 3.11M   63C
 ```
 (Ryzen 9 5950X on HiveOS, from the log file.)
+The miner screen and log show the engine's own version: 2.1.1 ships the unchanged 2.1.0 engine, so they read
+2.1.0, while HiveOS stats (`ver`) report the package version 2.1.1.
 
 For a **live stats header** in the HiveOS miner screen add `"dashboard": true` to Extra config. HiveOS's web
 *Miner log* is a tail of the raw screen recording, so with the header on it fills with screen redraws; the clean
@@ -167,7 +169,7 @@ Captured from a Ryzen 9 5900X (80 columns) a few seconds after start:
 
 ```
 +------------------------------------------------------------------------------+
-| BloxMiner 2.1.1  Ryzen 9 5900X  12C/24T                            up 0h00m  |
+| BloxMiner 2.1.0  Ryzen 9 5900X  12C/24T                            up 0h00m  |
 | Hashrate 32.83 MH/s   A 8  R 0   Diff 1.28e+07                               |
 | Power 89 W   Temp 45C   Eff 368 kH/W   Pool veruscoin.cedric-crispin.com:4024 |
 +------------------------------------------------------------------------------+
