@@ -286,12 +286,23 @@ res=$(timeout 20 bash -c '
 	# its own identity - a classic self-match, confirmed directly (pgrep -P $$ inside `$(...)` matched its own
 	# PID, with zero real children present per `ps --ppid`). /proc/$$/task/$$/children (Linux, direct children
 	# of $$) read via the `read` builtin never forks at all, so there is no reader process left for it to see.
-	children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
+	# Guarded with -r first: CONFIG_PROC_CHILDREN can be off, or this file can simply be absent in some
+	# containers - an unreadable path fails the REDIRECTION itself, not just `read`, and that error is NOT
+	# something "2>/dev/null" on the read command alone stops from reaching this whole bash -c''s own stderr
+	# (this case used to capture that merged in via 2>&1, corrupting every field below, not just this one -
+	# fixed below too). children_na=1 marks "could not determine" so the caller SKIPs only the child-count
+	# half of this assertion, never fails the whole case over an absent kernel feature.
+	children=""; children_na=0
+	if [[ -r /proc/$$/task/$$/children ]]; then
+		read -r children < /proc/$$/task/$$/children 2>/dev/null
+	else
+		children_na=1
+	fi
 	after_children=0; [[ -n $children ]] && after_children=$(wc -w <<< "$children")
 	jq -nc --arg a "$r1" --arg b "$r2" --arg c "$r3" --arg d "$r4" \
-		--arg bf "$before_fds" --arg af "$after_fds" --arg ac "$after_children" \
-		"{p1:\$a,p2:\$b,p3:\$c,p4:\$d,before_fds:(\$bf|tonumber),after_fds:(\$af|tonumber),after_children:(\$ac|tonumber)}"
-' 2>&1)
+		--arg bf "$before_fds" --arg af "$after_fds" --arg ac "$after_children" --argjson na "$children_na" \
+		"{p1:\$a,p2:\$b,p3:\$c,p4:\$d,before_fds:(\$bf|tonumber),after_fds:(\$af|tonumber),after_children:(\$ac|tonumber),children_na:\$na}"
+' 2>"$T/sourced_repeatedly_stderr.log")
 all_positive=true
 for key in p1 p2 p3 p4; do
 	k=$(jq -r --arg k "$key" '.[$k] // "" | split("|")[0]' <<< "$res" 2>/dev/null)
@@ -300,12 +311,16 @@ for key in p1 p2 p3 p4; do
 	[[ -n $s && $s == "{"*"}" ]] || all_positive=false
 done
 bf=$(jq -r '.before_fds // -1' <<< "$res" 2>/dev/null); af=$(jq -r '.after_fds // -1' <<< "$res" 2>/dev/null)
-ac=$(jq -r '.after_children // -1' <<< "$res" 2>/dev/null)
-if $all_positive && [[ $bf == "$af" ]] && [[ $ac == 0 ]]; then
-	ok "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd/child leak"
+ac=$(jq -r '.after_children // -1' <<< "$res" 2>/dev/null); na=$(jq -r '.children_na // 0' <<< "$res" 2>/dev/null)
+if $all_positive && [[ $bf == "$af" ]] && { [[ $na == 1 ]] || [[ $ac == 0 ]]; }; then
+	if [[ $na == 1 ]]; then
+		ok "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd leak (child-count check SKIPPED: /proc/\$\$/task/\$\$/children unavailable)"
+	else
+		ok "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd/child leak"
+	fi
 else
 	bad "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd/child leak" \
-		"res=$res before_fds=$bf after_fds=$af after_children=$ac"
+		"res=$res before_fds=$bf after_fds=$af after_children=$ac children_na=$na"
 fi
 
 # ---- unbounded-reap fix (ported from bloxminer-x commit 9a3778a, same bug): a SIGTERM-ignoring child, with a
@@ -332,18 +347,26 @@ t0=$(date +%s.%N)
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 10 bash -c '
 	. "$BLOX_DIR/h-stats.sh"
-	children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
-	jq -nc --arg k "$khs" --arg s "$stats" --arg c "$children" "{khs: \$k, stats: \$s, children: \$c}"
+	children=""; children_na=0
+	if [[ -r /proc/$$/task/$$/children ]]; then
+		read -r children < /proc/$$/task/$$/children 2>/dev/null
+	else
+		children_na=1
+	fi
+	jq -nc --arg k "$khs" --arg s "$stats" --arg c "$children" --argjson na "$children_na" \
+		"{khs: \$k, stats: \$s, children: \$c, children_na: \$na}"
 ' 2>"$T/sigterm_ignore_stderr.log")
 t1=$(date +%s.%N)
 elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 khs_got=$(jq -r '.khs // ""' <<< "$res" 2>/dev/null)
 children_got=$(jq -r '.children // "" | split(" ") | map(select(. != "")) | length' <<< "$res" 2>/dev/null)
-if [[ $khs_got == "11900.00" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}' && [[ ${children_got:-9} -le 1 ]]; then
-	ok "SIGTERM-ignoring child, healthy summary: Phase A's fresh total survives escalation, returned promptly (${elapsed}s)"
+na_got=$(jq -r '.children_na // 0' <<< "$res" 2>/dev/null)
+na_note=""; [[ $na_got == 1 ]] && na_note=" (child-count check SKIPPED: /proc/\$\$/task/\$\$/children unavailable)"
+if [[ $khs_got == "11900.00" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}' && { [[ $na_got == 1 ]] || [[ ${children_got:-9} -le 1 ]]; }; then
+	ok "SIGTERM-ignoring child, healthy summary: Phase A's fresh total survives escalation, returned promptly (${elapsed}s)$na_note"
 else
 	bad "SIGTERM-ignoring child, healthy summary: Phase A's fresh total survives escalation, returned promptly" \
-		"elapsed=${elapsed}s children=$children_got res=$res"
+		"elapsed=${elapsed}s children=$children_got children_na=$na_got res=$res"
 fi
 # No explicit reap after SIGKILL (see h-stats.sh's own comment at that exact point) means AT MOST one stale
 # zombie can be left behind per poll that goes through this escalation path - bash's own job control reaps it
@@ -361,19 +384,71 @@ for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 # plain-integer check below).
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 20 bash -c '
-	max=0
+	max=0; na=0; [[ -r /proc/$$/task/$$/children ]] || na=1
+	# Runs all 3 polls (still exercising the real escalation path) regardless of whether the procfs feature is
+	# available to MEASURE with - na alone decides whether the caller trusts $max afterward, never whether this
+	# loop runs at all.
 	for i in 1 2 3; do
 		. "$BLOX_DIR/h-stats.sh"
-		children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
+		children=""
+		(( na )) || read -r children < /proc/$$/task/$$/children 2>/dev/null
 		n=0; [[ -n $children ]] && { read -ra arr <<< "$children"; n=${#arr[@]}; }
 		(( n > max )) && max=$n
 	done
-	echo "$max"
+	echo "$na $max"
 ' 2>"$T/sigterm_ignore_stderr2.log")
-if [[ $res =~ ^[0-9]+$ ]] && (( res <= 1 )); then
-	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (max=$res)"
+na_got=${res%% *}; max_got=${res#* }
+if [[ $na_got == 1 ]]; then
+	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (SKIPPED: /proc/\$\$/task/\$\$/children unavailable)"
+elif [[ $max_got =~ ^[0-9]+$ ]] && (( max_got <= 1 )); then
+	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (max=$max_got)"
 else
 	bad "repeated escalation-path polls: at most one transient zombie between polls, never accumulating" "res=$res"
+fi
+
+# ---- P1: the MANDATORY `summary` call used to be capped at a flat 600 ms, same as the OPTIONAL `cores` call -
+# under real CPU pressure a perfectly healthy ccminer can legitimately take longer than that just to get its
+# own stats thread scheduled and answer, and the old flat cap killed that `nc` call and reported a false zero
+# with most of the 2.4 s budget still unused. api()'s own fake_api.py reply can now answer a given command only
+# after a configurable delay (re-read per connection) - exercises this directly rather than just by inspection.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 1.3 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>"$T/slow_summary_stderr.log")
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+if awk -v k="${khs_got:-0}" 'BEGIN{exit !(k>0)}' && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.0)}'; then
+	ok "summary answers after 1.3s (healthy, under heavy load): khs>0 within budget (${elapsed}s)"
+else
+	bad "summary answers after 1.3s (healthy, under heavy load): khs>0 within budget" "elapsed=${elapsed}s res=$res"
+fi
+
+# ---- the SAME slow-summary scenario but past the WHOLE 2.4 s budget (never answers in time at all) must still
+# be BOUNDED - the mandatory call getting nearly the whole budget must never turn into effectively no cap at
+# all; api()'s own cap_us() against the freshly-recomputed remaining_us is what still protects this, and the
+# honest 0 fallback (no API answer in time) is correct here, not a hang.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 10 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(timeout 8 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>"$T/slow_summary_stderr2.log")
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+if [[ $khs_got == "0" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}'; then
+	ok "summary never answers (10s, past the whole budget): bounded, honest 0, no hang (${elapsed}s)"
+else
+	bad "summary never answers (10s, past the whole budget): bounded, honest 0, no hang" "elapsed=${elapsed}s res=$res"
 fi
 
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real

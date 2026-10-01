@@ -112,6 +112,11 @@ remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEA
 }
 have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
 cap_us() { (( $1 < $2 )) && REPLY=$1 || REPLY=$2; }   # min(remaining, nominal per-step ceiling), both in us
+# Reserved, after the mandatory Phase A `summary` call returns, for parsing its reply plus write_result()'s own
+# jq composition - measured comfortably (a handful of pure-bash parameter expansions plus a couple of small jq
+# invocations) to finish well inside 200 ms even under load; kept here as a named constant rather than inlined
+# at the one call site that uses it (run(), below) so the reasoning stays attached to the number.
+RESERVE_US=200000
 us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout` below - no fork
 	local us=$1 f
 	printf -v f '%06d' $(( us % 1000000 ))
@@ -136,9 +141,18 @@ num()  { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 int()  { [[ $1 =~ ^[0-9]+$ ]]; }
 # --foreground: see the file header - keeps `nc` in this collection's own process group so the outer group-kill
 # (below) can always reach it, even though `timeout` would otherwise isolate it into a new group of its own.
+# api <command> [cap_us] - cap_us bounds the `nc` call to min(remaining budget, cap_us); defaults to 600000
+# (600 ms), the existing short per-step ceiling appropriate for Phase B's own OPTIONAL `cores` call below (no
+# single optional step should be allowed to eat the whole remaining budget). The MANDATORY Phase A `summary`
+# call below passes a much larger cap instead (see RESERVE_US) - a flat 600 ms cap applied to every api() call,
+# including this one, could kill a perfectly healthy ccminer that simply took longer than 600 ms THIS poll to
+# answer `summary` under real CPU pressure (its own stats thread starved, not stalled) - reporting a false zero
+# with most of the 2.4 s budget still unused. cap_us's own min() with the freshly-recomputed remaining_us still
+# protects the true deadline regardless of what cap is passed.
 api() {
+	local cap=${2:-600000}
 	remaining_us; have_budget_us "$REPLY" || return 1
-	cap_us "$REPLY" 600000; us_to_secstr "$REPLY"
+	cap_us "$REPLY" "$cap"; us_to_secstr "$REPLY"
 	echo -n "$1" | timeout --foreground "$REPLY" nc 127.0.0.1 "$VPORT" 2>/dev/null | tr -d '\0'
 }
 # field <"KEY=val;KEY=val|..."> <KEY> - the first "KEY=" segment's value (";" and "|" both act as separators),
@@ -226,9 +240,17 @@ phase_a_stats_gate() {
 # Sets $khs/$stats and writes $OUTFILE at least once (Phase A).
 run() {
 	local sum acc rej up ver stall fresh power ptemp cores head gen age rows cov pstall percore want
-	local ok hs temps n k t id pk co cpus ncpu r
+	local ok hs temps n k t id pk co cpus ncpu r sum_cap
 
-	sum=$(api summary)
+	# The MANDATORY call gets nearly the whole remaining budget (remaining minus RESERVE_US for the parsing/
+	# write_result work that follows it), not the short 600 ms per-step cap Phase B's own OPTIONAL `cores` call
+	# below keeps unchanged - see api()'s own header for the full rationale. Falls back to api()'s own default
+	# (600000) only in the edge case where less than RESERVE_US remains in total at this point (manifest
+	# parsing/LIB setup already consumed most of the budget): api()'s own cap_us() still clamps to whatever
+	# truly remains regardless, so this is never a behavior regression even then.
+	sum_cap=600000
+	remaining_us; (( REPLY > RESERVE_US )) && sum_cap=$(( REPLY - RESERVE_US ))
+	sum=$(api summary "$sum_cap")
 	if [[ -z $sum ]]; then khs=0; stats=""; write_result "$khs" "$stats"; return 0; fi
 	acc=$(field "$sum" ACC); rej=$(field "$sum" REJ); up=$(field "$sum" UPTIME)
 	stall=$(field "$sum" STALL); fresh=$(field "$sum" FRESHKHS); power=$(field "$sum" POWER); ptemp=$(field "$sum" TEMP)
