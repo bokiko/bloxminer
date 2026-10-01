@@ -427,6 +427,11 @@ KILL_GRACE=0.3
 # $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at least once after Phase A and
 # again after Phase B if that also completes - never captured from the child's stdout (a single final print is
 # not used): a kill mid-Phase-B must never erase Phase A's already-written, honest answer.
+# Initialised empty FIRST, unconditionally, before either mktemp is even attempted - this file is sourced
+# repeatedly by Hive's own long-lived agent shell, and these are plain globals, so a stale non-empty path left
+# over from a PREVIOUS poll could otherwise be mistaken for this poll's own temp file below (and `rm -f`'d, or
+# worse, trusted) if either of the two mktemp calls here were ever skipped or reordered in the future.
+OUTFILE=""; HANDSHAKE=""
 OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-out.XXXXXX") || OUTFILE=""
 HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-hs.XXXXXX") || HANDSHAKE=""
 PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
@@ -525,6 +530,14 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# itself (BUDGET_US/KILL_GRACE) is unchanged; this was a reap ordering/boundedness bug, not a budget sizing
 	# one.
 else
+	# One of the two mktemp calls above can succeed even though the OTHER fails (e.g. /tmp runs out of
+	# inodes/quota between the two) - mktemp creates the file immediately, it does not just reserve a name, so
+	# a partial failure here would otherwise leak whichever ONE succeeded forever: this file is sourced
+	# repeatedly by Hive's own long-lived agent, so a leak like that compounds every single poll, directly
+	# worsening the exact exhaustion that caused it. `rm -f` on an empty string or an already-absent path is a
+	# safe no-op, so this is correct whether neither, either, or (impossible here, but handled identically)
+	# both ever got created.
+	rm -f "$OUTFILE" "$HANDSHAKE"
 	result=""
 fi
 rm -f "$LIB"

@@ -431,6 +431,46 @@ else
 	bad "repeated escalation-path polls: at most one transient zombie between polls, never accumulating" "res=$res"
 fi
 
+# ---- P2: a PARTIAL mktemp failure (OUTFILE succeeds, HANDSHAKE fails - e.g. /tmp runs out of inodes/quota
+# between the two calls) used to leak whichever ONE actually got created: mktemp creates the file immediately,
+# not just a name, and the old `else` branch only set result="" without removing it. This file is sourced
+# repeatedly by Hive's own long-lived agent, so a leak like that compounds every poll, worsening the exact
+# exhaustion that caused it. A PATH stub for `mktemp` forces exactly that split: fails any call whose own
+# template names the HANDSHAKE file ("-hs."), forwards every other call (LIB, OUTFILE) to the real mktemp
+# unchanged - a template-based match, not call-ordinal counting, so it is correct regardless of how many other
+# mktemp calls (LIB) happen first in the same poll.
+REAL_MKTEMP=$(command -v mktemp)
+STUBBIN_MKTEMP="$T/stubbin-mktemp"; mkdir -p "$STUBBIN_MKTEMP"
+cat > "$STUBBIN_MKTEMP/mktemp" <<STUBEOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+	case "\$a" in *-hs.*) exit 1 ;; esac
+done
+exec "$REAL_MKTEMP" "\$@"
+STUBEOF
+chmod +x "$STUBBIN_MKTEMP/mktemp"
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+before_out=$(ls "${TMPDIR:-/tmp}"/bloxminer-hstats-out.* 2>/dev/null)
+# One line per value, not "khs=[..]|stats=[..]" on one line: $stats is itself JSON and can contain "]" - a
+# single-line greedy sed capture for khs would (and once did, caught while verifying this very test) grab up to
+# the LAST "]" in the whole line, swallowing part of $stats into what was supposed to be just the khs value.
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(PATH="$STUBBIN_MKTEMP:$PATH" timeout 10 bash -c '. "$BLOX_DIR/h-stats.sh"; printf "KHS=%s\nSTATS=%s\n" "$khs" "$stats"' 2>"$T/mktemp_fail_stderr.log")
+after_out=$(ls "${TMPDIR:-/tmp}"/bloxminer-hstats-out.* 2>/dev/null)
+leaked_out=$(comm -13 <(sort <<< "$before_out") <(sort <<< "$after_out") 2>/dev/null)
+khs_got=$(sed -n 's/^KHS=//p' <<< "$res")
+if [[ $khs_got == "0" ]] && [[ -z $leaked_out ]]; then
+	ok "partial mktemp failure (OUTFILE ok, HANDSHAKE fails): honest fallback, no leaked OUTFILE temp file"
+else
+	bad "partial mktemp failure (OUTFILE ok, HANDSHAKE fails): honest fallback, no leaked OUTFILE temp file" \
+		"res=$res leaked=[$leaked_out]"
+fi
+
 # ---- P1: the MANDATORY `summary` call used to be capped at a flat 600 ms, same as the OPTIONAL `cores` call -
 # under real CPU pressure a perfectly healthy ccminer can legitimately take longer than that just to get its
 # own stats thread scheduled and answer, and the old flat cap killed that `nc` call and reported a false zero
