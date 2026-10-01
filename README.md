@@ -372,8 +372,13 @@ On Ubuntu 22.04 x86-64:
 
 ```bash
 build/build.sh                      # clang 14, -march=x86-64-v3 -mtune=znver3 -O3 → out/bloxminer-O3 (+ .provenance)
+BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 \
 build/package.sh out/bloxminer-O3   # → bloxminer-2.1.1.tar.gz + SHA256SUMS
 ```
+
+2.1.1 changes only the HiveOS scripts: the engine binary is the 2.1.0 build, so it reports version 2.1.0 while the
+package is 2.1.1. `package.sh` refuses that mismatch unless `BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1` is set, and then
+records it in `SOURCE.md`.
 
 Source: [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183` + [`build/bloxminer.patch`](build/bloxminer.patch).
 The patch adds the BloxMiner screen, log file, sensors and power, the `cores` API, stall detection and fixes for
