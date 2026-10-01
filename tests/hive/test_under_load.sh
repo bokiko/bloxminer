@@ -7,8 +7,21 @@
 # deadline-derived cap). This test's taskset -c 0 case reproduced 8+ s runs with no result at all before the
 # fix; h-stats.sh now uses a budgeted, killable-child pattern instead. This test stays as the regression guard
 # for that fix, at a realistic 16-row/32-thread reply size.
+#
+# LOAD MODEL (host-independent by design): each taskset-constrained tier launches LOAD_K busy loops PER CPU IN
+# THAT TIER, all pinned to that exact cpuset - NOT `nproc` loops regardless of tier size. The old "nproc loops,
+# all pinned to the tested CPUs" model made severity scale with the HOST's total core count, not the tier being
+# tested: on a 24-core box the "1 CPU" tier was a 24x squeeze, on a 2-4 vCPU GitHub runner the same tier was
+# only 2-4x - neither one is a stand-in for a real Hive rig, where every core runs roughly ONE miner thread at
+# normal scheduling priority, not an arbitrary multiple of unrelated competing processes. LOAD_K=4 (~4x a real
+# rig's own per-core pressure - a deliberate margin above normal operation, not a worst-case-imaginable value)
+# applies identically to every taskset tier, so severity depends only on how many CPUs that tier constrains to,
+# never on the host running this suite. Overridable via BLOX_LOAD_K for a one-off stress comparison (e.g.
+# BLOX_LOAD_K=24 reproduces the OLD per-core harshness on today's 24-core ai02, as information only - the
+# suite's own pass/fail bar, zero false zeros and the hard cap, is never loosened regardless of K).
 # Usage: tests/hive/test_under_load.sh (needs jq, nc, timeout, python3, bash, nproc, taskset)
 set -u
+LOAD_K=${BLOX_LOAD_K:-4}
 # Serialize against any OTHER CPU-saturating load test on this same host (anywhere, any user) - a second
 # instance competing for the same CPUs would corrupt both runs' own timing measurements.
 exec 9>"${TMPDIR:-/tmp}/bloxminer-load-test.lock"
@@ -32,8 +45,18 @@ bad() { fail=$((fail+1)); printf '%-70s FAIL: %s\n' "$1" "$2"; }
 
 HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
 
-saturate_cpus() {   # $1 = cpuset ("" = whatever this process is already confined to) - n busy loops per CPU
-	local n; n=$(nproc)
+saturate_cpus() {   # $1 = cpuset ("" = unconstrained, representing a generally busy host - `nproc` loops
+	# system-wide, NOT scaled by LOAD_K: that is not a "taskset tier" in the host-independent sense this file's
+	# own header explains, it is a separate "the whole box is busy" baseline). A real cpuset like "0-2" (3 CPUs)
+	# or a single CPU like "0" (1 CPU, no "-") launches LOAD_K busy loops PER CPU in that cpuset - never `nproc`
+	# loops regardless of how many CPUs the tier itself constrains to.
+	local n lo hi ncpus
+	if [[ -n ${1:-} && $HAVE_TASKSET == 1 ]]; then
+		if [[ $1 == *-* ]]; then lo=${1%-*}; hi=${1#*-}; ncpus=$(( hi - lo + 1 )); else ncpus=1; fi
+		n=$(( LOAD_K * ncpus ))
+	else
+		n=$(nproc)
+	fi
 	BUSY_PIDS=()
 	for _ in $(seq 1 "$n"); do
 		if [[ -n ${1:-} && $HAVE_TASKSET == 1 ]]; then
@@ -124,9 +147,10 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	# The hard safety requirement is NO FALSE ZEROS - a real Hive watchdog reboots a rig on repeated
 	# zero-hashrate polls, never on a single slow-but-honest one. The documented triggers on a real rig are
 	# WD_MINER=10 min (miner restart) and WD_REBOOT=21 min (reboot) of SUSTAINED zero hashrate - an occasional
-	# poll running a couple of seconds past its own internal budget, under this test's deliberately extreme 1-2
-	# CPU vs. many-competing-loop squeeze, is not in the same universe as either trigger as long as it is never
-	# a false zero. Staying under the nominal 3.0 s budget is additionally enforced from 3 CPUs up (a realistic
+	# poll running a couple of seconds past its own internal budget, under this test's LOAD_K-per-CPU squeeze
+	# (margin above a real rig's own per-core pressure, deliberately, not a worst-case-imaginable value), is not
+	# in the same universe as either trigger as long as it is never a false zero. Staying under the nominal
+	# 3.0 s budget is additionally enforced from 3 CPUs up (a realistic
 	# floor for a rig actually mining many threads); at 1-2 CPUs the collector's own bounded work (one absolute
 	# deadline, no cache/probe path left to escape it) can still occasionally run past 3.0 s under
 	# signal-delivery/scheduling delay alone - it never produces a false zero even there, which is what
@@ -159,11 +183,11 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		run_case "h-stats.sh, taskset 0-$hi ($want CPU(s))" "0-$hi" 10 "$eb"
 	done
 	# ---- sustained: a >90 s run, not just a handful of polls, to guard against a failure mode that only shows
-	# up over time (a leak, a slow state drift) that a 10-poll burst could miss. 2 CPUs against many competing
-	# busy loops (the same squeeze as the taskset-0-1 case above, budget not enforced there either) run
-	# continuously for at least 90 s of wall time - well past both real Hive watchdog triggers' own polling
-	# cadence, with zero cross-poll state to drift in the first place post-redesign, so this is really proving
-	# "no false zero, ever, however long this runs", not "state survives".
+	# up over time (a leak, a slow state drift) that a 10-poll burst could miss. 2 CPUs against LOAD_K*2 busy
+	# loops (the same squeeze as the taskset-0-1 case above, budget not enforced there either) run continuously
+	# for at least 90 s of wall time - well past both real Hive watchdog triggers' own polling cadence, with
+	# zero cross-poll state to drift in the first place post-redesign, so this is really proving "no false zero,
+	# ever, however long this runs", not "state survives".
 	(( NPROC >= 2 )) && run_case "h-stats.sh, taskset 0-1 (2 CPU(s), sustained)" "0-1" 1 0 95
 else
 	echo "SKIP: taskset not available - only the unconstrained case above ran"
