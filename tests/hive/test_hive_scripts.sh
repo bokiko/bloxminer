@@ -209,6 +209,89 @@ else
 	bad "write_result's own guard: a forced jq failure never overwrites an already-good prior result" "res=$res debug=$(cat "$D_DEBUG" 2>/dev/null)"
 fi
 
+# ---- write_result_fast: malformed-JSON regression (CI/bot finding on the D=2.0s saturation case, root cause
+# of what earlier looked like a nested-docker-only artifact). bash's `printf` builtin interprets backslash
+# escapes - including `\"` - IN ITS OWN FORMAT STRING regardless of shell quoting (single quotes only stop
+# the SHELL from touching them, not printf), silently dropping the backslash; a first version of this
+# function wrote `\"` directly in stats_inner's format string meaning to pre-escape it for nesting, and got
+# back a plain, UNESCAPED `"` instead - then nested that raw into outer's "stats":"%s" unescaped, producing
+# e.g. `{"khs":"100","stats":"{"hs":[100],...}"}"` - malformed JSON every reader (jq, and the parent's own
+# read-back) correctly refuses. Fixed via bash parameter expansion (not printf) to escape stats_inner
+# EXPLICITLY - backslash first, then quote - before nesting. This case calls write_result_fast and
+# write_result directly (not through a full poll) with the SAME representative inputs, and requires: (1)
+# write_result_fast's own output is valid JSON on its own (`jq -e .` succeeds - this alone catches the
+# regression), and (2) it is byte-identical to write_result's real jq-composed output for the same inputs -
+# the "byte-identical in shape" claim in write_result_fast's own header, made a hard requirement here, not
+# just prose.
+mkdir -p "$T/wrf_test1"
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"
+	OUTFILE="$1/out"
+	write_result_fast "11900.00" "15" "1" "321"
+	fast_out=$(cat "$OUTFILE" 2>/dev/null)
+	write_result "11900.00" "{\"hs\":[11900.00],\"hs_units\":\"khs\",\"temp\":[null],\"fan\":[0],\"bus_numbers\":[null],\"uptime\":321,\"ar\":[15,1],\"algo\":\"verushash\"}"
+	real_out=$(cat "$OUTFILE" 2>/dev/null)
+	if jq -e . > /dev/null 2>&1 <<< "$fast_out" && [[ "$fast_out" == "$real_out" ]]; then
+		echo "RESULT=PASS"
+	else
+		valid=no; jq -e . > /dev/null 2>&1 <<< "$fast_out" && valid=yes
+		echo "RESULT=FAIL valid=$valid fast=[$fast_out] real=[$real_out]"
+	fi' _ "$T/wrf_test1" 2>&1)
+if [[ $res == RESULT=PASS* ]]; then
+	ok "write_result_fast: valid JSON, byte-identical in shape to write_result for the same inputs"
+else
+	bad "write_result_fast: valid JSON, byte-identical in shape to write_result for the same inputs" "$res"
+fi
+
+# ---- write_result_fast's escaping mechanism, in isolation from its own (numeric-only, already-validated)
+# callers: k/a/r/u are int()/num()-gated by run() before this function is ever called (see the SECURITY audit
+# above and this function's own header), so NONE of them can ever actually carry a quote or backslash today -
+# unlike a dynamic API-sourced string field (e.g. a hypothetical `ver` taken from the miner's own API reply,
+# which this package's `ver` is NOT - see run()'s own comment: it is always $CUSTOM_VERSION, a fixed local
+# string, never the engine's API VER field). The escape step itself is still tested directly here, against a
+# value engineered to contain BOTH a quote and a backslash, so correctness does not rest on "nothing today
+# happens to need it" - replicates write_result_fast's own two-line transform (backslash first, then quote -
+# order matters, or a `"` already turned into `\"` would itself be wrongly re-escaped by a later backslash
+# pass) and round-trips the result back through jq to confirm the decoded value is byte-identical to the
+# original, untouched input.
+res=$(bash -c '
+	raw="algo\"inject\\x"
+	esc=${raw//\\/\\\\}
+	esc=${esc//\"/\\\"}
+	printf -v wrapped "{\"stats\":\"%s\"}" "$esc"
+	decoded=$(jq -r ".stats" <<< "$wrapped" 2>/dev/null)
+	if jq -e . > /dev/null 2>&1 <<< "$wrapped" && [[ "$decoded" == "$raw" ]]; then
+		echo "RESULT=PASS"
+	else
+		echo "RESULT=FAIL wrapped=[$wrapped] decoded=[$decoded] raw=[$raw]"
+	fi' 2>&1)
+if [[ $res == RESULT=PASS* ]]; then
+	ok "write_result_fast's escape order (backslash then quote): a value with both stays valid JSON and round-trips exactly"
+else
+	bad "write_result_fast's escape order (backslash then quote): a value with both stays valid JSON and round-trips exactly" "$res"
+fi
+
+# ---- write_result_fast under the SAME forced-failure path write_result's own guard test (above) uses for
+# write_result() directly - but reached through a REAL poll (full run(), not a synthetic direct call), to
+# prove the production path the parent actually depends on: a healthy summary, with write_result() (Phase
+# A/B's own richer composition write) forced to fail for the rest of the poll, must leave the PARENT reading
+# back write_result_fast's own earlier publish - a positive $khs, not the false-zero this exact bug produced
+# before the fix once write_result_fast's own malformed output stopped the parent's read-back jq from
+# accepting it at all.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL=1 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+if awk -v k="${khs_got:-0}" 'BEGIN{exit !(k>0)}'; then
+	ok "write_result forced to fail after the fast write: the poll still returns the fast result (khs>0)"
+else
+	bad "write_result forced to fail after the fast write: the poll still returns the fast result (khs>0)" "khs_got=$khs_got res=$res"
+fi
+
 # ---- "Reject an empty Phase A stats composition": Phase A's own stats composition chains four nested jq calls
 # into one outer jq call; if any one of them failed (a transient fork/exec failure under resource pressure -
 # the same class this file's own write_result() guard above exists for), $stats came back empty while $khs

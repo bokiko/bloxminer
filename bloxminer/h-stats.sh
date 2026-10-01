@@ -243,11 +243,34 @@ write_result() {
 # The stats value this writes is byte-identical in shape to phase_a_stats_gate()'s own last-resort printf
 # fallback (that function's own header explains why that path must also stay jq-free) - this is that same
 # minimal object, just reached on the FAST path instead of only after jq has already failed.
+#
+# $OUTFILE's real schema (set by write_result(), via `jq -nc --arg s ...`) has "stats" as a STRING field
+# whose *value*, once JSON-decoded, is itself the raw stats object text - i.e. the stats object is nested
+# JSON-ENCODED-AS-A-STRING, not a nested object. Matching that shape here needs stats_inner's own `"`
+# characters escaped to `\"` before it is embedded as the "stats" string's content - bash's `printf` builtin
+# cannot be made to do that escaping for us: it interprets backslash-escapes (including `\"`) IN ITS OWN
+# FORMAT STRING regardless of shell quoting (single quotes only stop the SHELL from touching them, not
+# printf) and silently drops the backslash, so a first version of this function that wrote `\"` directly in
+# the stats_inner format string ended up with stats_inner holding plain, UNESCAPED `"` characters - and
+# then nested those raw into outer's "stats":"%s" unescaped, producing e.g.
+# `{"khs":"100","stats":"{"hs":[100],...}"}"` - malformed JSON that jq correctly refuses to parse, which
+# this function's own caller then reads back as the safe-but-wrong fallback 0 (CI found this: it reproduces
+# reliably once write_result()'s own later overwrite doesn't land in time to paper over it, e.g. under real
+# saturation or when BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL forces write_result() to fail outright).
+# Fixed: build stats_inner with plain, unescaped `"` (so it is valid JSON on its own, same as before), then
+# escape it EXPLICITLY via bash parameter expansion - not printf - before nesting: backslash first, then
+# quote (order matters, or a `"` turned into `\"` would itself be re-escaped by a later backslash pass).
+# k/a/r/u are already-validated (int()/num()-gated by the caller, before this is ever called) numeric
+# fields only, so neither escape can ever fire on them - this guards only the fixed JSON-skeleton text's own
+# literal quotes - but the parameter expansion is unconditional regardless, costing nothing and leaving no
+# assumption about k/a/r/u's content for this function to silently depend on.
 write_result_fast() {
-	local k=$1 a=$2 r=$3 u=$4 stats_inner outer tmp="$OUTFILE.w.$$"
-	printf -v stats_inner '{\"hs\":[%s],\"hs_units\":\"khs\",\"temp\":[null],\"fan\":[0],\"bus_numbers\":[null],\"uptime\":%s,\"ar\":[%s,%s],\"algo\":\"verushash\"}' \
+	local k=$1 a=$2 r=$3 u=$4 stats_inner stats_esc outer tmp="$OUTFILE.w.$$"
+	printf -v stats_inner '{"hs":[%s],"hs_units":"khs","temp":[null],"fan":[0],"bus_numbers":[null],"uptime":%s,"ar":[%s,%s],"algo":"verushash"}' \
 		"$k" "$u" "$a" "$r"
-	printf -v outer '{"khs":"%s","stats":"%s"}' "$k" "$stats_inner"
+	stats_esc=${stats_inner//\\/\\\\}
+	stats_esc=${stats_esc//\"/\\\"}
+	printf -v outer '{"khs":"%s","stats":"%s"}' "$k" "$stats_esc"
 	{ printf '%s' "$outer" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
 
