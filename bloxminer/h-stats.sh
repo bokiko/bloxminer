@@ -68,10 +68,19 @@ __t_us="${__t%%.*}${__t_frac:0:6}"
 DEADLINE_US=$(( __t_us + 2400000 ))   # a 2.4 s budget out of Hive's own ~3 s stats-script ceiling
 unset __t __t_frac __t_us
 
-. "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
-
+# h-manifest.conf is NOT sourced here anymore (CI/bot finding, product fix paired with D's own re-derivation
+# below): it used to be read, and its $CUSTOM_VERSION/$CUSTOM_CONFIG_FILENAME exported for the child, right
+# here - entirely non-essential work sitting IN FRONT of the mandatory `summary` request, which should be the
+# very first network action after the minimal setup this whole poll actually needs. Neither value is used
+# before Phase A's own fast write: $CUSTOM_VERSION only feeds the `ver` field in the richer composition AFTER
+# write_result_fast() has already published, and $CUSTOM_CONFIG_FILENAME is only read in Phase B's own `want`
+# lookup, far later still. $VPORT is the one thing api() genuinely needs before the summary call, and it never
+# depended on the manifest at all (BLOX_API_PORT, an independent env var - tests only; a real rig's own 4068
+# default). Moved: the manifest is now sourced inside run() itself (the child), positioned right after
+# write_result_fast() - see that call site's own comment - so sourcing it (a real file read, cheap but never
+# free under saturation) no longer delays the summary request by even one syscall.
 VPORT=${BLOX_API_PORT:-4068}
-export VPORT CUSTOM_VERSION CUSTOM_CONFIG_FILENAME
+export VPORT
 
 # dbg <msg> - appends a timestamped line to $BLOX_HSTATS_DEBUG_LOG iff that variable is set (never on a real
 # Hive rig), a single [[ ]] test - no fork at all - when unset. Every call site guards its OWN argument
@@ -345,9 +354,10 @@ run() {
 	# The MANDATORY call gets nearly the whole remaining budget (remaining minus RESERVE_US for the parsing/
 	# write_result work that follows it), not the short 600 ms per-step cap Phase B's own OPTIONAL `cores` call
 	# below keeps unchanged - see api()'s own header for the full rationale. Falls back to api()'s own default
-	# (600000) only in the edge case where less than RESERVE_US remains in total at this point (manifest
-	# parsing/LIB setup already consumed most of the budget): api()'s own cap_us() still clamps to whatever
-	# truly remains regardless, so this is never a behavior regression even then.
+	# (600000) only in the edge case where less than RESERVE_US remains in total at this point (WORKDIR/LIB
+	# setup already consumed most of the budget - manifest parsing no longer happens before this point at all,
+	# see the "VPORT" header above for why): api()'s own cap_us() still clamps to whatever truly remains
+	# regardless, so this is never a behavior regression even then.
 	sum_cap=600000
 	remaining_us; (( REPLY > RESERVE_US )) && sum_cap=$(( REPLY - RESERVE_US ))
 	sum=$(api summary "$sum_cap")
@@ -356,11 +366,6 @@ run() {
 	stall=$(field "$sum" STALL); fresh=$(field "$sum" FRESHKHS); power=$(field "$sum" POWER); ptemp=$(field "$sum" TEMP)
 	int "$acc" || acc=0; int "$rej" || rej=0; num "$up" || up=0
 	int "$ptemp" || ptemp=""
-	# $CUSTOM_VERSION (the package release, from h-manifest.conf) is shown, never the engine binary's own API
-	# VER field: a hotfix package (like this one) intentionally ships an UNCHANGED, already-gated binary, so
-	# the engine's own VER can legitimately lag the package version it is shipped inside - showing it instead
-	# would display the wrong release number on the miner screen and in Hive's farm view.
-	ver=$CUSTOM_VERSION
 
 	# ---- Phase A (mandatory): honest, THIS-POLL answer from summary alone - STALL=1 -> 0, else FRESHKHS as a
 	# single row. Written now, before Phase B (the `cores` call) is even attempted, so a kill during Phase B can
@@ -375,6 +380,18 @@ run() {
 	# write_result_fast()'s own header for the measured reason this exists as a separate, earlier step rather
 	# than only the composition-failure fallback phase_a_stats_gate() already had.
 	write_result_fast "$khs" "$acc" "$rej" "${up%.*}"
+	# h-manifest.conf is sourced HERE, not before the summary request above (CI/bot finding, product fix - see
+	# the top-level "VPORT" header for the full rationale): the fast write just above already covers the one
+	# thing this poll is honor-bound to publish fast, so the manifest's own file-read cost - genuinely cheap,
+	# but never free under saturation - can no longer delay that. $CUSTOM_VERSION below feeds `ver`, used only
+	# by the richer composition that follows; $CUSTOM_CONFIG_FILENAME (Phase B's own `want` lookup, further
+	# still) is covered by this same sourcing.
+	. "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
+	# $CUSTOM_VERSION (the package release, just sourced above) is shown, never the engine binary's own API VER
+	# field: a hotfix package (like this one) intentionally ships an UNCHANGED, already-gated binary, so the
+	# engine's own VER can legitimately lag the package version it is shipped inside - showing it instead would
+	# display the wrong release number on the miner screen and in Hive's farm view.
+	ver=$CUSTOM_VERSION
 	n=${#hs[@]}
 	# This composition chains FOUR nested jq calls (command substitutions for hs/temp/fan/bus) into ONE outer
 	# jq call, same shape as Phase B's own final composition below - and, same as that one, any single nested

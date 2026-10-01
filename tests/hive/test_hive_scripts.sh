@@ -237,7 +237,7 @@ else
 	bad "write_result's own guard: a forced jq failure never overwrites an already-good prior result" "res=$res debug=$(cat "$D_DEBUG" 2>/dev/null)"
 fi
 
-# ---- write_result_fast: malformed-JSON regression (CI/bot finding on the D=2.0s saturation case, root cause
+# ---- write_result_fast: malformed-JSON regression (CI/bot finding on the saturation case, root cause
 # of what earlier looked like a nested-docker-only artifact). bash's `printf` builtin interprets backslash
 # escapes - including `\"` - IN ITS OWN FORMAT STRING regardless of shell quoting (single quotes only stop
 # the SHELL from touching them, not printf), silently dropping the backslash; a first version of this
@@ -630,21 +630,25 @@ fi
 # published, even under GENUINE single-CPU saturation (not just this file's own serial test harness). An
 # earlier version of this case used a flat 1.85 s and failed 20/20 on GitHub's own 2-4 vCPU runners (and the
 # bot's 3-CPU review environment) even though it passed cleanly on ai02: 1.85 s was picked without accounting
-# for PARENT-side start-up (manifest parse, mktemp, setsid launch, handshake) ALSO running on a saturated CPU,
-# BEFORE the summary request is even sent - on a slower/more contended runner that start-up alone can approach
-# or exceed what was left of the budget after a 1.85 s delay, with no reserve value able to fix a delay chosen
-# without that in mind.
+# for PARENT-side start-up (mktemp, setsid launch, handshake) ALSO running on a saturated CPU, BEFORE the
+# summary request is even sent - on a slower/more contended runner that start-up alone can approach or exceed
+# what was left of the budget after a 1.85 s delay, with no reserve value able to fix a delay chosen without
+# that in mind. A SECOND version used D=2.0 s (a doubled-for-CI-margin 2x safety factor on a ~60 ms ai02
+# measurement) and still showed khs=0 on 20/20 in the bot's OWN review sandbox - clearly slower/more contended
+# than even GitHub's own runners - because 2x was too thin a margin for how much slower an unknown host can be,
+# and because 2.0 s of a 2.4 s budget leaves only ~0.4 s for start-up + RESERVE_US, razor-thin on a slow host,
+# for a delay (2 s) already far beyond anything ccminer's own local API takes to answer in practice.
 #
-# D is derived from a real measurement, not guessed: BLOX_HSTATS_DEBUG_LOG timestamps bracketing poll entry to
-# the summary request being sent, 20 polls, taskset to ONE CPU with 2 competing busy loops (the same
-# saturation this case itself applies) - max 60.5 ms on ai02 (avg 58.3 ms), AFTER also cutting that start-up
-# cost itself (one mktemp -d instead of three separate mktemp calls; the heredoc written via a builtin `read`+
-# `printf` instead of forking `cat`; the parent's and the child's own pgid read from /proc/self/stat via a
-# builtin `read` instead of forking `ps`+`tr` - see h-stats.sh's own WORKDIR/pgid comments). Doubled for an
-# honest worst case on a slower 2-4 vCPU CI runner (~120 ms), D = 2.4 s budget - 0.12 s start-up margin -
-# 0.15 s RESERVE_US - 0.1 s extra margin = ~2.0 s; used as-is here. (Before the start-up cuts, the same
-# measurement was ~199 ms avg/205 ms max on ai02 - the 1.85 s this case used to test was already inside the
-# OLD start-up-unaware margin's danger zone, which is exactly how it passed on ai02 but not on a slower runner.)
+# D is derived from a real measurement, not guessed, with a WIDER safety factor this time: BLOX_HSTATS_DEBUG_LOG
+# timestamps bracketing poll entry to the summary request being sent, 20 polls, taskset to ONE CPU with 2
+# competing busy loops (the same saturation this case itself applies) - avg ~68 ms on ai02 (max ~70-74 ms
+# across several runs; the manifest-sourcing move paired with this change - see h-stats.sh's own "VPORT"
+# header - measured within noise of the pre-move baseline: start-up here was already dominated by mktemp/LIB/
+# setsid/handshake, cut in the previous round, not by the small manifest file read). A 4x safety factor (not
+# 2x) for an unknown host that could be meaningfully slower than both ai02 and GitHub's own runners: D = 2.4 s
+# budget - (0.068 s start-up * 4) - 0.15 s RESERVE_US - 0.2 s extra margin = 2.4 - 0.272 - 0.15 - 0.2 = ~1.78 s;
+# rounded DOWN (never up) to 1.5 s - this is the "guaranteed-publish window under single-CPU saturation": any
+# summary answering within 1.5 s of being requested, under genuine single-CPU saturation, must always publish.
 HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
 # ---- P2 (bot finding): this used to hardcode `taskset -c 0` - assuming CPU 0 is in this process's own
 # affinity, which is not true when the suite itself runs under a restricted affinity (e.g. `taskset -c 2-4
@@ -666,7 +670,7 @@ if [[ $HAVE_TASKSET == 1 && -n $SAT_CPU ]]; then
 	if flock -w 300 8; then
 		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 		PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
-		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 2.0 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 1.5 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
 		: > "$T/api.out"
 		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
@@ -687,16 +691,16 @@ if [[ $HAVE_TASKSET == 1 && -n $SAT_CPU ]]; then
 		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done
 		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
 		if [[ $n_zero == 0 && $n_over_cap == 0 ]]; then
-			ok "summary answers within D=2.0s under genuine single-CPU saturation, $i polls: no false zero, within hard cap"
+			ok "summary answers within D=1.5s under genuine single-CPU saturation, $i polls: no false zero, within hard cap"
 		else
-			bad "summary answers within D=2.0s under genuine single-CPU saturation, $i polls: no false zero, within hard cap" \
+			bad "summary answers within D=1.5s under genuine single-CPU saturation, $i polls: no false zero, within hard cap" \
 				"n_zero=$n_zero n_over_cap=$n_over_cap"
 		fi
 
 		# ---- the SAME genuine single-CPU saturation, but summary answers PAST the remaining budget (2.3 s -
-		# D's own 2.0 s plus margin, still well short of the full 2.4 s budget) - this must still be BOUNDED with
-		# an honest 0, never a hang: api()'s own cap_us() against the freshly-recomputed remaining_us is what
-		# protects this regardless of what D above is tuned to.
+		# comfortably past D's own 1.5 s guaranteed-publish window, still well short of the full 2.4 s budget) -
+		# this must still be BOUNDED with an honest 0, never a hang: api()'s own cap_us() against the
+		# freshly-recomputed remaining_us is what protects this regardless of what D above is tuned to.
 		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 		PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
 		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 2.3 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
