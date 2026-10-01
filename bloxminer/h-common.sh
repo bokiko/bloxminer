@@ -308,6 +308,28 @@ _hp_boot_id() {
 	printf '%s' "$val"
 }
 
+# _hp_sysfs_hugetlb_present - true if the kernel's hugetlb sysfs interface exists at all (at least one
+# /sys/kernel/mm/hugepages/hugepages-<size> entry) - BLOX_SYSFS_ROOT overridable for tests, the SAME variable
+# engines/rx/h-config.sh's own 1gb-pages NUMA check and bloxsense's own sysfs reads already use (never a second,
+# differently-named override for the same concept). PR #2 follow-up review (Codex): "Verify sysfs before
+# allowing an untracked start" - an absent /proc/sys/vm/nr_hugepages does NOT by itself prove no reservation is
+# possible on this host: in a restricted container, the proc alias can be masked out while the REAL hugetlb
+# sysfs controls underneath it (this path, and its per-NUMA-node mirrors under
+# /sys/devices/system/node/node*/hugepages/) remain fully live - XMRig can and does write those directly when
+# the proc path is unavailable (confirmed against this package's own pinned xmrig-src:
+# LinuxMemory::write_nr_hugepages falls back to exactly the global sysfs node, never just /proc). A host like
+# that genuinely CAN reserve - just not through the one path this package itself reads - so it must never take
+# the untracked-but-safe fallback note_rx_hugepages_start's own absent-proc branch otherwise would; see that
+# function's own call site for what happens instead. No fork: a glob expansion, no external command at all.
+_hp_sysfs_hugetlb_present() {
+	local d="${BLOX_SYSFS_ROOT:-/sys}/kernel/mm/hugepages" e
+	[[ -d $d ]] || return 1
+	for e in "$d"/hugepages-*; do
+		[[ -e $e ]] && return 0
+	done
+	return 1
+}
+
 # _hp_free_hugepages - HugePages_Free from /proc/meminfo (BLOX_PROCFS_ROOT overridable for tests). Empty/absent
 # on any read failure - callers treat that exactly like any other missing precondition (never finalize).
 # ROUND 5d: via _hp_kv_field, no fork (was `awk`).
@@ -575,8 +597,22 @@ note_rx_hugepages_start() {
 	# make this exact distinction for the SAME file read at a different moment (after an existing record's own
 	# ownership is decided) - this is the same policy, just also applied before boot_id, which did not exist as
 	# a concept the first time that distinction was added.
+	#
+	# PR #2 follow-up review (Codex), next round: "Verify sysfs before allowing an untracked start" - an absent
+	# $proc does NOT, by itself, prove "no one can reserve anything here" the way the paragraph above assumed:
+	# in a restricted container, the /proc alias can be masked out while the REAL hugetlb sysfs controls
+	# underneath it stay fully live, and XMRig writes those directly (see _hp_sysfs_hugetlb_present's own
+	# header for the exact xmrig-src trace). A host like that is not "no hugetlbfs support" at all - it is
+	# "hugetlbfs present, but unreachable through the one path this package reads" - so it must NOT take the
+	# untracked-but-safe fallback: that would silently let a REAL reservation happen with nothing tracking it,
+	# exactly the risk this whole mechanism exists to close. Only when the sysfs interface is ALSO absent is a
+	# reservation genuinely impossible for anyone, anywhere on this host - the one case safe to let through.
 	if [[ ! -e $proc ]]; then
-		log_hugepages_note "BloxMiner: $proc does not exist (no hugetlbfs support on this host?) - huge-page tracking is not possible here; letting rx start anyway, without it"
+		if _hp_sysfs_hugetlb_present; then
+			log_hugepages_note "BloxMiner: $proc does not exist, but the kernel's hugetlb sysfs interface (${BLOX_SYSFS_ROOT:-/sys}/kernel/mm/hugepages) does - a reservation IS still possible here (XMRig can write that directly), just not through a path this package can track or restore; refusing to start rx rather than leave an untracked, unrestorable reservation"
+			return 1
+		fi
+		log_hugepages_note "BloxMiner: $proc does not exist (no hugetlbfs support on this host - checked both /proc and the kernel's own sysfs interface) - huge-page tracking is not possible here; letting rx start anyway, without it"
 		return 0
 	fi
 

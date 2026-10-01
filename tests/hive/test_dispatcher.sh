@@ -294,6 +294,13 @@ PROCROOT="$T/proc"; mkdir -p "$PROCROOT/sys/vm" "$PROCROOT/sys/kernel/random"
 PROCFILE="$PROCROOT/sys/vm/nr_hugepages"
 MEMINFO="$PROCROOT/meminfo"
 BOOTFILE="$PROCROOT/sys/kernel/random/boot_id"
+# PR #2 follow-up review (Codex): "Verify sysfs before allowing an untracked start" - BLOX_SYSFS_ROOT, the SAME
+# override engines/rx/h-config.sh's own 1gb-pages NUMA check and bloxsense already use, now also gates
+# _hp_sysfs_hugetlb_present. Empty (no hugepages-* entries at all) by default below, matching every EXISTING
+# "$PROCFILE absent" test's own assumption of genuinely NO hugetlbfs anywhere on the host - without this, those
+# tests would see ai02's own REAL /sys/kernel/mm/hugepages (hugetlbfs is commonly present on a real dev box)
+# and wrongly refuse instead of proceeding untracked.
+SYSROOT="$T/sys"; mkdir -p "$SYSROOT/kernel/mm/hugepages"
 printf 'boot-TEST-CONSTANT\n' > "$BOOTFILE"
 printf '1000.00 0.00\n' > "$PROCROOT/uptime"   # Round 5c: note_rx_hugepages_start now also needs /proc/uptime
 	# (start_uptime) to write a record at all - a static value throughout this section is fine, since the
@@ -353,7 +360,7 @@ chmod +x "$BLOX_DIR/xmrig"
 SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG PROCFILE MEMINFO BOOTFILE
 sysctl_called() { grep -q '^sysctl ' "$SYSCTL_LOG" 2>/dev/null; }
 hugepages_called() { grep -q '^hugepages ' "$SYSCTL_LOG" 2>/dev/null; }
-run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" MV_FAIL="${MV_FAIL:-0}" RM_FAIL="${RM_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # verus's own ./bloxminer binary is absent (exec fails harmlessly there); rx's ./xmrig is the working stub above
+run_h_run() { PATH="$FAKEBIN:$PATH" BLOX_PROCFS_ROOT="$PROCROOT" BLOX_SYSFS_ROOT="$SYSROOT" HUGEPAGES_TARGET="${HUGEPAGES_TARGET:-1200}" HUGEPAGES_FREE0="${HUGEPAGES_FREE0:-100}" SYSCTL_FAIL="${SYSCTL_FAIL:-0}" MV_FAIL="${MV_FAIL:-0}" RM_FAIL="${RM_FAIL:-0}" timeout 2 bash "$BLOX_DIR/h-run.sh" > /dev/null 2>&1; }   # verus's own ./bloxminer binary is absent (exec fails harmlessly there); rx's ./xmrig is the working stub above
 # marks the CURRENT record final=1, ours=<live nr_hugepages> - simulates a successful finalize_rx_hugepages
 # poll (real end-to-end finalization behaviour, including the exact xmrig-src-derived formula, is covered in
 # tests/hive/test_hugepage_finalization.sh) so this section can test restore_verus_hugepages's OWN logic.
@@ -919,6 +926,29 @@ else
 fi
 printf '%s\n' "$PROCFILE_BACKUP_CONTENT2" > "$PROCFILE"   # restore for every test below (file re-created)
 printf '%s\n' "$BOOTFILE_BACKUP2" > "$BOOTFILE"
+echo 0 > "$PROCFILE"
+
+# ---- PR #2 follow-up review (Codex): "Verify sysfs before allowing an untracked start" - vm.nr_hugepages is
+#      absent, but the kernel's own hugetlb sysfs interface (/sys/kernel/mm/hugepages/hugepages-<size>) is NOT:
+#      this host genuinely CAN reserve (XMRig writes that sysfs path directly when /proc is unavailable), just
+#      not through a path this package can track or restore - the untracked-but-safe fallback above must NOT
+#      apply here. Must refuse the whole rx start, before ever calling `hugepages -rx` - no rollback needed.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+PROCFILE_BACKUP_CONTENT3=$(cat "$PROCFILE" 2>/dev/null); rm -f "$PROCFILE"
+mkdir -p "$SYSROOT/kernel/mm/hugepages/hugepages-2048kB"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "but the kernel's hugetlb sysfs interface" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "baseline absent but hugetlb sysfs present: refused (reservation is still possible, just untrackable), logged"
+else
+	bad "baseline absent but hugetlb sysfs present: refused, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+if ! grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then
+	ok "baseline absent but hugetlb sysfs present: hugepages -rx NEVER called - refused before ever reserving"
+else
+	bad "baseline absent but hugetlb sysfs present: hugepages -rx never called" "$(cat "$SYSCTL_LOG")"
+fi
+rm -rf "$SYSROOT/kernel/mm/hugepages/hugepages-2048kB"   # restore "no sysfs" for every test below
+printf '%s\n' "$PROCFILE_BACKUP_CONTENT3" > "$PROCFILE"
 echo 0 > "$PROCFILE"
 
 # ---- Same class, but the file EXISTS and is readable - hugetlbfs IS present, so a later `hugepages -rx` WILL
