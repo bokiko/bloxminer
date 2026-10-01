@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: release build (same script as the published binary)
         run: build/build.sh -O3 out
+      - name: package.sh version-mismatch opt-in gate
+        run: tests/build/test_package.sh
       - name: patched source for unit tests and a sanitizer build
         run: tests/engine/prepare_source.sh src
       - name: sensor unit tests (fake sysfs)

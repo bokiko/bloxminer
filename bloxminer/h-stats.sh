@@ -39,22 +39,34 @@
 # would let a PREVIOUS poll's values silently stand as THIS poll's answer - a positive rate surviving a
 # stalled/dead poll right after it. Cleared here means the rest of this file can never "forget" to answer.
 khs=""; stats=""
-# ONE absolute deadline for the WHOLE poll, computed at the TRUE entry point of this script - before even
-# manifest parsing, let alone anything below. No dispatcher sits above this file in the single-engine package
-# (unlike the 3.0.0 line this was ported from, which shares one deadline across engine selection + collection);
-# this is simply the poll's own start.
-if [[ -z ${DEADLINE_US:-} ]]; then
-	__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
-	# EPOCHREALTIME's own fraction is already exactly 6 digits (real microseconds), but the `date +%s.%N`
-	# fallback's is 9 (nanoseconds) - concatenating it raw silently inflated the result by 1000x whenever that
-	# fallback path was ever taken (bash < 5 only, but load-bearing if it ever is). Pad with trailing zeros
-	# first, then keep only the first 6 digits - normalizes either source to exactly 6 real microsecond digits,
-	# no fork. now_us() below applies the identical normalization on every later call.
-	__t_frac="${__t#*.}000000"
-	__t_us="${__t%%.*}${__t_frac:0:6}"
-	DEADLINE_US=$(( __t_us + 2400000 ))   # a 2.4 s budget out of Hive's own ~3 s stats-script ceiling
-	unset __t __t_frac __t_us
-fi
+# ONE absolute deadline for the WHOLE poll, computed UNCONDITIONALLY at the TRUE entry point of this script -
+# before even manifest parsing, let alone anything below. No dispatcher sits above this file in the
+# single-engine package (unlike the 3.0.0 line this was ported from, where a dispatcher recomputes DEADLINE_US
+# once per poll, exports it, and sources the ENGINE's own h-stats.sh - whose `if [[ -z ${DEADLINE_US:-} ]]`
+# guard only ever sees a value the dispatcher just set THIS poll, so the guard is a no-op there and only a
+# true fallback for a standalone sourcing with no dispatcher above it at all, e.g. a test).
+#
+# Hive's real agent sources THIS file - the one and only poll entry point in a single-engine package - directly
+# and REPEATEDLY in the SAME long-lived shell, poll after poll (the same reason $khs/$stats are reset
+# unconditionally just above). Porting that `if [[ -z ]]` guard verbatim onto a file that itself IS the one
+# sourced on every poll was a bug, not just unnecessary: DEADLINE_US is a plain shell global, so once poll 1
+# sets it, the guard keeps it on every later poll (`-z` is false forever after) - poll 2 onward computes
+# remaining_us against a deadline that is already minutes/hours in the PAST, have_budget_us is false before
+# the first check, api() refuses to even attempt a `nc` call, and every poll after the first reports khs=0
+# with the API never actually contacted - on a real rig, every poll after the first would show 0 hashrate
+# forever, indistinguishable from a dead miner. Computed fresh, unconditionally, every single sourcing instead -
+# exactly the single-engine BloxMiner-X package's own h-stats.sh (which has the identical "no dispatcher above
+# it" shape) already does.
+__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
+# EPOCHREALTIME's own fraction is already exactly 6 digits (real microseconds), but the `date +%s.%N`
+# fallback's is 9 (nanoseconds) - concatenating it raw silently inflated the result by 1000x whenever that
+# fallback path was ever taken (bash < 5 only, but load-bearing if it ever is). Pad with trailing zeros
+# first, then keep only the first 6 digits - normalizes either source to exactly 6 real microsecond digits,
+# no fork. now_us() below applies the identical normalization on every later call.
+__t_frac="${__t#*.}000000"
+__t_us="${__t%%.*}${__t_frac:0:6}"
+DEADLINE_US=$(( __t_us + 2400000 ))   # a 2.4 s budget out of Hive's own ~3 s stats-script ceiling
+unset __t __t_frac __t_us
 
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
 

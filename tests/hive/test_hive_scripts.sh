@@ -256,6 +256,52 @@ else
 	bad "now_us() fallback path: normalized to real microseconds" "now_us=$now_us_fallback ref_us=$ref_us"
 fi
 
+# ---- P1 (2df9b2d): Hive's real agent sources h-stats.sh REPEATEDLY in the SAME long-lived shell, poll after
+# poll - this file IS the one and only poll entry point in a single-engine package (no dispatcher recomputes a
+# shared DEADLINE_US once per poll the way the multi-engine 3.0.0 line's dispatcher does). An earlier version of
+# this file ported that line's `if [[ -z ${DEADLINE_US:-} ]]` guard verbatim: DEADLINE_US is a plain shell
+# global, so poll 1 set it and the guard then kept THAT value on every later poll in the same shell forever -
+# poll 2 onward started with an already-expired deadline, never even attempted the `nc` call, and reported
+# khs=0 with a perfectly healthy API, indistinguishable on a real rig from a dead miner. Proves BOTH halves:
+# every poll (back-to-back AND separated by real gaps past the 2.4 s budget) returns a positive khs with valid
+# stats, AND the repeated sourcing leaves no growing fd or child-process trail behind in that same shell.
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+grep -q ready "$T/api.out" || bad "sourced repeatedly in one shell" "fake API did not start: $(cat "$T/api.out" 2>/dev/null)"
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(timeout 20 bash -c '
+	before_fds=$(ls /proc/$$/fd 2>/dev/null | wc -l)
+	. "$BLOX_DIR/h-stats.sh"; r1="$khs|$stats"            # poll 1
+	. "$BLOX_DIR/h-stats.sh"; r2="$khs|$stats"             # poll 2, back-to-back (same second)
+	sleep 2.6                                              # > the 2.4 s budget poll 1 computed its deadline from
+	. "$BLOX_DIR/h-stats.sh"; r3="$khs|$stats"             # poll 3, after a real gap
+	sleep 2.6
+	. "$BLOX_DIR/h-stats.sh"; r4="$khs|$stats"             # poll 4, after another real gap
+	after_fds=$(ls /proc/$$/fd 2>/dev/null | wc -l)
+	after_children=$(pgrep -P $$ 2>/dev/null | wc -l)
+	jq -nc --arg a "$r1" --arg b "$r2" --arg c "$r3" --arg d "$r4" \
+		--arg bf "$before_fds" --arg af "$after_fds" --arg ac "$after_children" \
+		"{p1:\$a,p2:\$b,p3:\$c,p4:\$d,before_fds:(\$bf|tonumber),after_fds:(\$af|tonumber),after_children:(\$ac|tonumber)}"
+' 2>&1)
+all_positive=true
+for key in p1 p2 p3 p4; do
+	k=$(jq -r --arg k "$key" '.[$k] // "" | split("|")[0]' <<< "$res" 2>/dev/null)
+	s=$(jq -r --arg k "$key" '.[$k] // "" | split("|")[1] // ""' <<< "$res" 2>/dev/null)
+	awk -v x="${k:-0}" 'BEGIN{exit !(x>0)}' || all_positive=false
+	[[ -n $s && $s == "{"*"}" ]] || all_positive=false
+done
+bf=$(jq -r '.before_fds // -1' <<< "$res" 2>/dev/null); af=$(jq -r '.after_fds // -1' <<< "$res" 2>/dev/null)
+ac=$(jq -r '.after_children // -1' <<< "$res" 2>/dev/null)
+if $all_positive && [[ $bf == "$af" ]] && [[ $ac == 0 ]]; then
+	ok "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd/child leak"
+else
+	bad "sourced repeatedly in one shell (back-to-back + >2.4s gaps): every poll khs>0 w/ stats, no fd/child leak" \
+		"res=$res before_fds=$bf after_fds=$af after_children=$ac"
+fi
+
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
 # leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
 for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done

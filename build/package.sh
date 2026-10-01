@@ -20,8 +20,13 @@ ENGINE_VER=$(p version)
 # stale/wrong binary being shipped under the wrong version number, and only the caller packaging a deliberate
 # hotfix knows the mismatch here is expected rather than a mistake.
 if [[ $ENGINE_VER != "$VER" ]]; then
-	[[ -n ${BLOX_PACKAGE_ALLOW_VERSION_MISMATCH:-} ]] || {
-		echo "binary version $ENGINE_VER != h-manifest.conf CUSTOM_VERSION $VER (scripts-only hotfix? set BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 to package this already-verified binary under the new package version)"
+	# Exact-match the opt-in to the literal string "1" - anything else (unset, empty, "0", "false", "yes", a
+	# typo) must leave the gate closed. `[[ -n ... ]]` treated ANY non-empty value as "yes", so an operator
+	# setting BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=0 to mean "no" (a common shell convention elsewhere) would
+	# have silently been let through by this gate - the one place this check exists to prevent an accidental
+	# mismatched ship, defeated by the most natural-looking way to write "false".
+	[[ ${BLOX_PACKAGE_ALLOW_VERSION_MISMATCH:-} == 1 ]] || {
+		echo "binary version $ENGINE_VER != h-manifest.conf CUSTOM_VERSION $VER (scripts-only hotfix? set BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1, exactly \"1\", to package this already-verified binary under the new package version - any other value, including 0/false/yes, is treated as not set)"
 		exit 1
 	}
 	echo "binary version $ENGINE_VER != h-manifest.conf CUSTOM_VERSION $VER - BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 is set, packaging the existing binary under the new package version"
