@@ -1,40 +1,313 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034   # khs and stats (set far below) are read by the Hive agent that sources this
+	# file - this directive must stay file-level (before any code at all) to cover both.
 # Sourced by the Hive agent: must set $khs (total kH/s) and $stats (JSON). The miner does the work (topology,
 # temperatures, power, freshness); this script only reads its local API and checks the reply is complete.
 # Rows: one per physical core (SMT threads summed) when every thread is bound and the topology resolves,
 # else one per thread (both from the `cores` command); else a single FRESHKHS row; else 0.
 # A stalled miner (every thread overdue, STALL=1) reports 0, never its last rate.
-# shellcheck disable=SC2034   # khs and stats are read by the Hive agent that sources this file
+#
+# 2.1.1: a from-scratch BloxMiner development line (the combined Verus+RandomX "3.0.0" branch) found and fixed
+# a class of bug in this exact collector through many rounds of review, and this file ports those fixes back
+# onto the single-engine 2.1.0 package (engine binary unchanged - see build/package.sh). An earlier version of
+# this file cached the last positive $khs and served it on a missed deadline, gated by a short liveness probe.
+# That was wrong: a live process (even the SAME instance) proves nothing about whether it is still hashing,
+# "any nonempty reply" is a weak gate (it does not even notice STALL=1/FRESHKHS=0 in the cached sample), and
+# the probe's own extra time ran past the total deadline. Redesign: the hashrate is NEVER cached. Each poll is
+# split into
+#   Phase A (mandatory, cheap): one `summary` call - already gives STALL, FRESHKHS, ACC/REJ/UPTIME/POWER/TEMP.
+#     This alone is enough to answer honestly every time: STALL=1 -> 0 immediately; otherwise FRESHKHS as a
+#     single-row total. Written to $OUTFILE the moment it is ready.
+#   Phase B (optional, whatever budget remains): the `cores` call, for a real per-core breakdown - overwrites
+#     Phase A's answer with a richer one if it validates in time, but Phase A's answer already sitting in
+#     $OUTFILE means a kill during Phase B never loses it.
+# So a poll's answer is always either genuinely fresh (this exact call, this exact poll) or the defined 0 - not
+# a cache with an age bound, because there is no cache left to bound.
+#
+# The whole collection (both `nc` calls plus the `field()` parsing loop below, one per API field AND per
+# `cores` row - tr+grep+cut, three forks each, would have been - see field() below, now fork-free) runs inside
+# a single, ONE-absolute-deadline, killable child. On a rig with many physical cores the per-row parsing loop
+# runs `field()` many times, and on a small/saturated cpuset that cost alone was measured to push the WHOLE
+# script multiple seconds past its budget with nothing to show for it (tests/hive/test_verus_under_load.sh:
+# taskset -c 0 with the CPU fully saturated reproduced 8+ s runs with no result at all, before field() was made
+# fork-free). `api()`'s own `timeout nc` runs with `--foreground` so it stays in the SAME process group as this
+# whole collection (a bare `timeout` would otherwise start `nc` in a NEW group of its own, which the outer
+# group-kill below could not reach).
+# Reset $khs/$stats UNCONDITIONALLY, before any other work - the very first thing this poll does. Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll; $khs/$stats are plain global
+# variables, so anything that leaves them untouched (rather than explicitly assigning, even to the honest 0)
+# would let a PREVIOUS poll's values silently stand as THIS poll's answer - a positive rate surviving a
+# stalled/dead poll right after it. Cleared here means the rest of this file can never "forget" to answer.
+khs=""; stats=""
+# ONE absolute deadline for the WHOLE poll, computed at the TRUE entry point of this script - before even
+# manifest parsing, let alone anything below. No dispatcher sits above this file in the single-engine package
+# (unlike the 3.0.0 line this was ported from, which shares one deadline across engine selection + collection);
+# this is simply the poll's own start.
+if [[ -z ${DEADLINE_US:-} ]]; then
+	__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
+	# EPOCHREALTIME's own fraction is already exactly 6 digits (real microseconds), but the `date +%s.%N`
+	# fallback's is 9 (nanoseconds) - concatenating it raw silently inflated the result by 1000x whenever that
+	# fallback path was ever taken (bash < 5 only, but load-bearing if it ever is). Pad with trailing zeros
+	# first, then keep only the first 6 digits - normalizes either source to exactly 6 real microsecond digits,
+	# no fork. now_us() below applies the identical normalization on every later call.
+	__t_frac="${__t#*.}000000"
+	__t_us="${__t%%.*}${__t_frac:0:6}"
+	DEADLINE_US=$(( __t_us + 2400000 ))   # a 2.4 s budget out of Hive's own ~3 s stats-script ceiling
+	unset __t __t_frac __t_us
+fi
+
 . "${BLOX_DIR:-/hive/miners/custom/bloxminer}/h-manifest.conf"   # BLOX_DIR: tests only
 
-deadline=$(( $(date +%s) + 3 ))                 # one 3 s budget for every API call together
-api() { local left=$(( deadline - $(date +%s) )); (( left < 1 )) && return 1
-        echo -n "$1" | timeout "$left" nc 127.0.0.1 "${BLOX_API_PORT:-4068}" 2>/dev/null | tr -d '\0'; }
+VPORT=${BLOX_API_PORT:-4068}
+export VPORT CUSTOM_VERSION CUSTOM_CONFIG_FILENAME
+
+# dbg <msg> - appends a timestamped line to $BLOX_HSTATS_DEBUG_LOG iff that variable is set (never on a real
+# Hive rig), a single [[ ]] test - no fork at all - when unset. Every call site guards its OWN argument
+# construction the same way whenever that argument would otherwise fork (e.g. a command substitution) - dbg()'s
+# internal check alone only stops the write, not a fork bash already performed while building the string to
+# pass it.
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s h-stats[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }
+export BLOX_HSTATS_DEBUG_LOG   # so the setsid'd child below inherits it too - unset is a no-op either way
+
+LIB=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-lib.XXXXXX") || {
+	dbg "LIB mktemp FAILED - emergency fallback"
+	khs=0; stats=""
+	return 0 2>/dev/null || exit 0
+}
+cat > "$LIB" <<'LIBEOF'
+# Budget arithmetic below is pure bash - NO FORK AT ALL (was `date` + `awk` on every single check).
+dbg() { [[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && printf '%s h-stats[%s] %s\n' "${EPOCHREALTIME:-?}" "$$" "$*" >> "$BLOX_HSTATS_DEBUG_LOG" 2>/dev/null; return 0; }   # see the parent's own copy of this function for the full rationale
+
+now_us() {   # sets $REPLY = now, integer microseconds since epoch
+	local t=${EPOCHREALTIME:-} frac
+	[[ -n $t ]] || t=$(date +%s.%N)   # bash < 5 fallback (forks) - never expected on Ubuntu 22.04+/HiveOS
+	# EPOCHREALTIME's own fraction is already exactly 6 digits (real microseconds), but the `date +%s.%N`
+	# fallback's is 9 (nanoseconds) - concatenating it raw, as before, silently inflated the result by 1000x
+	# whenever that fallback path was ever taken. Pad with trailing zeros first, then keep only the first 6
+	# digits - normalizes either source (6-digit already, 9-digit, or shorter/missing) to exactly 6 real
+	# microsecond digits, no fork.
+	frac="${t#*.}000000"
+	REPLY="${t%%.*}${frac:0:6}"
+}
+remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEADLINE_US, floored at 0 -
+	# DEADLINE_US is computed exactly once, by the PARENT, before the child is even launched (process
+	# setup/exec time counts against the budget, not just the child's own post-launch work), and passed
+	# through launch/collection/enrichment/cleanup as a single shared value - never re-derived from a fresh
+	# "now" partway through, which would silently grant extra time on top of what was already spent.
+	local n; now_us; n=$REPLY
+	REPLY=$(( DEADLINE_US - n ))
+	(( REPLY < 0 )) && REPLY=0
+}
+have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
+cap_us() { (( $1 < $2 )) && REPLY=$1 || REPLY=$2; }   # min(remaining, nominal per-step ceiling), both in us
+us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout` below - no fork
+	local us=$1 f
+	printf -v f '%06d' $(( us % 1000000 ))
+	REPLY="$(( us / 1000000 )).$f"
+}
+# wait_secs <fd> <seconds, may be fractional e.g. "0.05"> - the poll loop below already compares its deadline
+# fork-free (remaining_us/have_budget_us, above), but its own pacing still forked an external `sleep` every
+# iteration. `read -t` against a private fd the caller opens ONCE (`{ exec {fd}<> <(:); } 2>/dev/null`) always
+# times out after almost exactly <seconds>, a plain builtin, no external process per call. <fd> < 0 (the
+# one-time fd open itself failed - not expected in practice) falls back to the external `sleep`, the prior
+# behaviour.
+wait_secs() {
+	local fd=$1 secs=$2
+	if (( fd >= 0 )); then
+		read -r -t "$secs" -u "$fd" _ 2>/dev/null
+	else
+		sleep "$secs" 2>/dev/null
+	fi
+	true
+}
 num()  { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 int()  { [[ $1 =~ ^[0-9]+$ ]]; }
+# --foreground: see the file header - keeps `nc` in this collection's own process group so the outer group-kill
+# (below) can always reach it, even though `timeout` would otherwise isolate it into a new group of its own.
+api() {
+	remaining_us; have_budget_us "$REPLY" || return 1
+	cap_us "$REPLY" 600000; us_to_secstr "$REPLY"
+	echo -n "$1" | timeout --foreground "$REPLY" nc 127.0.0.1 "$VPORT" 2>/dev/null | tr -d '\0'
+}
+# field <"KEY=val;KEY=val|..."> <KEY> - the first "KEY=" segment's value (";" and "|" both act as separators),
+# or empty if absent. Pure parameter expansion - NO fork at all (was `tr ';|' '\n\n' | grep -m1 "^$2=" | cut
+# -d= -f2-`, three forks every single call). first-match-wins, matching grep -m1's semantics.
+field() {
+	local s=$1 key=$2 tok
+	while [[ -n $s ]]; do
+		tok=${s%%[;|]*}
+		if [[ ${#tok} -lt ${#s} ]]; then s=${s:$((${#tok}+1))}; else s=""; fi
+		if [[ $tok == "$key="* ]]; then printf '%s' "${tok#"$key"=}"; return 0; fi
+	done
+}
 
-sum=$(api summary)
-if [[ -z $sum ]]; then khs=0; stats=""; return 0 2>/dev/null || exit 0; fi
-field() { tr ';|' '\n\n' <<< "$1" | grep -m1 "^$2=" | cut -d= -f2-; }
-acc=$(field "$sum" ACC); rej=$(field "$sum" REJ); up=$(field "$sum" UPTIME); ver=$(field "$sum" VER)
-stall=$(field "$sum" STALL); fresh=$(field "$sum" FRESHKHS); power=$(field "$sum" POWER); ptemp=$(field "$sum" TEMP)
-int "$acc" || acc=0; int "$rej" || rej=0; num "$up" || up=0; [[ -n $ver ]] || ver=$CUSTOM_VERSION
-int "$ptemp" || ptemp=""
+# write_result <khs> <stats-json> - atomic (tmp+rename) write of this poll's answer to $OUTFILE. Called once
+# after Phase A (the mandatory, always-fresh single-row answer) and again after Phase B if it improves on it -
+# never the other way around, and never with anything but data this exact poll just collected.
+# This used to be `printf '%s' "$(jq -nc ...)" > "$tmp" && mv -f "$tmp" "$OUTFILE"` - if the jq command
+# substitution failed (a transient jq/fork-under-resource-pressure failure), `$(...)` comes back empty,
+# `printf '%s' ""` still successfully writes a ZERO-BYTE file (a trivially successful redirect, not a failure
+# the `&&` could ever catch), and `mv -f` then unconditionally replaces $OUTFILE - an earlier phase's own
+# already-good result - with that empty file. The parent's own read-back would then have no choice but to
+# report the safe-but-wrong fallback 0. jq's own output is now captured into a plain variable FIRST and
+# checked (jq's own exit status, non-empty, looks like a JSON object) - only a call that passes all three
+# ever reaches the write; anything else leaves $OUTFILE exactly as an earlier phase left it, logged via dbg().
+write_result() {
+	local tmp="$OUTFILE.w.$$" out rc
+	if [[ -n ${BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL:-} ]]; then
+		out=""; rc=1   # tests only: deterministically simulates jq itself failing (a fork/exec failure, or
+			# jq genuinely unavailable) inside THIS function specifically, independent of whether a caller's
+			# own upstream composition succeeded - exercises this guard directly, on every host the same way
+	else
+		out=$(jq -nc --arg k "$1" --arg s "$2" '{khs: $k, stats: $s}' 2>&1); rc=$?
+	fi
+	if (( rc != 0 )) || [[ -z $out ]] || [[ $out != "{"*"}" ]]; then
+		dbg "write_result: REFUSED - jq failed or produced empty/non-object output (rc=$rc, was: '$out') - \$OUTFILE left as-is"
+		return 1
+	fi
+	{ printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
+}
 
-hs=(); temps=(); ok=0
-if [[ $stall != 1 ]]; then
+# phase_a_stats_gate <candidate-stats-json> - sets $REPLY to a stats value safe to hand to write_result: the
+# candidate itself if it passes every check, otherwise an honest minimal object built from $khs/$acc/$rej/$up
+# (already-known scalars every caller of this function has validated before calling it). A single,
+# unconditional gate every Phase-A-class composition in this file (Phase A's own, and the pstall-in-Phase-B
+# branch, which shares the identical 4-nested-jq-into-one-outer-jq shape) passes through before ever reaching
+# write_result - "whatever happened upstream, what write_result gets is always a validated non-empty JSON
+# object or the minimal literal". write_result() cannot enforce that centrally the way it enforces its own
+# non-empty-output check: an intentionally empty "" is ALSO this file's legitimate "no stats" sentinel for the
+# no-API-answer case (run()'s very first line), so emptiness alone can never be centrally rejected there
+# without breaking that - the distinction can only be made HERE, at each Phase-A-class call site, which knows
+# whether it is composing real stats or deliberately signalling "none".
+#
+# The first version of this gate used `jq -e '<filter>' <<< "$candidate"` ALONE to detect an empty/invalid
+# candidate - and that behaves differently depending on jq's own version: `jq -e '<any filter>' <<< ""` (EMPTY
+# input - zero JSON values to evaluate at all, nothing for -e to call false/null) exits 0 on jq 1.6 (the
+# Ubuntu 22.04 apt package - HiveOS's own base) "vacuously successful", but exits 4 on jq 1.7+ - a real,
+# version-dependent difference in how "-e with zero outputs" is treated, not something either script can
+# control. A non-empty but MALFORMED candidate does NOT have this problem (both versions reliably fail -e on
+# it) - it is specifically the EMPTY case this gate exists to catch that jq's own exit code cannot be trusted
+# for. Fixed: emptiness/shape is checked with a plain BASH pattern match FIRST (deterministic on every jq
+# version, or even with no jq installed at all) - jq -e is only ever reached once the candidate is already
+# proven non-empty and object-shaped, where both versions agree.
+phase_a_stats_gate() {
+	local candidate=$1
+	if [[ -n $candidate && $candidate == "{"*"}" ]] \
+		&& jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$candidate"
+	then
+		REPLY=$candidate
+		return 0
+	fi
+	dbg "phase_a_stats_gate: composition invalid/empty (was: '$candidate') - writing the honest minimal object instead, khs=$khs stands"
+	REPLY=$(jq -nc --argjson k "$khs" --argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" \
+		'{hs: [$k], hs_units: "khs", temp: [null], fan: [0], bus_numbers: [null], uptime: $uptime, ar: [$acc, $rej], algo: "verushash"}' 2>/dev/null)
+	if [[ -z $REPLY || $REPLY != "{"*"}" ]]; then
+		# even the minimal composition's own jq call failed (jq itself broken/missing, or still under the same
+		# resource pressure) - printf, no fork: $khs/$acc/$rej/$up are all already validated numeric (num()/
+		# int() above, or produced by this function itself), safe to interpolate raw; no string field (ver) is
+		# included here at all, avoiding any escaping risk from an untrusted string.
+		printf -v REPLY '{"hs":[%s],"hs_units":"khs","temp":[null],"fan":[0],"bus_numbers":[null],"uptime":%s,"ar":[%s,%s],"algo":"verushash"}' "$khs" "${up%.*}" "$acc" "$rej"
+	fi
+}
+
+# Sets $khs/$stats and writes $OUTFILE at least once (Phase A).
+run() {
+	local sum acc rej up ver stall fresh power ptemp cores head gen age rows cov pstall percore want
+	local ok hs temps n k t id pk co cpus ncpu r
+
+	sum=$(api summary)
+	if [[ -z $sum ]]; then khs=0; stats=""; write_result "$khs" "$stats"; return 0; fi
+	acc=$(field "$sum" ACC); rej=$(field "$sum" REJ); up=$(field "$sum" UPTIME)
+	stall=$(field "$sum" STALL); fresh=$(field "$sum" FRESHKHS); power=$(field "$sum" POWER); ptemp=$(field "$sum" TEMP)
+	int "$acc" || acc=0; int "$rej" || rej=0; num "$up" || up=0
+	int "$ptemp" || ptemp=""
+	# $CUSTOM_VERSION (the package release, from h-manifest.conf) is shown, never the engine binary's own API
+	# VER field: a hotfix package (like this one) intentionally ships an UNCHANGED, already-gated binary, so
+	# the engine's own VER can legitimately lag the package version it is shipped inside - showing it instead
+	# would display the wrong release number on the miner screen and in Hive's farm view.
+	ver=$CUSTOM_VERSION
+
+	# ---- Phase A (mandatory): honest, THIS-POLL answer from summary alone - STALL=1 -> 0, else FRESHKHS as a
+	# single row. Written now, before Phase B (the `cores` call) is even attempted, so a kill during Phase B can
+	# never lose it.
+	if [[ $stall == 1 ]]; then
+		khs=0; hs=(0); temps=("${ptemp:-null}")
+	else
+		num "$fresh" || fresh=0                             # the miner's freshness-aware total, never raw KHS
+		khs=$fresh; hs=("$fresh"); temps=("${ptemp:-null}")
+	fi
+	n=${#hs[@]}
+	# This composition chains FOUR nested jq calls (command substitutions for hs/temp/fan/bus) into ONE outer
+	# jq call, same shape as Phase B's own final composition below - and, same as that one, any single nested
+	# call failing (a transient fork/exec failure under resource pressure) leaves $stats empty while $khs
+	# already holds a real, positive number. This used to be written UNCONDITIONALLY - write_result would wrap
+	# an empty $stats as a literal empty JSON string (`"stats":""`, not the empty/malformed shape write_result's
+	# own guard below can catch, since --arg always succeeds regardless of content) and the parent would report
+	# a positive khs with NO stats at all. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL deterministically simulates
+	# a nested jq failure for tests, the same way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL already does for
+	# write_result() itself - forcing the exact downstream symptom directly is more reliable than trying to
+	# reproduce the actual fork-pressure root cause on demand. Validated by phase_a_stats_gate() below, a single
+	# unconditional gate every Phase-A-class composition in this file passes through before ever reaching
+	# write_result - see that function's own header for why it no longer trusts jq -e ALONE to detect an empty
+	# candidate (jq 1.6, the GitHub Actions ubuntu-22.04 runner's own apt package and HiveOS's own base,
+	# behaves differently from jq 1.7+ for this exact check on empty input - see below).
+	if [[ -n ${BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL:-} ]]; then
+		stats=""
+	else
+		stats=$(jq -nc \
+			--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
+			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
+			--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
+			--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
+			--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
+			  algo: "verushash", ver: $ver}
+			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+	fi
+	phase_a_stats_gate "$stats"; stats=$REPLY
+	write_result "$khs" "$stats"
+	(( stall == 1 )) && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
+	local khs_a=$khs   # Phase A's own total, kept aside - Phase B may add detail rows but may only ever
+		# REPLACE this with its own total when that total is complete AND consistent with it (never a
+		# validly-formatted-but-zero cores reply quietly outvoting a positive, fresher summary rate)
+
+	# ---- Phase B (optional): per-core breakdown, whatever budget remains. Only ever OVERWRITES Phase A's
+	# answer with a richer one built from data collected THIS SAME poll - never a substitute for it.
+	[[ -n ${BLOX_HSTATS_TEST_PHASEB_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_PHASEB_DELAY"   # tests only
+	remaining_us; have_budget_us "$REPLY" || return 0
 	cores=$(api cores)
+	[[ -z $cores ]] && return 0
 	head=${cores%%|*}
 	gen=$(field "$head" GEN); age=$(field "$head" AGE); rows=$(field "$head" ROWS); cov=$(field "$head" THREADS)
 	pstall=$(field "$head" STALL); percore=$(field "$head" PERCORE)
 	want=$(jq -r '.threads // empty' "$CUSTOM_CONFIG_FILENAME" 2>/dev/null)
-	[[ $pstall == 1 ]] && stall=1                               # a stall seen by either reply counts
-	# accept only a fresh, complete reply that covers every configured thread exactly once
-	if [[ $stall != 1 ]] && int "$gen" && (( gen > 0 )) && num "$age" && awk -v a="$age" 'BEGIN{exit !(a <= 6)}' &&
+	if [[ $pstall == 1 ]]; then
+		# A stall seen in THIS reply (even though summary's own STALL said 0) is real, fresh information from
+		# the SAME poll - a stall detected by either reply always counts (unchanged from the original,
+		# pre-redesign semantics). It must OVERWRITE Phase A's FRESHKHS-based answer with an honest 0, never
+		# silently leave a positive number standing just because Phase A ran first.
+		khs=0; hs=(0); temps=("${ptemp:-null}")
+		# Same 4-nested-jq-into-one-outer-jq shape as Phase A's own composition above, same risk - routed
+		# through the same phase_a_stats_gate() (see its own header for the full rationale, including why a
+		# plain jq -e re-check alone is not enough on jq 1.6).
+		stats=$(jq -nc --argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
+			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
+			--argjson fan "$(jq -nc '[0]')" --argjson bus "$(jq -nc '[null]')" \
+			--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
+			  algo: "verushash", ver: $ver}
+			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+		phase_a_stats_gate "$stats"; stats=$REPLY
+		write_result "$khs" "$stats"
+		return 0
+	fi
+	ok=0
+	if int "$gen" && (( gen > 0 )) && num "$age" && awk -v a="$age" 'BEGIN{exit !(a <= 6)}' &&
 	   int "$want" && (( want > 0 )) && int "$rows" && (( rows > 0 && rows <= want )) &&
 	   [[ $cov == "$want/$want" && $pstall == 0 && ( $percore == 0 || $percore == 1 ) ]] &&
 	   { [[ $percore == 1 ]] || (( rows == want )); }; then
-		ok=1; declare -A seen=() seencpu=(); ncpu=0; n=0
+		ok=1; declare -A seen=() seencpu=(); ncpu=0; n=0; hs=(); temps=()
 		IFS='|' read -ra parts <<< "${cores#*|}"
 		for r in "${parts[@]}"; do
 			[[ -z $r ]] && continue
@@ -55,24 +328,171 @@ if [[ $stall != 1 ]]; then
 		(( n == rows )) || ok=0                         # a truncated reply is not used
 		[[ $percore == 1 ]] && (( ncpu != want )) && ok=0   # per-core rows must cover every thread's CPU
 	fi
-fi
+	(( ok )) || return 0   # Phase B did not validate - Phase A's answer (already written) stands, unchanged
 
-if (( ok )); then
-	khs=$(printf '%s\n' "${hs[@]}" | awk '{s+=$1} END{printf "%.2f", s}')
-elif [[ $stall == 1 ]]; then
-	khs=0; hs=(0); temps=("${ptemp:-null}")
+	local khs_b; khs_b=$(printf '%s\n' "${hs[@]}" | awk '{s+=$1} END{printf "%.2f", s}')
+	# consistent := Phase A itself has no confident positive rate (khs_a == 0 - nothing to protect a
+	# structurally-valid Phase B reading from), OR the two totals agree within 10% of Phase A's own value. A
+	# near-zero (not just exactly-zero) Phase B total quietly replacing a HEALTHY Phase A rate is exactly the
+	# false-zero this class of review caught - an exact-zero special case alone is not enough, hence the
+	# tolerance. When inconsistent, Phase A's WHOLE result (already written: khs_a + its own single-row stats)
+	# stands - never a mixed payload of Phase A's number with Phase B's (contradicting) per-core rows.
+	local consistent=0
+	awk -v b="$khs_b" -v a="$khs_a" 'BEGIN{
+		if (a+0 == 0) { exit 0 }
+		d = b - a; if (d < 0) d = -d
+		exit !(d <= 0.10 * a)
+	}' && consistent=1
+	(( consistent )) || return 0
+
+	# Built into a LOCAL variable first, validated, and only THEN assigned to $khs/$stats and written - never
+	# straight into the globals/$OUTFILE. This composition is 5 jq forks deep (the outer call plus 4 nested
+	# command substitutions for hs/temp/fan/bus) - any one of them failing (a transient fork/exec failure under
+	# resource pressure) would otherwise leave $stats empty/malformed while $khs already held a real, positive
+	# number (khs_b, assigned before this): write_result would then atomically overwrite Phase A's own
+	# already-good, already-written OUTFILE with invalid JSON, and the PARENT's read-back guard (which only ever
+	# sees $OUTFILE) would have no choice but to discard the whole thing and report the safe fallback 0 -
+	# destroying a real positive rate Phase A had already safely captured. Validating here, before touching
+	# $khs/$stats/$OUTFILE, is what prevents that; a caught failure leaves BOTH the globals and the file exactly
+	# as Phase A already left them.
+	n=${#hs[@]}
+	# The composition AND its validation are folded into ONE if-condition (via &&), not run as bare statements
+	# checked afterward - a bare failing statement outside an if/while condition risks the whole script being
+	# torn down by an inherited shell option before ever reaching an "if this failed" check that comes after it;
+	# every command that decides whether this replaces Phase A's result lives inside the if's own condition
+	# instead, which bash's error-handling rules always shield from that class of surprise.
+	local new_stats
+	if new_stats=$(jq -nc \
+			--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
+			--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
+			--argjson fan "$(jq -nc --argjson n "$n" '[range($n)] | map(0)')" \
+			--argjson bus "$(jq -nc --argjson n "$n" '[range($n)] | map(null)')" \
+			--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
+			'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
+			  algo: "verushash", ver: $ver}
+			 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)') \
+		&& jq -e 'type == "object" and (.hs | type) == "array" and (.hs | length) > 0 and
+			(.hs | all(type == "number")) and (.temp | type) == "array"' > /dev/null 2>&1 <<< "$new_stats"
+	then
+		khs=$khs_b
+		stats=$new_stats
+		write_result "$khs" "$stats"
+	fi   # else: final stats composition failed - Phase A's already-written result stands, untouched
+}
+LIBEOF
+
+# shellcheck disable=SC1090   # $LIB is a script this file just generated into a temp file, not a fixed path
+. "$LIB"
+
+BUDGET_US=2400000  # of the shared 3.0 s deadline - integer microseconds, for the forkless budget arithmetic
+                    # both this parent and the child (run(), via remaining_us) derive every timer from
+KILL_GRACE=0.3
+# $DEADLINE_US itself was already computed at the very top of this file - not re-derived here, which would
+# silently grant back whatever the manifest/LIB setup above already spent.
+
+# $OUTFILE is written to DIRECTLY by run() (via write_result), atomically, at least once after Phase A and
+# again after Phase B if that also completes - never captured from the child's stdout (a single final print is
+# not used): a kill mid-Phase-B must never erase Phase A's already-written, honest answer.
+OUTFILE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-out.XXXXXX") || OUTFILE=""
+HANDSHAKE=$(mktemp "${TMPDIR:-/tmp}/bloxminer-hstats-hs.XXXXXX") || HANDSHAKE=""
+PARENT_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+export OUTFILE
+
+if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
+	# shellcheck disable=SC2016   # $1/$2 are the child bash's own positional parameters, not this shell's
+	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
+		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
+		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
+		. "$1"
+		run
+	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
+	# stderr from everything inside run() goes to $BLOX_HSTATS_DEBUG_LOG when debugging, /dev/null otherwise.
+	CPID=$!
+
+	validated_pgid() {   # sets $REPLY to the verified pgid, or empty - no fork (was `echo`/`$(...)` + `cat`)
+		REPLY=""
+		local hs=""
+		[[ -s $HANDSHAKE ]] && { read -r hs < "$HANDSHAKE"; } 2>/dev/null   # bash builtin read, no fork (was cat)
+		[[ $hs =~ ^[0-9]+$ ]] || return 1
+		[[ $hs == "$CPID" && $hs != "$PARENT_PGID" ]] || return 1
+		(( hs > 1 )) || return 1
+		REPLY=$hs
+	}
+	still_running() {   # forkless (bash's builtin kill against the negative pgid)
+		local g; validated_pgid; g=$REPLY
+		if [[ -n $g ]]; then kill -0 -- "-$g" 2>/dev/null; else kill -0 "$CPID" 2>/dev/null; fi
+	}
+	escalate() {
+		local g; validated_pgid; g=$REPLY
+		if [[ -n $g ]]; then kill -"$1" -- "-$g" 2>/dev/null; else kill -"$1" "$CPID" 2>/dev/null; fi
+	}
+
+	# Bounded poll for $CPID, NOT `wait -n "$CPID" "$ALARM"` on a background alarm sleep: that construct can
+	# block for the FULL remaining budget even when $CPID has ALREADY exited, specifically when the invoking
+	# shell was itself started via `bash -c` (exactly how every poll in tests/hive/test_under_load.sh invokes
+	# this file: `bash -c '. "$BLOX_DIR/h-stats.sh"; ...'`) rather than as a script file - a real, reproducible
+	# bash job-control quirk. A poll loop against $DEADLINE_US directly (via the same forkless remaining_us/
+	# have_budget_us this whole file already uses for every other timing decision) has no such
+	# invocation-context dependency: it costs nothing extra when $CPID finishes promptly (the loop just exits on
+	# its very first check) and never waits any longer than the alarm-based version would have in the worst case
+	# either way.
+	# Deadline checked BEFORE the liveness probe on every iteration - the liveness probe (still_running, which
+	# calls validated_pgid, which reads $HANDSHAKE) is itself not free, and checking it first would let that
+	# cost silently eat into the budget on every single iteration instead of the loop simply exiting once the
+	# deadline alone says to stop.
+	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
+	# "exec {fd}... 2>/dev/null" with NO command after it is a bare redirection, not a command invocation - bash
+	# applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec 2>/dev/null` would), not just to
+	# this one statement; this is top-level script code, so there is not even a function scope to (wrongly) hope
+	# would limit it. That would silently redirect this whole process's stderr to /dev/null for the rest of its
+	# life the instant this ran once - and Hive sources h-stats.sh repeatedly in one long-lived shell, so every
+	# later poll's own stderr would be gone too. The `{ ...; } 2>/dev/null` group form keeps the SAME {fd}
+	# allocation (still visible after the group, since `{ }` is not a subshell) while scoping the redirect to
+	# only the command inside it.
+	waitfd=-1; { exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
+	while :; do
+		remaining_us; have_budget_us "$REPLY" || break
+		still_running || break
+		wait_secs "$waitfd" 0.05
+	done
+	if still_running; then
+		escalate TERM
+		wait_secs "$waitfd" "$KILL_GRACE"
+		still_running && escalate KILL
+		wait "$CPID" 2>/dev/null
+	fi
+	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
+	result=$(cat "$OUTFILE" 2>/dev/null)
+	rm -f "$OUTFILE" "$HANDSHAKE"
 else
-	num "$fresh" || fresh=0                             # the miner's freshness-aware total, never raw KHS
-	khs=$fresh; hs=("$fresh"); temps=("${ptemp:-null}")
+	result=""
 fi
+rm -f "$LIB"
 
-n=${#hs[@]}
-stats=$(jq -nc \
-	--argjson hs "$(printf '%s\n' "${hs[@]}" | jq -cs 'map(tonumber)')" \
-	--argjson temp "$(printf '%s\n' "${temps[@]}" | jq -cs '.')" \
-	--argjson fan "$(yes 0 | head -n "$n" | jq -cs .)" \
-	--argjson bus "$(yes null | head -n "$n" | jq -cs .)" \
-	--argjson uptime "${up%.*}" --argjson acc "$acc" --argjson rej "$rej" --arg ver "$ver" --arg w "$power" \
-	'{hs: $hs, hs_units: "khs", temp: $temp, fan: $fan, bus_numbers: $bus, uptime: $uptime, ar: [$acc, $rej],
-	  algo: "verushash", ver: $ver}
-	 + (if ($w | test("^[0-9]+$")) then {cpu_power: ($w | tonumber)} else {} end)')
+# Whatever $OUTFILE holds - Phase A's answer, or Phase B's richer one, or nothing at all if the child was
+# killed before Phase A even finished writing - is used as-is: no cache, no age bound, no re-verification,
+# because there is nothing here that was not collected THIS poll. Nothing written at all (killed too early, or
+# the LIB/OUTFILE/HANDSHAKE temp files themselves could not even be created) is the only case that falls back
+# to the defined, honest 0.
+# ONE jq call, not three (validate + extract $khs + extract $stats together): under heavy, CI-runner-scale
+# resource pressure a jq PROCESS SPAWN itself (not just a parse) can transiently fail - three separate calls
+# leave a window where the first (validate) succeeds but a later one silently returns empty, leaving $khs/
+# $stats empty rather than either the real answer or the defined fallback.
+# khs must be a finite, non-negative NUMBER (as a JSON string), not merely a nonempty one - a looser guard
+# would accept a non-numeric string (e.g. a stray error message written where khs belongs) as if it were a
+# real, honest rate.
+parsed=$(jq -r 'if (type == "object") and (.khs | type) == "string" and (.khs | test("^[0-9]+(\\.[0-9]+)?$"))
+	and has("stats") and (.stats | type) == "string"
+	then [.khs, .stats] | @tsv else empty end' <<< "$result" 2>/dev/null)
+if [[ -n $parsed ]]; then
+	IFS=$'\t' read -r khs stats <<< "$parsed"
+fi
+# Final, unconditional bash-level guard (belt and suspenders, independent of the jq filter above): $khs must
+# match a finite non-negative number - if it does not, THIS poll's answer is discarded and replaced with the
+# same honest, defined fallback as a genuine "nothing collected" poll, never an old value left standing from
+# whatever poll ran before this one in the same shell (see the top-of-file reset). $stats is allowed to be a
+# genuinely empty string (write_result's own convention for "no engine data" - the caller's engine screen
+# falls back to the miner's own plain output).
+if [[ ! ${khs:-} =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+	khs=0; stats=""
+fi

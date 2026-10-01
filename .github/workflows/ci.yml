@@ -19,6 +19,8 @@ jobs:
         run: shellcheck -s bash bloxminer/h-config.sh bloxminer/h-run.sh bloxminer/h-stats.sh build/*.sh tools/*.sh tests/*/*.sh
       - name: HiveOS script tests
         run: tests/hive/test_hive_scripts.sh
+      - name: HiveOS under-load tests (fork-free timing, no false zeros)
+        run: tests/hive/test_under_load.sh
       - name: hashing-identity tool controls
         run: tests/tools/test_hashing_identity.sh
 

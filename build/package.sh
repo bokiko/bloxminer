@@ -12,7 +12,20 @@ p() { sed -n "s/^$1=//p" "$PROV"; }
 [[ $(p binary_sha256) == $(sha256sum "$BIN" | cut -d' ' -f1) ]] || { echo "$PROV does not describe $BIN (sha256 differs)"; exit 1; }
 [[ $(p patch_sha256) == $(sha256sum "$HERE/build/bloxminer.patch" | cut -d' ' -f1) ]] || { echo "binary was built from a different bloxminer.patch"; exit 1; }
 VER=$(sed -n 's/^CUSTOM_VERSION=//p' "$HERE/bloxminer/h-manifest.conf")
-[[ $(p version) == "$VER" ]] || { echo "binary version $(p version) != h-manifest.conf CUSTOM_VERSION $VER"; exit 1; }
+ENGINE_VER=$(p version)
+# A scripts-only hotfix (this file's own caller may package an unchanged, already-gated binary under a NEW
+# package version - see bloxminer/h-stats.sh's own header: it shows $CUSTOM_VERSION, never the engine's raw API
+# VER, for exactly this reason) legitimately has ENGINE_VER != VER. That must stay an explicit, opt-in decision
+# (BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1), never a silent default - this check exists to catch an accidentally
+# stale/wrong binary being shipped under the wrong version number, and only the caller packaging a deliberate
+# hotfix knows the mismatch here is expected rather than a mistake.
+if [[ $ENGINE_VER != "$VER" ]]; then
+	[[ -n ${BLOX_PACKAGE_ALLOW_VERSION_MISMATCH:-} ]] || {
+		echo "binary version $ENGINE_VER != h-manifest.conf CUSTOM_VERSION $VER (scripts-only hotfix? set BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 to package this already-verified binary under the new package version)"
+		exit 1
+	}
+	echo "binary version $ENGINE_VER != h-manifest.conf CUSTOM_VERSION $VER - BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 is set, packaging the existing binary under the new package version"
+fi
 LIBOMP=/usr/lib/llvm-14/lib/libomp.so.5   # from Ubuntu 22.04 package libomp5-14
 [[ $(p libomp_sha256) == $(sha256sum "$LIBOMP" | cut -d' ' -f1) ]] || { echo "this host's libomp.so.5 differs from the one the binary was built with"; exit 1; }
 
@@ -24,9 +37,13 @@ cp "$BIN" "$D/bloxminer"; cp -L "$LIBOMP" "$D/libomp.so.5"
 cp "$HERE/LICENSE" "$D/LICENSE"
 cp /usr/share/doc/libomp5-14/copyright "$D/LICENSE.libomp"
 cp /usr/share/common-licenses/Apache-2.0 "$D/LICENSE.Apache-2.0"
+ENGINE_NOTE=""
+[[ $ENGINE_VER != "$VER" ]] && ENGINE_NOTE="
+This is a scripts-only release: the engine binary is unchanged from the $ENGINE_VER package (same build,
+same sha256 below) - only bloxminer/*.sh changed. See CHANGES.md."
 cat > "$D/SOURCE.md" <<SRC
 BloxMiner $VER - corresponding source (GPL-3.0)
-
+$ENGINE_NOTE
 The bloxminer binary is monkins1010/ccminer (branch Verus2.2) at commit $(p upstream_commit)
 with build/bloxminer.patch applied, built by build/build.sh:
   https://github.com/bokiko/bloxminer/tree/$VER/build

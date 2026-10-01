@@ -3,7 +3,11 @@
 # Usage: tests/hive/test_hive_scripts.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); PKG=$(cd "$HERE/../../bloxminer" && pwd)
-T=$(mktemp -d); trap 'kill "$API_PID" 2>/dev/null; rm -rf "$T"' EXIT
+T=$(mktemp -d)
+declare -a ALL_API_PIDS=()   # every fake-API pid THIS script ever started - killed exactly by pid, never by
+	# pattern (a fixed port could be held by another, unrelated process on a shared build host)
+cleanup_apis() { local p; for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done; wait "${ALL_API_PIDS[@]:-}" 2>/dev/null || true; }
+trap 'cleanup_apis; rm -rf "$T"' EXIT INT TERM
 pass=0; fail=0; API_PID=
 ok()  { pass=$((pass+1)); printf '%-52s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-52s FAIL: %s\n' "$1" "$2"; }
@@ -94,15 +98,34 @@ stats_case() {  # name summary cores jq-assertion
 	PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT       # a fresh port per case: no rebind races
 	jq -n --arg s "$2" --arg c "$3" '{summary: $s, cores: $c}' > "$T/replies.json"
 	: > "$T/api.out"
-	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!
+	python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 	for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 	grep -q ready "$T/api.out" || { bad "$1" "fake API did not start: $(cat "$T/api.out")"; return; }
 	local res; res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
 	if [[ $(jq -r "$4" <<< "$res" 2>/dev/null) == true ]]; then ok "$1"; else bad "$1" "$res"; fi
 }
 
+# NOTE: $CUSTOM_VERSION in this harness's h-manifest.conf is the package's own 2.1.1 - "ver" always reflects
+# that, never the engine binary's own VER field (a hotfix package ships an unchanged, already-gated binary; see
+# bloxminer/h-stats.sh's own header). SUM_OK below deliberately reports VER=2.1.0 (the real, unchanged 2.1.1
+# binary's own report) to prove the package version wins, not just that it happens to match.
 stats_case "complete per-core reply" "$SUM_OK" "$CORES_OK" \
-	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "2.1.0" and .stats.algo == "verushash"'
+	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "2.1.1" and .stats.algo == "verushash"'
+stats_case "engine VER differs from package -> package version still shown" "${SUM_OK/VER=2.1.0/VER=1.9.9}" "$CORES_OK" '.stats.ver == "2.1.1"'
+stats_case "no VER field at all -> package version still shown" "${SUM_OK/;VER=2.1.0/}" "$CORES_OK" '.stats.ver == "2.1.1"'
+
+# "exec {fd}... 2>/dev/null" with no command after it is a bare redirection, applied to the CURRENT SHELL
+# PERMANENTLY, not scoped to that one statement. The poll loop's own fd-open/close run unconditionally on every
+# poll that reaches this code, so an unscoped version would have silently redirected THIS WHOLE SHELL's stderr
+# to /dev/null from the very first poll onward - Hive sources h-stats.sh repeatedly in one long-lived shell.
+# Proven directly: a message written to stderr, in the SAME shell, immediately after a normal poll, must still
+# be visible afterward.
+out=$(bash -c '. "$BLOX_DIR/h-stats.sh" > /dev/null; echo "STDERR_SURVIVES_AFTER_WAIT_FD" >&2' 2>&1)
+if grep -q "STDERR_SURVIVES_AFTER_WAIT_FD" <<< "$out"; then
+	ok "poll loop's own wait-fd open/close never silently redirects this shell's stderr afterward"
+else
+	bad "poll loop's own wait-fd open/close never silently redirects stderr afterward" "$out"
+fi
 stats_case "numbers are JSON numbers" "$SUM_OK" "$CORES_OK" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and (.stats.hs | map(type) | unique) == ["number"]'
 stats_case "stale cores reply -> FRESHKHS" "$SUM_OK" "${CORES_OK/AGE=1.2/AGE=9.5}" '.khs == "11900.00" and .stats.hs == [11900]'
@@ -128,6 +151,123 @@ stats_case "per-core duplicate CPU ids -> FRESHKHS" "$SUM_OK" "${CORES_OK/CPUS=0
 stats_case "per-core bad PKG -> FRESHKHS" "$SUM_OK" "${CORES_OK/PKG=0;CORE=1;/PKG=x;CORE=1;}" '.stats.hs == [11900]'
 stats_case "stall only in cores reply -> 0" "$SUM_OK" "${CORES_OK/STALL=0/STALL=1}" '.khs == "0" and .stats.hs == [0]'
 stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" "" '.stats.hs == [11900] and (.stats | has("cpu_power")) == false'
+CORES_ZERO="${CORES_OK/KHS=6000.00/KHS=0.00}"; CORES_ZERO="${CORES_ZERO/KHS=5900.00/KHS=0.00}"
+stats_case "positive FRESHKHS + structurally-valid but all-zero (non-stalled) cores reply -> Phase A's WHOLE result kept" \
+	"$SUM_OK" "$CORES_ZERO" '.khs == "11900.00" and .stats.hs == [11900]'
+CORES_NEARZERO="${CORES_OK/KHS=6000.00/KHS=10.00}"; CORES_NEARZERO="${CORES_NEARZERO/KHS=5900.00/KHS=10.00}"
+stats_case "positive FRESHKHS + complete-but-near-zero cores total (>10% off) -> Phase A's WHOLE result kept" \
+	"$SUM_OK" "$CORES_NEARZERO" '.khs == "11900.00" and .stats.hs == [11900]'
+
+# ---- one shell, two polls: a positive rate from poll 1 must NEVER survive as poll 2's answer just because
+# poll 2's own attempt to get fresh data fails (dead API) - $khs/$stats are plain global variables, and Hive's
+# real agent sources this file repeatedly in the SAME shell, poll after poll.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+export API_PID
+# shellcheck disable=SC2016
+res=$(bash -c '. "$BLOX_DIR/h-stats.sh"; poll1_khs=$khs
+	kill "$API_PID" 2>/dev/null   # poll 2: API now dead - a genuine, real failure, not a contrived parse error
+	. "$BLOX_DIR/h-stats.sh"
+	jq -nc --arg p1 "$poll1_khs" --arg p2 "$khs" "{poll1: \$p1, poll2: \$p2}"' 2>&1)
+if [[ $(jq -r '.poll1 == "11900.00" and .poll2 == "0"' <<< "$res" 2>/dev/null) == true ]]; then
+	ok "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing"
+else
+	bad "one shell, two polls: poll 2's failure never leaves poll 1's positive rate standing" "$res"
+fi
+
+# ---- write_result's OWN guard: this used to be
+# `printf '%s' "$(jq -nc ...)" > "$tmp" && mv -f "$tmp" "$OUTFILE"` - if jq's OWN command substitution failed
+# (a fork/exec failure, independent of whatever the CALLER's own upstream composition did), `$(...)` comes
+# back empty, `printf '%s' ""` still writes a trivially-successful zero-byte file, and `mv -f` then
+# unconditionally replaced $OUTFILE - an already-good prior result - with that empty file. Tests THIS function
+# directly (not through run()'s own upstream validation, which is a separate, shallower guard) via
+# BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL, deterministically the same way on every host: a real positive
+# result is written first, then a forced-failing write_result call must leave that exact result standing.
+D_DEBUG="$T/write_result_debug.log"; : > "$D_DEBUG"
+res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG" bash -c '. "$BLOX_DIR/h-stats.sh"
+	write_result "11900.00" "a prior positive result"
+	before=$(cat "$OUTFILE" 2>/dev/null)
+	BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL=1 write_result "0" "should never reach OUTFILE"
+	after=$(cat "$OUTFILE" 2>/dev/null)
+	jq -nc --arg b "$before" --arg a "$after" "{before: \$b, after: \$a}"' 2>&1)
+if [[ $(jq -r '.before == .after and (.after | contains("a prior positive result"))' <<< "$res" 2>/dev/null) == true ]] \
+	&& grep -q "write_result: REFUSED" "$D_DEBUG"
+then
+	ok "write_result's own guard: a forced jq failure never overwrites an already-good prior result"
+else
+	bad "write_result's own guard: a forced jq failure never overwrites an already-good prior result" "res=$res debug=$(cat "$D_DEBUG" 2>/dev/null)"
+fi
+
+# ---- "Reject an empty Phase A stats composition": Phase A's own stats composition chains four nested jq calls
+# into one outer jq call; if any one of them failed (a transient fork/exec failure under resource pressure -
+# the same class this file's own write_result() guard above exists for), $stats came back empty while $khs
+# already held a real, positive number - write_result would then wrap that empty $stats as a literal empty
+# JSON string (`"stats":""`), passing write_result's own guard (which only checks the OUTER wrap succeeded, not
+# $2's own content) and reaching $OUTFILE: the parent would report a positive khs with NO stats at all. Fixed:
+# Phase A's composition is now validated the same way Phase B's own final composition already is (non-empty
+# JSON object, hs array of numbers, temp array) before ever reaching write_result; on failure, an honest
+# minimal object (khs from the fresh reading + a single minimal row) is written instead - never an empty
+# stats. BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL deterministically simulates the nested-jq failure, the same
+# way BLOX_HSTATS_TEST_FORCE_WRITE_RESULT_FAIL already does for write_result() itself, above. No cores reply
+# (empty $c, same convention as the "2.0.0 engine (no cores command)" case above) - Phase B then skips outright
+# (`[[ -z $cores ]] && return 0`), so Phase A's own result (the honest minimal fallback, with the fix) is what
+# the parent actually sees, never masked by a legitimate Phase B reply overwriting it regardless of whether
+# Phase A's own fix fired.
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+D_DEBUG2="$T/phasea_debug.log"; : > "$D_DEBUG2"
+res=$(BLOX_HSTATS_DEBUG_LOG="$D_DEBUG2" BLOX_HSTATS_TEST_FORCE_PHASEA_STATS_FAIL=1 bash -c '. "$BLOX_DIR/h-stats.sh"; jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: (\$s | if . == \"\" then null else fromjson end)}"' 2>&1)
+if [[ $(jq -r '.khs == "11900.00" and .stats.hs == [11900] and (.stats.temp | type) == "array"' <<< "$res" 2>/dev/null) == true ]] \
+	&& grep -q "phase_a_stats_gate: composition invalid/empty" "$D_DEBUG2"
+then
+	ok "Phase A: forced nested-jq failure -> honest minimal stats object (khs stands, never empty stats)"
+else
+	bad "Phase A: forced nested-jq failure -> honest minimal stats object (khs stands, never empty stats)" "res=$res debug=$(cat "$D_DEBUG2" 2>/dev/null)"
+fi
+
+# ---- "Normalize the fallback timestamp to microseconds": now_us() (and this file's own DEADLINE_US fallback,
+# right at the top) used to concatenate the raw fractional string straight onto the whole-seconds part:
+# EPOCHREALTIME's own fraction is always exactly 6 digits (real microseconds), but the `date +%s.%N` FALLBACK's
+# is 9 (nanoseconds) - taken only on bash < 5, but load-bearing if it ever is. Concatenated raw, every
+# "microsecond" value this file computes off that fallback was silently inflated by ~1000x, blowing the whole
+# 2.4 s budget arithmetic by three orders of magnitude. Forces the fallback path (EPOCHREALTIME explicitly
+# unset in a fresh bash) and checks now_us()'s own $REPLY lands within a generous few seconds of a known-good
+# reference (date +%s, scaled to real microseconds) - the pre-fix concatenation would be off by roughly 1000x,
+# nowhere near this tolerance.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+# shellcheck disable=SC2016  # single quotes on purpose: expanded by the inner bash, not here
+now_us_fallback=$(BLOX_API_PORT=19999 timeout 5 bash -c '
+	unset EPOCHREALTIME
+	. "$BLOX_DIR/h-stats.sh" > /dev/null 2>&1
+	now_us
+	echo "$REPLY"
+' 2>/dev/null)
+ref_us=$(( $(date +%s) * 1000000 ))
+if [[ $now_us_fallback =~ ^[0-9]+$ ]] && (( now_us_fallback > ref_us - 10000000 && now_us_fallback < ref_us + 10000000 )); then
+	ok "now_us() fallback path (EPOCHREALTIME unset, date +%s.%N): normalized to real microseconds, not nanosecond-inflated"
+else
+	bad "now_us() fallback path: normalized to real microseconds" "now_us=$now_us_fallback ref_us=$ref_us"
+fi
+
+# SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
+# leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
+leaked=()
+for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -0 "$p" 2>/dev/null && leaked+=("$p"); done
+if [[ ${#leaked[@]} -eq 0 ]]; then
+	ok "no leaked fake-API child processes at suite end"
+else
+	bad "no leaked fake-API child processes at suite end" "still alive: ${leaked[*]}"
+	cleanup_apis
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
