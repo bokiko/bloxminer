@@ -150,6 +150,34 @@ stats_case "per-core CPUS cover 3 of 4 threads -> FRESHKHS" "$SUM_OK" "${CORES_O
 stats_case "per-core duplicate CPU ids -> FRESHKHS" "$SUM_OK" "${CORES_OK/CPUS=0,2/CPUS=0,0}" '.stats.hs == [11900]'
 stats_case "per-core bad PKG -> FRESHKHS" "$SUM_OK" "${CORES_OK/PKG=0;CORE=1;/PKG=x;CORE=1;}" '.stats.hs == [11900]'
 stats_case "stall only in cores reply -> 0" "$SUM_OK" "${CORES_OK/STALL=0/STALL=1}" '.khs == "0" and .stats.hs == [0]'
+
+# ---- P1: "the answer just got worse" transitions (summary healthy -> cores reply says STALL=1) must publish
+# the honest zero IMMEDIATELY, before the richer zero-result composition - CI/bot finding: the composition used
+# to run several jq forks BEFORE ever calling write_result(), so a parent-side deadline/kill landing inside
+# that window left $OUTFILE exactly as Phase A had already written it: a real positive rate, for a miner this
+# exact poll just learned is stalled. BLOX_HSTATS_TEST_PSTALL_DELAY deterministically reproduces that window
+# (sleeps right after write_result_fast(), before the composition) long enough that the parent's own deadline
+# is guaranteed to land and kill the child mid-delay - the fix means the fast write above already landed by
+# then; the pre-fix code would still show khs=11900.00 here (Phase A's own earlier, now-stale positive answer).
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "${CORES_OK/STALL=0/STALL=1}" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(BLOX_HSTATS_TEST_PSTALL_DELAY=5 timeout 8 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+if [[ $khs_got == "0" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 4.0)}'; then
+	ok "Phase B stall, enrichment killed mid-composition: honest 0 published early, never Phase A's stale positive (${elapsed}s)"
+else
+	bad "Phase B stall, enrichment killed mid-composition: honest 0 published early, never Phase A's stale positive" \
+		"khs_got=$khs_got elapsed=${elapsed}s res=$res"
+fi
+
 stats_case "2.0.0 engine (no cores command) -> FRESHKHS" "${SUM_OK%%;POWER=*}|" "" '.stats.hs == [11900] and (.stats | has("cpu_power")) == false'
 CORES_ZERO="${CORES_OK/KHS=6000.00/KHS=0.00}"; CORES_ZERO="${CORES_ZERO/KHS=5900.00/KHS=0.00}"
 stats_case "positive FRESHKHS + structurally-valid but all-zero (non-stalled) cores reply -> Phase A's WHOLE result kept" \
@@ -618,7 +646,22 @@ fi
 # measurement was ~199 ms avg/205 ms max on ai02 - the 1.85 s this case used to test was already inside the
 # OLD start-up-unaware margin's danger zone, which is exactly how it passed on ai02 but not on a slower runner.)
 HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
+# ---- P2 (bot finding): this used to hardcode `taskset -c 0` - assuming CPU 0 is in this process's own
+# affinity, which is not true when the suite itself runs under a restricted affinity (e.g. `taskset -c 2-4
+# bash tests/hive/test_hive_scripts.sh`, the bot's own review environment, or a container with a sparse/
+# non-zero-based --cpuset-cpus): a hardcoded `taskset -c 0 ...` then simply fails (EINVAL - you cannot widen your own
+# affinity), not "runs on a different CPU than intended". Fixed the same way tests/hive/test_under_load.sh's
+# own tiers were: pick ONE real CPU from THIS process's own current affinity (parsed from /proc/self/status's
+# Cpus_allowed_list, falling back to `taskset -pc $$` if that proc field is ever unavailable), and SKIP this
+# whole saturation section (not fail) if even one CPU cannot be determined.
+SAT_CPU=""
 if [[ $HAVE_TASKSET == 1 ]]; then
+	cpus_line=$(awk -F'\t' '/^Cpus_allowed_list:/{print $2}' /proc/self/status 2>/dev/null)
+	[[ -z $cpus_line ]] && cpus_line=$(taskset -pc $$ 2>/dev/null | sed -n 's/.*affinity list: *//p')
+	SAT_CPU=${cpus_line%%[,-]*}   # first CPU named by the list/range - a single id is always enough here
+	[[ $SAT_CPU =~ ^[0-9]+$ ]] || SAT_CPU=""
+fi
+if [[ $HAVE_TASKSET == 1 && -n $SAT_CPU ]]; then
 	exec 8>"${TMPDIR:-/tmp}/bloxminer-load-test.lock"
 	if flock -w 300 8; then
 		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
@@ -628,13 +671,13 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 		SAT_PIDS=()
-		for _ in 1 2; do taskset -c 0 sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
+		for _ in 1 2; do taskset -c "$SAT_CPU" sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
 		sleep 0.3
 		n_zero=0; n_over_cap=0; i=0
 		for i in $(seq 1 20); do
 			t0=$(date +%s.%N)
 			# shellcheck disable=SC2016   # expanded by the inner bash, not here
-			res=$(timeout 8 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
+			res=$(timeout 8 taskset -c "$SAT_CPU" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
 			t1=$(date +%s.%N)
 			elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 			khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
@@ -661,13 +704,13 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 		SAT_PIDS=()
-		for _ in 1 2; do taskset -c 0 sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
+		for _ in 1 2; do taskset -c "$SAT_CPU" sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
 		sleep 0.3
 		n_zero_ok=0; n_hardfail=0; i=0
 		for i in $(seq 1 10); do
 			t0=$(date +%s.%N)
 			# shellcheck disable=SC2016   # expanded by the inner bash, not here
-			res=$(timeout 8 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
+			res=$(timeout 8 taskset -c "$SAT_CPU" bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
 			t1=$(date +%s.%N)
 			elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
 			khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
@@ -687,7 +730,11 @@ if [[ $HAVE_TASKSET == 1 ]]; then
 		echo "SKIP: could not acquire the shared load-test lock within 300s (stuck holder?)"
 	fi
 else
-	echo "SKIP: taskset not available - saturated-CPU timing cases skipped"
+	if [[ $HAVE_TASKSET == 1 ]]; then
+		echo "SKIP: could not determine this process's own current CPU affinity (SAT_CPU) - saturated-CPU timing cases skipped"
+	else
+		echo "SKIP: taskset not available - saturated-CPU timing cases skipped"
+	fi
 fi
 
 # ---- SECURITY: bash arithmetic contexts ($(( )), (( )), array subscripts, -eq/-lt/-gt/...) recursively

@@ -433,6 +433,24 @@ run() {
 		# pre-redesign semantics). It must OVERWRITE Phase A's FRESHKHS-based answer with an honest 0, never
 		# silently leave a positive number standing just because Phase A ran first.
 		khs=0; hs=(0); temps=("${ptemp:-null}")
+		# CI/bot finding: this "the answer just got worse" transition used to run the 4-nested-jq-into-one-
+		# outer-jq composition below BEFORE ever calling write_result() - if the parent hit the deadline and
+		# killed this child anywhere in that several-jq-forks-deep window, $OUTFILE was never touched here at
+		# all, and the parent's own read-back saw whatever Phase A had ALREADY written earlier in this SAME
+		# poll: a real, positive rate - reported as hashing, for a miner this exact reply just said is
+		# stalled. Fixed the same way Phase A's own publish-speed fix (write_result_fast(), see its own header)
+		# works: publish the minimal, honest zero IMMEDIATELY, atomically, via the same fork-free fast writer -
+		# before any enrichment - so a kill during the richer composition below can only ever leave this zero
+		# standing (or Phase A's answer, if THIS write itself didn't even get a chance to run - never the
+		# other way around). The richer composition further below may still run and OVERWRITE this with a
+		# fuller zero-result (ver/power/temp), but only ever another zero - never upgrades it back to positive.
+		write_result_fast "$khs" "$acc" "$rej" "${up%.*}"
+		[[ -n ${BLOX_HSTATS_TEST_PSTALL_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_PSTALL_DELAY"   # tests only -
+			# deterministically reproduces "the parent's deadline lands inside the composition below" on every
+			# host the same way, the same reason BLOX_HSTATS_TEST_PHASEB_DELAY/_HANDSHAKE_DELAY already do for
+			# their own call sites: forcing the exact downstream timing directly is more reliable than trying
+			# to reproduce real fork-pressure on demand. Placed AFTER write_result_fast - a test using this to
+			# force a kill here is exercising "did the fast write above already happen", never masking it.
 		# Same 4-nested-jq-into-one-outer-jq shape as Phase A's own composition above, same risk - routed
 		# through the same phase_a_stats_gate() (see its own header for the full rationale, including why a
 		# plain jq -e re-check alone is not enough on jq 1.6).

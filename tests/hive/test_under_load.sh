@@ -45,14 +45,71 @@ bad() { fail=$((fail+1)); printf '%-70s FAIL: %s\n' "$1" "$2"; }
 
 HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
 
+# ---- P2 (bot finding): the taskset tiers below used to be built as "0-$((want-1))" - CPU IDs 0..want-1,
+# assuming this process's own affinity starts at CPU 0 and is contiguous. That breaks wherever it is not: this
+# suite itself run under a restricted affinity (e.g. `taskset -c 2-4 bash tests/hive/test_under_load.sh`, the
+# bot's own review environment, or any container with a sparse/non-zero-based --cpuset-cpus) can be denied CPU
+# 0 entirely - `taskset -c 0 ...` then simply fails (EINVAL: you cannot widen your own affinity), not "runs on
+# a different CPU than intended". Fixed: $AVAIL_CPUS holds THIS process's own real, current affinity (parsed
+# from /proc/self/status's Cpus_allowed_list, falling back to `taskset -pc $$`'s own output if that proc field
+# is ever unavailable) - every tier below asks cpu_tier() for its CPU IDs from THAT list, never assumes 0..N-1,
+# and SKIPs (not fails) a tier that needs more CPUs than are actually available to pin to.
+AVAIL_CPUS=()
+cpu_list_expand() {   # $1 = "2-4,7,9-10" style list (as /proc/self/status or taskset -pc print it) -> appends
+	# each individual CPU number it names to $AVAIL_CPUS. Malformed tokens are skipped, not fatal - an empty
+	# $AVAIL_CPUS afterward is exactly what every cpu_tier() call below already treats as "not enough CPUs,
+	# SKIP this tier", never a hard error.
+	local tok lo hi c toks
+	IFS=',' read -ra toks <<< "$1"
+	for tok in "${toks[@]}"; do
+		[[ -z $tok ]] && continue
+		if [[ $tok == *-* ]]; then
+			lo=${tok%-*}; hi=${tok#*-}
+			[[ $lo =~ ^[0-9]+$ && $hi =~ ^[0-9]+$ ]] || continue
+			for ((c = lo; c <= hi; c++)); do AVAIL_CPUS+=("$c"); done
+		elif [[ $tok =~ ^[0-9]+$ ]]; then
+			AVAIL_CPUS+=("$tok")
+		fi
+	done
+}
+if [[ -r /proc/self/status ]]; then
+	cpus_line=$(awk -F'\t' '/^Cpus_allowed_list:/{print $2}' /proc/self/status 2>/dev/null)
+	[[ -n ${cpus_line:-} ]] && cpu_list_expand "$cpus_line"
+fi
+if [[ ${#AVAIL_CPUS[@]} -eq 0 && $HAVE_TASKSET == 1 ]]; then
+	cpus_line=$(taskset -pc $$ 2>/dev/null | sed -n 's/.*affinity list: *//p')
+	[[ -n ${cpus_line:-} ]] && cpu_list_expand "$cpus_line"
+fi
+if [[ ${#AVAIL_CPUS[@]} -gt 0 ]]; then
+	mapfile -t AVAIL_CPUS < <(printf '%s\n' "${AVAIL_CPUS[@]}" | sort -nu)   # ascending, deduped
+fi
+
+cpu_tier() {   # $1 = how many CPUs this tier needs -> sets $REPLY to a taskset -c argument (a comma-separated
+	# list, which taskset accepts exactly as well as a contiguous range and handles non-contiguous sets
+	# correctly) built from the FIRST $1 entries of $AVAIL_CPUS. Returns 1 (REPLY left empty) when fewer than
+	# $1 CPUs are actually available in THIS process's own affinity - the caller's job to SKIP that tier, never
+	# this function's to fail loudly for a perfectly legitimate "this host doesn't have that many CPUs for us"
+	# case.
+	local n=$1 i
+	REPLY=""
+	(( ${#AVAIL_CPUS[@]} >= n )) || return 1
+	for ((i = 0; i < n; i++)); do REPLY+="${AVAIL_CPUS[i]},"; done
+	REPLY=${REPLY%,}
+}
+
 saturate_cpus() {   # $1 = cpuset ("" = unconstrained, representing a generally busy host - `nproc` loops
 	# system-wide, NOT scaled by LOAD_K: that is not a "taskset tier" in the host-independent sense this file's
-	# own header explains, it is a separate "the whole box is busy" baseline). A real cpuset like "0-2" (3 CPUs)
-	# or a single CPU like "0" (1 CPU, no "-") launches LOAD_K busy loops PER CPU in that cpuset - never `nproc`
-	# loops regardless of how many CPUs the tier itself constrains to.
-	local n lo hi ncpus
+	# own header explains, it is a separate "the whole box is busy" baseline). A real cpuset - a contiguous
+	# range ("0-2"), a comma list ("2,4,7" - what cpu_tier() above actually hands this, possibly
+	# non-contiguous), or a single CPU ("3", no "-" or ",") - launches LOAD_K busy loops PER CPU named in that
+	# cpuset - never `nproc` loops regardless of how many CPUs the tier itself constrains to.
+	local n ncpus=0 tok lo hi toks
 	if [[ -n ${1:-} && $HAVE_TASKSET == 1 ]]; then
-		if [[ $1 == *-* ]]; then lo=${1%-*}; hi=${1#*-}; ncpus=$(( hi - lo + 1 )); else ncpus=1; fi
+		IFS=',' read -ra toks <<< "$1"
+		for tok in "${toks[@]}"; do
+			if [[ $tok == *-* ]]; then lo=${tok%-*}; hi=${tok#*-}; ncpus=$(( ncpus + hi - lo + 1 ))
+			else ncpus=$(( ncpus + 1 )); fi
+		done
 		n=$(( LOAD_K * ncpus ))
 	else
 		n=$(nproc)
@@ -173,22 +230,27 @@ run_case() {   # $1 label, $2 cpuset ("" = none/whatever inherited), $3 n_polls,
 	fi
 }
 
-NPROC=$(nproc)
 run_case "h-stats.sh, unconstrained CPUs" "" 20
 if [[ $HAVE_TASKSET == 1 ]]; then
 	for want in 1 2 3; do
-		(( want <= NPROC )) || continue
-		hi=$((want - 1))
+		if ! cpu_tier "$want"; then
+			echo "SKIP: h-stats.sh, $want CPU(s) - fewer than $want CPUs available in this process's own affinity (${#AVAIL_CPUS[@]} available)"
+			continue
+		fi
 		eb=1; (( want < 3 )) && eb=0   # budget enforced from 3 CPUs up - see run_case's own comment
-		run_case "h-stats.sh, taskset 0-$hi ($want CPU(s))" "0-$hi" 10 "$eb"
+		run_case "h-stats.sh, taskset $REPLY ($want CPU(s))" "$REPLY" 10 "$eb"
 	done
 	# ---- sustained: a >90 s run, not just a handful of polls, to guard against a failure mode that only shows
 	# up over time (a leak, a slow state drift) that a 10-poll burst could miss. 2 CPUs against LOAD_K*2 busy
-	# loops (the same squeeze as the taskset-0-1 case above, budget not enforced there either) run continuously
-	# for at least 90 s of wall time - well past both real Hive watchdog triggers' own polling cadence, with
-	# zero cross-poll state to drift in the first place post-redesign, so this is really proving "no false zero,
+	# loops (the same squeeze as the 2-CPU tier above, budget not enforced there either) run continuously for
+	# at least 90 s of wall time - well past both real Hive watchdog triggers' own polling cadence, with zero
+	# cross-poll state to drift in the first place post-redesign, so this is really proving "no false zero,
 	# ever, however long this runs", not "state survives".
-	(( NPROC >= 2 )) && run_case "h-stats.sh, taskset 0-1 (2 CPU(s), sustained)" "0-1" 1 0 95
+	if cpu_tier 2; then
+		run_case "h-stats.sh, taskset $REPLY (2 CPU(s), sustained)" "$REPLY" 1 0 95
+	else
+		echo "SKIP: h-stats.sh, 2 CPU(s) sustained - fewer than 2 CPUs available in this process's own affinity (${#AVAIL_CPUS[@]} available)"
+	fi
 else
 	echo "SKIP: taskset not available - only the unconstrained case above ran"
 fi
