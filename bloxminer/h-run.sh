@@ -60,19 +60,24 @@ if [[ $engine == rx ]]; then
 		return 1 2>/dev/null || exit 1
 	fi
 	# PR #2 follow-up review (Codex): note_rx_hugepages_start now returns 1 (checked here, exactly like
-	# cpu_ok() just above) whenever it cannot establish a TRUSTWORTHY ownership record for this session - two
-	# distinct causes, both logged with their own specific reason in this package's own log
-	# (log_hugepages_note), never conflated into one message here: (1) "Invalidate stale ownership before
-	# attempting refresh" - an EXISTING record is stale and could not be removed (h-common.sh's own
-	# _hp_invalidate); nothing was reserved this call. (2) "Fail the RandomX start when tracking cannot be
-	# persisted" - `hugepages -rx` WAS already called and (best-effort) rolled back (h-common.sh's own
-	# _hp_rollback_reservation) because prelim/free0/start_uptime could not be read afterward, or the fresh
-	# record's own write failed. Either way this has to fail CLOSED here, not just inside that function:
-	# engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless of anything the
-	# dispatcher decided, so the ONLY way to actually keep vm.nr_hugepages from being reserved again right
-	# behind this check's back - rather than merely skipping THIS package's own tracking of a reservation
-	# that happens anyway - is to never reach that exec at all, same as a failed CPU gate already does one
-	# line above.
+	# cpu_ok() just above) whenever it cannot establish a TRUSTWORTHY ownership record for this session - every
+	# cause is logged with its own specific reason in this package's own log (log_hugepages_note), never
+	# conflated into one message here. In increasing order of "how much has already happened": (1) the current
+	# boot_id itself could not be read ("Require a boot ID before accepting the reservation") - checked first,
+	# before anything else, nothing reserved yet; (2) an EXISTING record is stale and could not be removed
+	# ("Invalidate stale ownership before attempting refresh", h-common.sh's own _hp_invalidate) - nothing
+	# reserved this call either; (3) the PRE-reservation vm.nr_hugepages baseline itself could not be read
+	# ("Reject RandomX starts when the baseline is unreadable") - still before `hugepages -rx` ever runs (a
+	# baseline file that does not EXIST at all is a different, non-fatal case - see h-common.sh's own
+	# _hp_read_baseline for why that one still returns 0, not 1, and reaches here); (4) "Fail the RandomX start
+	# when tracking cannot be persisted" - `hugepages -rx` WAS already called and (best-effort) rolled back
+	# (h-common.sh's own _hp_rollback_reservation) because prelim/free0/start_uptime could not be read
+	# afterward, or the fresh record's own write failed. Every cause has to fail CLOSED here, not just inside
+	# that function: engines/rx/h-run.sh runs its own, entirely unconditional `hugepages -rx` call regardless
+	# of anything the dispatcher decided, so the ONLY way to actually keep vm.nr_hugepages from being reserved
+	# again right behind this check's back - rather than merely skipping THIS package's own tracking of a
+	# reservation that happens anyway - is to never reach that exec at all, same as a failed CPU gate already
+	# does one line above.
 	if ! note_rx_hugepages_start; then
 		fail "BloxMiner (RandomX engine): could not establish a trustworthy huge-page ownership record for this start (see this package's own log for the exact reason) - refusing to start rather than risk either a wrong later Verus restore or an untracked reservation with no way to release it"
 		sleep 60

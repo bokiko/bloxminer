@@ -463,6 +463,31 @@ _hp_rollback_reservation() {
 	return 1
 }
 
+# _hp_read_baseline <proc file> - reads the PRE-RESERVATION vm.nr_hugepages baseline, before note_rx_hugepages_
+# start ever calls `hugepages -rx`. PR #2 follow-up review (Codex): "Reject RandomX starts when the baseline is
+# unreadable" - three outcomes, deliberately kept distinct rather than collapsed into one:
+#   0, $REPLY=<N> - a valid baseline was read; proceed normally.
+#   1             - the file does NOT EXIST AT ALL (`! -e`): no hugetlbfs support on this host, so NO ONE - not
+#                   this package, not engines/rx/h-run.sh's own unconditional `hugepages -rx` moments later -
+#                   can reserve anything here either. There is nothing to track because there is nothing to
+#                   leak; the caller must let rx start anyway (untracked, but mining correctly, just without
+#                   this package's extra reservation on top) rather than refuse a host that was never at risk
+#                   in the first place - refusing here would be a real functional regression, not a safety
+#                   improvement, on any host without hugetlbfs (some minimal/embedded kernels, some containers).
+#   2             - the file EXISTS but is unreadable, or its content is not a plain non-negative integer:
+#                   hugetlbfs IS present, so engines/rx/h-run.sh's own unconditional `hugepages -rx` call
+#                   moments later WILL genuinely reserve real pages, with no baseline on record to ever restore
+#                   to - the caller must refuse the whole rx start (nothing has been reserved yet at this point,
+#                   so this needs no rollback, only _hp_rollback_reservation's own post-reservation checks do).
+_hp_read_baseline() {
+	local f=$1
+	[[ -e $f ]] || return 1
+	REPLY=""
+	[[ -r $f ]] && REPLY=$(<"$f") 2>/dev/null
+	[[ $REPLY =~ ^[0-9]+$ ]] || return 2
+	return 0
+}
+
 # note_rx_hugepages_start - called just before exec'ing the rx engine. EVERY call means a genuinely NEW XMRig
 # process is about to start: h-run.sh's own final action is always an unconditional `exec ./xmrig` (this file's
 # own header), so Hive calling it again - a flight-sheet edit, a watchdog restart after a hang, the API being
@@ -536,13 +561,31 @@ _hp_rollback_reservation() {
 # `hugepages -rx`" was wrong) - it is only ever written by finalize_rx_hugepages, once XMRig's own reported
 # numbers confirm what it is.
 note_rx_hugepages_start() {
-	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp
+	local proc="${BLOX_PROCFS_ROOT:-/proc}/sys/vm/nr_hugepages" prior prelim free0 boot start_uptime tmp rc
+
+	# PR #2 follow-up review (Codex): "Require a boot ID before accepting the reservation" - read and validate
+	# ONCE, before anything else (including the existing-record ownership check just below, which also needs
+	# it): both finalize_rx_hugepages and restore_verus_hugepages require a non-empty, EXACT boot_id match
+	# before they will ever act on a record - a record persisted with boot= (empty) would be permanently stuck
+	# at final=0, its reservation pinned until reboot, with NOTHING in this file's own log to explain why (the
+	# record WRITE itself never used to fail on this - a genuinely silent gap, worse than the prelim/free0/
+	# start_uptime checks further down, which at least always log on failure). boot_id is a per-boot constant
+	# (set once by the kernel at boot, from this exact file) - reading it once here and reusing the SAME value
+	# throughout (the ownership check below, and the record write further down) is not just cheaper than the
+	# two separate reads this used to be, it is what closes the gap: there is only one place left that could
+	# ever disagree with itself. Checked here, before `hugepages -rx` ever runs, so a failure needs no rollback
+	# at all - nothing has been reserved yet.
+	boot=$(_hp_boot_id)
+	if [[ -z $boot ]]; then
+		log_hugepages_note "BloxMiner: could not read ${BLOX_PROCFS_ROOT:-/proc}/sys/kernel/random/boot_id (unreadable or empty) - refusing to start rx rather than persist a record that could never be finalized or restored"
+		return 1
+	fi
+
 	if [[ -e $HUGEPAGES_FILE ]]; then
-		local rec_final rec_boot cur_boot rec_prior cur="" owned=0
+		local rec_final rec_boot rec_prior cur="" owned=0
 		rec_final=$(_hp_field final); rec_boot=$(_hp_field boot); rec_prior=$(_hp_field prior)
-		cur_boot=$(_hp_boot_id)
 		[[ -r $proc ]] && cur=$(<"$proc") 2>/dev/null
-		if [[ -n $rec_boot && $rec_boot == "$cur_boot" && $cur =~ ^[0-9]+$ ]]; then
+		if [[ -n $rec_boot && $rec_boot == "$boot" && $cur =~ ^[0-9]+$ ]]; then
 			if [[ $rec_final == 1 ]]; then
 				local rec_ours; rec_ours=$(_hp_field ours)
 				[[ $rec_ours =~ ^[0-9]+$ && $cur == "$rec_ours" ]] && owned=1
@@ -623,16 +666,29 @@ note_rx_hugepages_start() {
 				log_hugepages_note "BloxMiner: existing huge-page ownership record is stale (not provably this package's own current session) but could not be removed ($HUGEPAGES_FILE unwritable?) - refusing to start rx this time rather than risk a later Verus restore trusting it; vm.nr_hugepages left untouched, record left as-is"
 				return 1
 			}
-			[[ -r $proc ]] || return 0
-			prior=$(<"$proc") 2>/dev/null   # not provably ours any more - rebase to whatever is on the box
-				# right now, exactly like a genuinely first-ever note (see the header comment for why this is
-				# the safer of the two options, not "decline ownership")
-			[[ $prior =~ ^[0-9]+$ ]] || return 0
+			# not provably ours any more - rebase to whatever is on the box right now, exactly like a genuinely
+			# first-ever note (see the header comment for why this is the safer of the two options, not "decline
+			# ownership") - see _hp_read_baseline's own header for the absent-vs-unreadable distinction below.
+			_hp_read_baseline "$proc"; rc=$?
+			if (( rc == 1 )); then
+				log_hugepages_note "BloxMiner: $proc does not exist (no hugetlbfs support on this host?) - huge-page tracking is not possible here; letting rx start anyway, without it"
+				return 0
+			elif (( rc != 0 )); then
+				log_hugepages_note "BloxMiner: $proc exists but could not be read as a plain number before reserving for rx - refusing to start rather than risk an untracked reservation"
+				return 1
+			fi
+			prior=$REPLY
 		fi
 	else
-		[[ -r $proc ]] || return 0
-		prior=$(<"$proc") 2>/dev/null
-		[[ $prior =~ ^[0-9]+$ ]] || return 0
+		_hp_read_baseline "$proc"; rc=$?
+		if (( rc == 1 )); then
+			log_hugepages_note "BloxMiner: $proc does not exist (no hugetlbfs support on this host?) - huge-page tracking is not possible here; letting rx start anyway, without it"
+			return 0
+		elif (( rc != 0 )); then
+			log_hugepages_note "BloxMiner: $proc exists but could not be read as a plain number before reserving for rx - refusing to start rather than risk an untracked reservation"
+			return 1
+		fi
+		prior=$REPLY
 	fi
 	{ command -v hugepages > /dev/null 2>&1 && hugepages -rx; } > /dev/null 2>&1
 	prelim=""
@@ -659,7 +715,9 @@ note_rx_hugepages_start() {
 		_hp_rollback_reservation "$prior" "could not read /proc/uptime after reserving for rx"
 		return 1
 	fi
-	boot=$(_hp_boot_id)
+	# $boot was already read and validated once, at function entry, before this session's own reservation ever
+	# happened - a per-boot constant, so the SAME value is still correct here; re-reading it a second time would
+	# only reintroduce the exact two-separate-reads gap this round's review closed (see the top of this function).
 	tmp="$HUGEPAGES_FILE.tmp.$$"
 	if { printf 'prior=%s\nprelim=%s\nfree0=%s\nboot=%s\nstart_uptime=%s\nfinal=0\n' \
 		"$prior" "$prelim" "$free0" "$boot" "$start_uptime" > "$tmp"; } 2>/dev/null \

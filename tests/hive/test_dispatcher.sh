@@ -873,6 +873,73 @@ if [[ ! -e $HUGEFILE ]] && grep -q "could not roll back vm.nr_hugepages to 0" "$
 if [[ $(cat "$PROCFILE" 2>/dev/null) == 1200 ]]; then ok "record write fails AND rollback fails: vm.nr_hugepages stays at the reservation's own value (1200) - a real, logged 'may remain pinned' outcome, never silent"; else bad "record write fails AND rollback fails: vm.nr_hugepages stays at 1200" "$(cat "$PROCFILE" 2>/dev/null)"; fi
 echo 0 > "$PROCFILE"   # clean slate for every test below
 
+# ---- PR #2 follow-up review (Codex): "Reject RandomX starts when the baseline is unreadable" - the file
+#      genuinely does NOT EXIST at all (no hugetlbfs support on this host). No one - not this package's own
+#      `hugepages -rx` call, not engines/rx/h-run.sh's own later one - can reserve anything on a host like
+#      this, so there is nothing to track and nothing to leak: rx must still start (just without this
+#      package's own tracking on top), never be refused for a condition that carries no risk. Proven by: no
+#      record is ever written, this dispatcher's OWN `hugepages -rx` attempt is skipped entirely (never even
+#      called - nothing to gain from trying), but the engine's own h-run.sh is still reached (exactly one
+#      `hugepages -rx` call total, the engine's own) and XMRig still execs successfully.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+PROCFILE_BACKUP_CONTENT=$(cat "$PROCFILE" 2>/dev/null); rm -f "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "does not exist (no hugetlbfs support" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "baseline file absent (no hugetlbfs): no record written, logged once"
+else
+	bad "baseline file absent (no hugetlbfs): no record written, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+if [[ $(grep -c '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null) == 1 ]]; then
+	ok "baseline file absent: hugepages -rx called exactly ONCE (the engine's own) - the dispatcher's own attempt is skipped, not wasted on a no-op"
+else
+	bad "baseline file absent: hugepages -rx called exactly once (engine's own)" "$(cat "$SYSCTL_LOG")"
+fi
+printf '%s\n' "$PROCFILE_BACKUP_CONTENT" > "$PROCFILE"   # restore for every test below (file re-created)
+echo 0 > "$PROCFILE"
+
+# ---- Same class, but the file EXISTS and is readable - hugetlbfs IS present, so a later `hugepages -rx` WILL
+#      genuinely reserve pages - with its content not a plain number (simulates both "corrupt content" and the
+#      unreadable case, which this harness - possibly running as root - cannot reliably simulate via
+#      permissions alone; either way _hp_read_baseline's own check is identical: not a plain non-negative
+#      integer). Must refuse the WHOLE rx start, before ever calling `hugepages -rx` at all - no reservation
+#      has happened yet at this point, so this needs no rollback, unlike the post-reservation checks above.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+echo "not-a-number" > "$PROCFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "exists but could not be read as a plain number" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "baseline file present but non-numeric: refused, logged"
+else
+	bad "baseline file present but non-numeric: refused, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+if ! grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then
+	ok "baseline file present but non-numeric: hugepages -rx NEVER called - refused before ever reserving"
+else
+	bad "baseline file present but non-numeric: hugepages -rx never called" "$(cat "$SYSCTL_LOG")"
+fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == "not-a-number" ]]; then ok "baseline file present but non-numeric: vm.nr_hugepages left completely untouched"; else bad "baseline file present but non-numeric: vm.nr_hugepages left untouched" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+echo 0 > "$PROCFILE"
+
+# ---- PR #2 follow-up review (Codex): "Require a boot ID before accepting the reservation" - an empty/
+#      unreadable boot_id can never be matched later by finalize_rx_hugepages or restore_verus_hugepages
+#      (both require a non-empty, EXACT match), so a record persisted with boot= would be permanently stuck at
+#      final=0, its reservation pinned until reboot. Checked BEFORE anything else in note_rx_hugepages_start -
+#      must refuse the whole rx start, before ever reserving (no rollback needed), live value untouched.
+rm -f "$HUGEFILE" "$T/log/bloxminer.log"
+BOOTFILE_BACKUP=$(cat "$BOOTFILE" 2>/dev/null); : > "$BOOTFILE"
+hconfig "p:1" "W" "" "" "rx/0"; : > "$SYSCTL_LOG"; run_h_run
+if [[ ! -e $HUGEFILE ]] && grep -q "could not read .*boot_id" "$T/log/bloxminer.log" 2>/dev/null; then
+	ok "empty boot_id: refused before reserving, no record, logged"
+else
+	bad "empty boot_id: refused before reserving, no record, logged" "record=$([[ -e $HUGEFILE ]] && cat "$HUGEFILE" || echo NONE) log=$(cat "$T/log/bloxminer.log" 2>/dev/null)"
+fi
+if ! grep -q '^hugepages -rx$' "$SYSCTL_LOG" 2>/dev/null; then
+	ok "empty boot_id: hugepages -rx NEVER called - refused before ever reserving"
+else
+	bad "empty boot_id: hugepages -rx never called" "$(cat "$SYSCTL_LOG")"
+fi
+if [[ $(cat "$PROCFILE" 2>/dev/null) == 0 ]]; then ok "empty boot_id: vm.nr_hugepages left completely untouched"; else bad "empty boot_id: vm.nr_hugepages left untouched" "$(cat "$PROCFILE" 2>/dev/null)"; fi
+printf '%s\n' "$BOOTFILE_BACKUP" > "$BOOTFILE"   # restore for every test below
+
 # legacy (pre-Round-5) record: only prior=/ours=, no final= line at all - never trusted for a restore (missing
 # final never equals "1"), left untouched until the next reboot clears tmpfs; no migration code needed.
 hconfig "p:1" "W" "" "" ""   # a verus config, so run_h_run below actually exercises restore_verus_hugepages
