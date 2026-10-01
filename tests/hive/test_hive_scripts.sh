@@ -281,7 +281,13 @@ res=$(timeout 20 bash -c '
 	sleep 2.6
 	. "$BLOX_DIR/h-stats.sh"; r4="$khs|$stats"             # poll 4, after another real gap
 	after_fds=$(ls /proc/$$/fd 2>/dev/null | wc -l)
-	after_children=$(pgrep -P $$ 2>/dev/null | wc -l)
+	# Fork-free, via a bash builtin `read` redirected from /proc - NOT `pgrep -P $$ | wc -l` (tried first):
+	# pgrep itself is a NEWLY FORKED child of $$ at the exact moment it runs, with PPID=$$ until it execs away
+	# its own identity - a classic self-match, confirmed directly (pgrep -P $$ inside `$(...)` matched its own
+	# PID, with zero real children present per `ps --ppid`). /proc/$$/task/$$/children (Linux, direct children
+	# of $$) read via the `read` builtin never forks at all, so there is no reader process left for it to see.
+	children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
+	after_children=0; [[ -n $children ]] && after_children=$(wc -w <<< "$children")
 	jq -nc --arg a "$r1" --arg b "$r2" --arg c "$r3" --arg d "$r4" \
 		--arg bf "$before_fds" --arg af "$after_fds" --arg ac "$after_children" \
 		"{p1:\$a,p2:\$b,p3:\$c,p4:\$d,before_fds:(\$bf|tonumber),after_fds:(\$af|tonumber),after_children:(\$ac|tonumber)}"
