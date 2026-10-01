@@ -516,6 +516,80 @@ else
 	bad "summary never answers (10s, past the whole budget): bounded, honest 0, no hang" "elapsed=${elapsed}s res=$res"
 fi
 
+# ---- P1: with `summary` answering late (1.8-1.9 s) under GENUINE single-CPU saturation (not just this file's
+# own serial test harness), Phase A's own fast publish (write_result_fast(), gated by RESERVE_US - see both of
+# their own headers) must still land well inside budget on every poll, not just when the host happens to be
+# idle. Serializes against tests/hive/test_under_load.sh's own CPU-saturating cases via the SAME shared lock
+# file (see that test's own header for the full rationale) - this case saturates a real CPU too.
+HAVE_TASKSET=1; command -v taskset > /dev/null 2>&1 || HAVE_TASKSET=0
+if [[ $HAVE_TASKSET == 1 ]]; then
+	exec 8>"${TMPDIR:-/tmp}/bloxminer-load-test.lock"
+	if flock -w 300 8; then
+		kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+		PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+		jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" --argjson d 1.85 '{summary: $s, cores: $c, delay: {summary: $d}}' > "$T/replies.json"
+		: > "$T/api.out"
+		python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+		for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+		SAT_PIDS=()
+		for _ in 1 2; do taskset -c 0 sh -c 'while :; do :; done' & SAT_PIDS+=("$!"); done
+		sleep 0.3
+		n_zero=0; n_over_cap=0; i=0
+		for i in $(seq 1 20); do
+			t0=$(date +%s.%N)
+			# shellcheck disable=SC2016   # expanded by the inner bash, not here
+			res=$(timeout 8 taskset -c 0 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>/dev/null)
+			t1=$(date +%s.%N)
+			elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+			khs_got=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+			awk -v k="${khs_got:-0}" 'BEGIN{exit !(k>0)}' || { n_zero=$((n_zero+1)); echo "  poll $i: ZERO khs ($res)"; }
+			awk -v e="$elapsed" 'BEGIN{exit !(e > 4.0)}' && { n_over_cap=$((n_over_cap+1)); echo "  poll $i: OVER HARD CAP (${elapsed}s)"; }
+		done
+		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done
+		for p in "${SAT_PIDS[@]:-}"; do [[ -n $p ]] && wait "$p" 2>/dev/null; done
+		flock -u 8
+		if [[ $n_zero == 0 && $n_over_cap == 0 ]]; then
+			ok "summary answers late (1.85s) under genuine single-CPU saturation, $i polls: no false zero, within hard cap"
+		else
+			bad "summary answers late (1.85s) under genuine single-CPU saturation, $i polls: no false zero, within hard cap" \
+				"n_zero=$n_zero n_over_cap=$n_over_cap"
+		fi
+	else
+		echo "SKIP: could not acquire the shared load-test lock within 300s (stuck holder?)"
+	fi
+else
+	echo "SKIP: taskset not available - saturated-CPU timing case skipped"
+fi
+
+# ---- SECURITY: bash arithmetic contexts ($(( )), (( )), array subscripts, -eq/-lt/-gt/...) recursively
+# evaluate a variable's VALUE as a further expression, including command substitution - an untrusted
+# numeric-looking field reaching ANY of those unvalidated is remote code execution from anything that can
+# answer on 127.0.0.1:4068 (a local port race, or whatever sits between this poll and the real miner), not just
+# a parsing bug. Poisons every numeric field this file parses - in BOTH the summary and cores replies - with
+# the SAME payload and confirms no command it contains ever runs (no file created) and the poll still completes
+# promptly with a safe, bounded result rather than hanging or crashing.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+PAYLOAD="a[\$(touch $T/pwned)]"
+SUM_EVIL="NAME=bloxminer;VER=2.1.0;API=1.9;ALGO=verus;GPUS=1;KHS=$PAYLOAD;SOLV=0;ACC=$PAYLOAD;REJ=$PAYLOAD;ACCMN=1.0;DIFF=1;NETKHS=0;POOLS=1;WAIT=0;UPTIME=$PAYLOAD;TS=1;LASTWORK=5;STALL=$PAYLOAD;FRESHKHS=$PAYLOAD;POWER=$PAYLOAD;TEMP=$PAYLOAD;CORES=2;ENGINE=ccminer-3.8.3|"
+CORES_EVIL="GEN=$PAYLOAD;AGE=$PAYLOAD;ROWS=$PAYLOAD;THREADS=4/4;PERCORE=$PAYLOAD;STALL=$PAYLOAD|ROW=$PAYLOAD;PKG=$PAYLOAD;CORE=$PAYLOAD;CPUS=$PAYLOAD;KHS=$PAYLOAD;TEMP=$PAYLOAD;SRC=ccd|"
+jq -n --arg s "$SUM_EVIL" --arg c "$CORES_EVIL" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+rm -f "$T/pwned"
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(timeout 8 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>"$T/evil_stderr.log")
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+if [[ ! -e $T/pwned ]] && [[ $res == "khs=[0]" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}'; then
+	ok "arithmetic-injection payload in every numeric field: no command executed, poll completes safely (${elapsed}s)"
+else
+	bad "arithmetic-injection payload in every numeric field: no command executed, poll completes safely" \
+		"elapsed=${elapsed}s res=$res pwned_exists=$([[ -e $T/pwned ]] && echo yes || echo no)"
+fi
+
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
 # leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
 for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done

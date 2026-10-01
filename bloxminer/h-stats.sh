@@ -112,11 +112,24 @@ remaining_us() {   # sets $REPLY = microseconds left until the ONE absolute $DEA
 }
 have_budget_us() { (( $1 > 50000 )); }   # < 50 ms left is not worth attempting
 cap_us() { (( $1 < $2 )) && REPLY=$1 || REPLY=$2; }   # min(remaining, nominal per-step ceiling), both in us
-# Reserved, after the mandatory Phase A `summary` call returns, for parsing its reply plus write_result()'s own
-# jq composition - measured comfortably (a handful of pure-bash parameter expansions plus a couple of small jq
-# invocations) to finish well inside 200 ms even under load; kept here as a named constant rather than inlined
-# at the one call site that uses it (run(), below) so the reasoning stays attached to the number.
-RESERVE_US=200000
+# Reserved, after the mandatory Phase A `summary` call returns, for parsing its reply (field(), fork-free) plus
+# write_result_fast()'s own publish (one `mv`) - NOT the richer jq-based enrichment further below, which is
+# best-effort and never blocks this reserve's own job: guaranteeing the FAST, minimal publish always has room
+# to land. The original 200 ms here was sized for the OLD path (parsing + the full ~7-jq-fork composition,
+# before write_result_fast existed) and was never re-measured once that path got replaced - CI found summary
+# itself answering late (1.8-1.9 s) under saturation could still blow a 200 ms reserve meant for 7 forks, not
+# the 1 fork (just the final `mv`) this now actually needs. Re-measured directly (fake API delaying `summary`
+# 1.85 s, collector taskset to ONE saturated CPU, 22 polls per level, BLOX_HSTATS_DEBUG_LOG timestamps around
+# the exact span this reserve covers): 3-way contention on that one CPU (2 competing busy loops + the
+# collector itself) - max 41.4 ms, avg 36.4 ms; 7-way contention - max 81.3 ms, avg 75.1 ms. (At 12-way
+# contention on one CPU, `summary` itself no longer returns in time at all regardless of this reserve - a
+# separate, already-reported scheduling-starvation limit of extreme single-CPU oversubscription, not something
+# sized here can fix.) 150 ms keeps comfortable margin above the worst measured value (81.3 ms, ~1.85x) while
+# giving the mandatory `summary` call 50 ms more of the shared budget than the old 200 ms did - directly
+# helping the exact "answers late under load" scenario this reserve exists for. Kept here as a named constant
+# rather than inlined at the one call site that uses it (run(), below) so the reasoning stays attached to the
+# number.
+RESERVE_US=150000
 us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout` below - no fork
 	local us=$1 f
 	printf -v f '%06d' $(( us % 1000000 ))
@@ -194,6 +207,34 @@ write_result() {
 	{ printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
 }
 
+# write_result_fast <khs> <acc> <rej> <uptime> - the FIRST thing Phase A publishes once `summary` is parsed, a
+# minimal single-row result built from already-validated (int()/num()-gated by the caller, before this is ever
+# called) numeric fields ONLY, via pure bash printf -v - no jq fork at all (one `mv` aside, for the same atomic
+# tmp+rename write_result() itself uses, which needs a real rename to guarantee no reader ever sees a partial
+# write - see write_result()'s own header).
+#
+# CI finding: with `summary` itself answering late (1.8-1.9 s) under real CPU saturation, the FULL Phase A
+# path below - parse, then a 4-nested-jq-into-one-outer-jq composition, then phase_a_stats_gate()'s own
+# re-validation jq -e call, then write_result()'s own jq call - is 6-7 jq forks deep. Measured under
+# `taskset -c 0` saturation (tests/hive/test_hive_scripts.sh's own "fast publish under saturation" case): that
+# chain did not reliably fit inside the old flat 200 ms RESERVE_US once `summary` itself had already used most
+# of the budget - the child was killed before ANYTHING was published, a false zero despite a perfectly
+# healthy, positive rate already fully parsed and sitting in bash variables. write_result_fast() publishes
+# that exact rate immediately, before any of the jq-based enrichment below even starts; the richer composition
+# then still runs afterward and, if it finishes in time, OVERWRITES this minimal result with a fuller one
+# (ver/power/per-row detail) - this function is the new floor under that, never a replacement for it.
+#
+# The stats value this writes is byte-identical in shape to phase_a_stats_gate()'s own last-resort printf
+# fallback (that function's own header explains why that path must also stay jq-free) - this is that same
+# minimal object, just reached on the FAST path instead of only after jq has already failed.
+write_result_fast() {
+	local k=$1 a=$2 r=$3 u=$4 stats_inner outer tmp="$OUTFILE.w.$$"
+	printf -v stats_inner '{\"hs\":[%s],\"hs_units\":\"khs\",\"temp\":[null],\"fan\":[0],\"bus_numbers\":[null],\"uptime\":%s,\"ar\":[%s,%s],\"algo\":\"verushash\"}' \
+		"$k" "$u" "$a" "$r"
+	printf -v outer '{"khs":"%s","stats":"%s"}' "$k" "$stats_inner"
+	{ printf '%s' "$outer" > "$tmp" && mv -f "$tmp" "$OUTFILE"; } 2>/dev/null
+}
+
 # phase_a_stats_gate <candidate-stats-json> - sets $REPLY to a stats value safe to hand to write_result: the
 # candidate itself if it passes every check, otherwise an honest minimal object built from $khs/$acc/$rej/$up
 # (already-known scalars every caller of this function has validated before calling it). A single,
@@ -237,6 +278,26 @@ phase_a_stats_gate() {
 	fi
 }
 
+# SECURITY audit (every arithmetic context in this file - $(( )), (( )), array subscripts, -eq/-lt/-gt/...,
+# `let`, `declare -i`, printf %d - against every value derived from the network (the `summary`/`cores` API
+# replies, via field()), procfs, or file content, per the review that found the $stall bug below): bash
+# arithmetic recursively evaluates a variable's VALUE as a further expression, including command substitution -
+# an untrusted field reaching ANY of those contexts unvalidated is remote code execution, not just a type
+# confusion. Every other arithmetic site in this file was already gated correctly (int()/num() - a strict
+# ^[0-9]+$ or ^[0-9]+(\.[0-9]+)?$ regex - on the SAME value, earlier in the SAME `&&` short-circuit chain or an
+# earlier line of the same function, before the arithmetic ever runs): acc/rej/up/ptemp (int()/num() at the top
+# of run(), before any arithmetic touches them), gen/want/rows/age (int()/num() in the Phase-B validation
+# if-condition, left-to-right before their own (( )) checks in the SAME condition), k/t/pk/co (num()/int() in
+# the per-row loop, before being appended to hs[]/temps[] - string appends, not arithmetic, anyway), cpus (a
+# `^[0-9]+(,[0-9]+)*$` regex before being split and used as an associative-array KEY - seen[]/seencpu[] are
+# `declare -A`, whose subscripts bash always treats as plain strings, never arithmetic, regardless). `power` is
+# never bash-validated at all, deliberately safe anyway: it only ever reaches jq via `--arg` (always a literal
+# JSON string, jq's own problem to parse) and jq's own `test()`/tonumber inside a filter string, never bash
+# arithmetic or shell execution. h-run.sh and h-config.sh were audited the same way: h-run.sh has no arithmetic
+# context at all; h-config.sh's three (`threads_ok()`, and the two `$((10#$CUSTOM_PASS))`/`$((10#$t))` thread
+# counts) were already correctly gated by a `^[0-9]{1,3}$` regex (plus an explicit `10#` base, avoiding octal
+# misreads of leading zeros) before ever reaching arithmetic - no change needed there.
+#
 # Sets $khs/$stats and writes $OUTFILE at least once (Phase A).
 run() {
 	local sum acc rej up ver stall fresh power ptemp cores head gen age rows cov pstall percore want
@@ -271,6 +332,10 @@ run() {
 		num "$fresh" || fresh=0                             # the miner's freshness-aware total, never raw KHS
 		khs=$fresh; hs=("$fresh"); temps=("${ptemp:-null}")
 	fi
+	# Published FIRST, before any of the richer jq-based composition below even starts - see
+	# write_result_fast()'s own header for the measured reason this exists as a separate, earlier step rather
+	# than only the composition-failure fallback phase_a_stats_gate() already had.
+	write_result_fast "$khs" "$acc" "$rej" "${up%.*}"
 	n=${#hs[@]}
 	# This composition chains FOUR nested jq calls (command substitutions for hs/temp/fan/bus) into ONE outer
 	# jq call, same shape as Phase B's own final composition below - and, same as that one, any single nested
@@ -301,7 +366,14 @@ run() {
 	fi
 	phase_a_stats_gate "$stats"; stats=$REPLY
 	write_result "$khs" "$stats"
-	(( stall == 1 )) && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
+	# SECURITY: string comparison, NOT `(( stall == 1 ))` - $stall is unvalidated text straight from the
+	# network (field() on $sum, the `summary` API reply). Bash arithmetic contexts ($(( )), (( )), array
+	# subscripts, -eq/-lt/-gt/...) recursively evaluate a variable's VALUE as a further expression, including
+	# command substitution: a reply of STALL=a[$(touch /tmp/pwned)] would run that command the instant `((
+	# stall == 1 ))` evaluated it - a remote command execution reachable by anything that can bind
+	# 127.0.0.1:4068 before the real miner does (a local port race) or sits between this poll and the real
+	# miner. See the file-wide audit note at the top of run() for every other arithmetic site this applies to.
+	[[ $stall == 1 ]] && return 0   # a real stall never attempts Phase B - nothing more to show, honestly
 	local khs_a=$khs   # Phase A's own total, kept aside - Phase B may add detail rows but may only ever
 		# REPLACE this with its own total when that total is complete AND consistent with it (never a
 		# validly-formatted-but-zero cores reply quietly outvoting a positive, fresher summary rate)
