@@ -439,14 +439,6 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
 		run
-		# tests only: forces the parent all the way through its own TERM-then-KILL escalation (see the unbounded-
-		# reap fix below, after this child is launched) - run() has already written a real, honest answer to
-		# $OUTFILE by this point (whatever it collected this poll), so what happens afterward exercises exactly
-		# the property that bug broke: an already-safely-written result must never be held hostage by how long a
-		# SIGTERM-ignoring child takes to actually die. SIGKILL (unlike SIGTERM) cannot be trapped or ignored, so
-		# this still exits - the test proves the PARENT does not wait around for that to happen before reading
-		# $OUTFILE back, not that this child survives forever.
-		[[ -n ${BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE:-} ]] && { trap "" TERM; sleep 30; }
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
 	# stderr from everything inside run() goes to $BLOX_HSTATS_DEBUG_LOG when debugging, /dev/null otherwise.
 	CPID=$!

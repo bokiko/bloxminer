@@ -327,10 +327,34 @@ fi
 # HEALTHY positive API reply underneath it, must still have its already-written Phase A/B answer read back and
 # returned PROMPTLY (well under the 3.0 s budget / 4.0 s hard cap tests/hive/test_under_load.sh enforces) - the
 # parent must never block behind an untimed `wait "$CPID"` waiting for a SIGKILLed-but-not-yet-reaped child.
-# BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE makes the child trap/ignore SIGTERM and sleep well past the deadline
-# AFTER run() has already written a real result - forcing the full TERM-then-KILL escalation path, the exact
-# one a real GitHub CI run once measured stalling to 5.01 s with an EMPTY result (the external test timeout
-# killing the whole poll before this file ever got to answer).
+#
+# No test-only branch in the shipped script for this (an earlier version of this file had
+# BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE directly in bloxminer/h-stats.sh - removed): the SAME forced
+# TERM-then-KILL path is produced from the TEST side instead, via a PATH stub standing in for the one external
+# command this collector actually calls during collection, `nc` - X achieves the equivalent through a
+# SIGTERM-ignoring bloxsense call; this engine has no such tool, so the stub plays that role for `nc` instead.
+# The stub forwards every command EXCEPT "cores" to the REAL nc (against the SAME fake API below), so Phase A's
+# own `summary` call still gets a genuine, healthy reply and run() writes a real positive result before
+# anything hangs - exactly "AFTER Phase A's result has been written". Only "cores" (Phase B, optional) traps/
+# ignores SIGTERM and sleeps well past the deadline: api()'s own inner `timeout --foreground` sends ONE SIGTERM
+# to the stub at ITS OWN short cap and then just waits (GNU timeout never escalates on its own without -k), so
+# that nc call - and therefore run() itself, still waiting on its own `cores=$(api cores)` - never returns on
+# its own; the collector's setsid child is still alive when the PARENT's poll loop gives up at the deadline and
+# has to escalate, the exact path a real GitHub CI run once measured stalling to 5.01 s with an EMPTY result
+# (the external test timeout killing the whole poll before this file ever got to answer).
+REAL_NC=$(command -v nc)
+STUBBIN="$T/stubbin"; mkdir -p "$STUBBIN"
+cat > "$STUBBIN/nc" <<STUBEOF
+#!/usr/bin/env bash
+cmd=\$(cat)
+if [[ \$cmd == cores ]]; then
+	trap '' TERM
+	sleep 30
+	exit 0
+fi
+printf '%s' "\$cmd" | "$REAL_NC" "\$@"
+STUBEOF
+chmod +x "$STUBBIN/nc"
 PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
 jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
 : > "$T/api.out"
@@ -345,7 +369,7 @@ t0=$(date +%s.%N)
 # but mixing it into $res here (an earlier version of this test used 2>&1) corrupted the JSON this test itself
 # expects back. Kept on disk instead, for debugging only.
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
-res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 10 bash -c '
+res=$(PATH="$STUBBIN:$PATH" timeout 10 bash -c '
 	. "$BLOX_DIR/h-stats.sh"
 	children=""; children_na=0
 	if [[ -r /proc/$$/task/$$/children ]]; then
@@ -382,8 +406,9 @@ for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 # Stdout only, not 2>&1 - same reason as the single-poll case above (bash's own async "Killed" job-control
 # notice, once per poll that escalates here, would otherwise land on stderr mixed into $res and break the
 # plain-integer check below).
+# Reuses the SAME $STUBBIN/nc stub set up above (still the only thing on PATH ahead of the real nc).
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
-res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 20 bash -c '
+res=$(PATH="$STUBBIN:$PATH" timeout 20 bash -c '
 	max=0; na=0; [[ -r /proc/$$/task/$$/children ]] || na=1
 	# Runs all 3 polls (still exercising the real escalation path) regardless of whether the procfs feature is
 	# available to MEASURE with - na alone decides whether the caller trusts $max afterward, never whether this
