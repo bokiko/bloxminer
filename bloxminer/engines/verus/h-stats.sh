@@ -110,6 +110,22 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout`
 	printf -v f '%06d' $(( us % 1000000 ))
 	REPLY="$(( us / 1000000 )).$f"
 }
+# wait_secs <fd> <seconds, may be fractional e.g. "0.05"> - PR #2 follow-up review (Codex): "Compare the
+# deadline without launching another process" - see the RandomX engine's own h-stats.sh for the full rationale
+# (identical pattern, same review): the poll loop below already compares its deadline fork-free (remaining_us/
+# have_budget_us, above), but its own pacing still forked an external `sleep` every iteration. `read -t`
+# against a private fd the caller opens ONCE (`exec {fd}<> <(:)`) always times out after almost exactly
+# <seconds>, a plain builtin, no external process per call. <fd> < 0 (the one-time fd open itself failed - not
+# expected in practice) falls back to the external `sleep`, the prior behaviour.
+wait_secs() {
+	local fd=$1 secs=$2
+	if (( fd >= 0 )); then
+		read -r -t "$secs" -u "$fd" _ 2>/dev/null
+	else
+		sleep "$secs" 2>/dev/null
+	fi
+	true
+}
 num()  { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 int()  { [[ $1 =~ ^[0-9]+$ ]]; }
 # --foreground: see the file header - keeps `nc` in this collection's own process group so the outer group-kill
@@ -445,17 +461,21 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# the alarm-based version would have in the worst case either way.
 	# PR #2 follow-up review (Codex): deadline checked BEFORE the liveness probe on every iteration - see the
 	# RandomX engine's own h-stats.sh for the full rationale (identical pattern, same review).
+	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
+	waitfd=-1; exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1   # top-level script code here, not inside a
+		# function - `local` is invalid outside one; this whole block is only ever entered once per poll anyway
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break
-		sleep 0.05
+		wait_secs "$waitfd" 0.05
 	done
 	if still_running; then
 		escalate TERM
-		sleep "$KILL_GRACE"
+		wait_secs "$waitfd" "$KILL_GRACE"
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null
 	fi
+	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
 else

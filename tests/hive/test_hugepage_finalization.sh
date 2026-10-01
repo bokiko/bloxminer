@@ -140,7 +140,7 @@ stop_api() { [[ -n $API_PID ]] && kill "$API_PID" 2>/dev/null; wait "$API_PID" 2
 #      hugepage finalization, which reads only $khs, the API's readiness fields, and smaps_rollup.
 poll() {
 	out=$(BLOX_DIR="$BLOX_DIR" BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT="$PORT" BLOX_STATE_DIR="$T/state" \
-		PATH="$FAKEBIN:$PATH" MV_FAIL="${MV_FAIL:-0}" bash -c '
+		PATH="$FAKEBIN:$PATH" MV_FAIL="${MV_FAIL:-0}" TIMING_AUDIT="${TIMING_AUDIT:-0}" TIMING_AUDIT_LOG="${TIMING_AUDIT_LOG:-}" bash -c '
 		. "$BLOX_DIR/h-stats.sh"
 		echo "khs=[$khs]"
 	' 2>&1)
@@ -179,6 +179,27 @@ fi
 exec /bin/mv "$@"
 SH
 chmod +x "$FAKEBIN/mv"
+# PROACTIVE AUDIT (Codex, PR #2 follow-up review): "Compare the deadline without launching another process" -
+# stubs that let a dedicated test PROVE finalize_rx_hugepages_bounded's own poll/escalation loop never forks
+# awk/date/sleep in its timing path, not just reason about it: each records its own invocation (name + args) to
+# $TIMING_AUDIT_LOG (pure recording, no side effect - an earlier version of this also made a stubbed call sleep
+# 5 s to fail dramatically on a regression, but the RX engine's own ownership scan legitimately calls awk once
+# per poll regardless of anything this review touches, so unconditionally inflating awk made EVERY poll slow
+# and self-contaminated the sleep count too, since that awk stub's own `sleep 5` was itself intercepted by the
+# sleep stub. Recording only, then comparing call counts between a quick control poll and a long-hung one - see
+# the test itself - both proves a per-iteration fork (control=1, hung=30ish would be unmissable) and avoids
+# false positives from real, unrelated, already-legitimate callers). Gated behind TIMING_AUDIT=1 (default
+# passthrough, no-op) so the MANY other tests in this file that legitimately use awk/date elsewhere (test
+# assertions themselves, the 1gb-pages smaps awk scan, log timestamps) are completely unaffected - same
+# convention as MV_FAIL/RM_FAIL/SYSCTL_FAIL elsewhere in this codebase's tests.
+for t in awk date sleep; do
+	cat > "$FAKEBIN/$t" <<SH
+#!/bin/sh
+[ "\${TIMING_AUDIT:-0}" = "1" ] && echo "$t \$*" >> "\$TIMING_AUDIT_LOG"
+exec /usr/bin/$t "\$@"
+SH
+	chmod +x "$FAKEBIN/$t"
+done
 SYSCTL_LOG="$T/sysctl.log"; export SYSCTL_LOG
 attempt_restore() {   # writes $SYSCTL_LOG (engine binary absent, so h-run.sh's own exit status is not meaningful)
 	write_verus_config
@@ -693,6 +714,74 @@ if [[ -n $poll_khs ]] && awk -v k="$poll_khs" 'BEGIN{exit !(k>0)}'; then ok "slo
 if [[ $(hp_field final) == 0 ]]; then ok "slow smaps_rollup: finalization deferred (final stays 0), never a partial/wrong record"; else bad "slow smaps_rollup: finalization deferred" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
 if fifo_has_no_reader_left "$PROC/$OWNER_PID/smaps_rollup"; then ok "slow smaps_rollup: the GROUP-kill reached the blocked read too - no orphaned descendant left waiting on the FIFO"; else bad "slow smaps_rollup: no orphaned descendant left" "a reader is still blocked on the FIFO"; fi
 rm -f "$PROC/$OWNER_PID/smaps_rollup"
+
+# ================================================================== 22b. PROACTIVE AUDIT (Codex, PR #2
+#    follow-up review): "Compare the deadline without launching another process" - proves finalize_rx_hugepages_
+#    bounded's own poll/escalation loop (h-common.sh) never forks awk/date/sleep in ITS OWN timing path, even
+#    while it is forced to iterate many times (a long-hung child, the exact condition that most exercises that
+#    loop). This is a CONTROL-vs-HUNG call-COUNT comparison, not a bare "zero calls" check: awk AND date both
+#    have real, unrelated, pre-existing legitimate callers earlier in the SAME poll, before finalize_rx_
+#    hugepages_bounded ever runs - the rx engine's own `run()` (its ownership scan's `awk -v p=... .../proc/
+#    net/tcp`, and note_state()'s own `date` on its first state transition) - so a bare zero-calls assertion
+#    would be a false positive against those real calls (confirmed the hard way: an earlier version of this
+#    test asserted zero and failed on exactly this). Both fire once per poll regardless of anything this
+#    review touches, in EITHER scenario (they are part of the engine's own collection, which completes
+#    normally before the hugepage step even starts, hung or not) - so the correct bar is not "zero", it is
+#    "the SAME count as a quick, 1-iteration control poll", even though the hung poll forces finalize_rx_
+#    hugepages_bounded's own loop through roughly TEST_HP_BUDGET_S/0.05 ~= 30 iterations. A regression that
+#    forks any of the three PER ITERATION would show up as a dramatic, unmissable count jump (e.g. control=1,
+#    hung=31) - counting is what actually proves this, not an artificial delay (an earlier version also made a
+#    stubbed call sleep 5 s to fail the elapsed-time assertion too on a regression, but unconditionally
+#    inflating awk's own real, legitimate, every-poll call made EVERY poll slow regardless of correctness, and
+#    self-contaminated the sleep count - that stub's own internal `sleep 5` was itself intercepted by the
+#    sleep stub). The elapsed-time assertion below is kept anyway, unmodified by any of this - it is a
+#    completely independent, real wall-clock check that the hung poll's true bound still holds.
+setup_pkg; write_rx_config false
+TIMING_AUDIT_LOG="$T/timing-audit.log"
+
+setup_proc 1201 1200 boot-TIMING-CONTROL
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-TIMING-CONTROL\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500000
+: > "$TIMING_AUDIT_LOG"
+TIMING_AUDIT=1 TIMING_AUDIT_LOG="$TIMING_AUDIT_LOG" poll
+stop_api
+control_awk=$(grep -c '^awk ' "$TIMING_AUDIT_LOG"); control_date=$(grep -c '^date ' "$TIMING_AUDIT_LOG"); control_sleep=$(grep -c '^sleep ' "$TIMING_AUDIT_LOG")
+if [[ $(hp_field final) == 1 ]]; then ok "timing audit control: quick poll (real smaps_rollup) finalizes normally, as the baseline"; else bad "timing audit control: quick poll finalizes normally" "$(cat "$HUGEFILE" 2>/dev/null)"; fi
+
+# Reset $T/state (setup_pkg's own job) between the control and hung sub-scenarios: engines/rx/h-stats.sh's own
+# note_state() only logs a `date`-stamped line on a STATE TRANSITION, never on every poll - without this reset,
+# the control's own first-ever transition would leave $STATEFILE already matching by the time the hung
+# sub-scenario runs moments later, making it show date=0 not because the loop is fork-free but because there
+# was nothing left to transition to. A fresh setup_pkg gives each sub-scenario its own "first poll ever" state.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-TIMING
+mkdir -p "$PROC/$OWNER_PID"; rm -f "$PROC/$OWNER_PID/smaps_rollup"; mkfifo "$PROC/$OWNER_PID/smaps_rollup"
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-TIMING\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500000
+: > "$TIMING_AUDIT_LOG"
+t0=$(date +%s.%N)
+TIMING_AUDIT=1 TIMING_AUDIT_LOG="$TIMING_AUDIT_LOG" BLOX_HP_TOTAL_BUDGET_S=$TEST_HP_BUDGET_S poll
+t1=$(date +%s.%N)
+stop_api
+rm -f "$PROC/$OWNER_PID/smaps_rollup"
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+hung_awk=$(grep -c '^awk ' "$TIMING_AUDIT_LOG"); hung_date=$(grep -c '^date ' "$TIMING_AUDIT_LOG"); hung_sleep=$(grep -c '^sleep ' "$TIMING_AUDIT_LOG")
+if [[ $hung_awk == "$control_awk" ]]; then
+	ok "timing audit: awk call count identical for a ~30-iteration hung poll vs a 1-iteration control ($hung_awk both) - the loop itself never forks awk"
+else
+	bad "timing audit: awk call count identical, hung vs control" "control=$control_awk hung=$hung_awk log=$(cat "$TIMING_AUDIT_LOG")"
+fi
+if [[ $hung_date == "$control_date" && $hung_sleep == "$control_sleep" ]]; then
+	ok "timing audit: date/sleep call counts identical for a ~30-iteration hung poll vs the control ($hung_date/$hung_sleep both) - the loop itself never forks either"
+else
+	bad "timing audit: date/sleep call counts identical, hung vs control" "control_date=$control_date hung_date=$hung_date control_sleep=$control_sleep hung_sleep=$hung_sleep log=$(cat "$TIMING_AUDIT_LOG")"
+fi
+if awk -v e="$elapsed" -v m="$MAX_ELAPSED_S" 'BEGIN{exit !(e < m)}'; then
+	ok "timing audit (hung FIFO): whole poll still bounded to budget+tolerance (${elapsed}s < ${MAX_ELAPSED_S}s)"
+else
+	bad "timing audit (hung FIFO): whole poll still bounded to budget+tolerance" "elapsed=${elapsed}s max=${MAX_ELAPSED_S}s log=$(cat "$TIMING_AUDIT_LOG" 2>/dev/null)"
+fi
 
 # ================================================================== 23. Round 5d (Codex): REPEATED timeouts (5
 #    consecutive polls, each with a FRESH hung smaps_rollup FIFO) must never accumulate stuck descendants, and

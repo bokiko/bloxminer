@@ -181,6 +181,25 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for curl --max-ti
 	printf -v f '%06d' $(( us % 1000000 ))
 	REPLY="$(( us / 1000000 )).$f"
 }
+# wait_secs <fd> <seconds, may be fractional e.g. "0.05"> - PR #2 follow-up review (Codex): "Compare the
+# deadline without launching another process" - the poll loop below already compares its deadline fork-free
+# (remaining_us/have_budget_us, above), but its own pacing still forked an external `sleep` every iteration;
+# under full CPU saturation that fork/exec latency is exactly what can go unscheduled past the loop's own
+# absolute deadline, the same class of bug this file's still_running()/escalate() already fixed for the
+# liveness probe. `read -t` against a private fd the caller opens ONCE (`exec {fd}<> <(:)` - a process
+# substitution of `:`, which exits immediately, but held open read-WRITE on OUR end so the reader never sees
+# EOF) always times out after almost exactly <seconds>: a plain builtin, no external process per call, and no
+# data is ever actually transferred (nothing ever writes to it). <fd> < 0 (the one-time `exec {fd}<> <(:)`
+# itself failed - not expected in practice) falls back to the external `sleep`, the prior behaviour.
+wait_secs() {
+	local fd=$1 secs=$2
+	if (( fd >= 0 )); then
+		read -r -t "$secs" -u "$fd" _ 2>/dev/null
+	else
+		sleep "$secs" 2>/dev/null
+	fi
+	true
+}
 
 # ENRICH_MAX_AGE_S: how old a cached TEMPERATURE (see ENRICHFILE) may be before Phase A stops using it and
 # shows null instead. This bounds a cosmetic detail only - see the file header for why khs is never bounded
@@ -684,10 +703,13 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# after (the old `while still_running; do remaining_us; have_budget_us ... done` checked liveness FIRST,
 	# as the loop's own condition) - now that still_running() is forkless this is mostly defense in depth, but
 	# it also means a poll that is already out of budget never even pays for the (cheap, but not free) probe.
+	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
+	waitfd=-1; exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1   # top-level script code here, not inside a
+		# function - `local` is invalid outside one; this whole block is only ever entered once per poll anyway
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break
-		sleep 0.05
+		wait_secs "$waitfd" 0.05
 	done
 	remaining_us
 	[[ -n ${BLOX_HSTATS_DEBUG_LOG:-} ]] && dbg "parent: poll loop exited, remaining_us=$REPLY still_running=$(still_running && echo yes || echo no)"
@@ -701,10 +723,11 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		# available (reaching every descendant, including a nested `timeout --foreground` and whatever it is
 		# guarding), else against $CPID alone - never a guessed or unconfirmed group
 		escalate TERM
-		sleep "$KILL_GRACE"
+		wait_secs "$waitfd" "$KILL_GRACE"
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it
 	fi
+	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
 else

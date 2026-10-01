@@ -51,11 +51,19 @@ engine=$(engine_from_config) || { khs=0; stats="$DISPATCH_FALLBACK_STATS"; retur
 # ONCE here, rather than a "seconds remaining" snapshot - a snapshot goes stale the instant any further time
 # passes after it is computed, which is exactly what let Round 5c's own escalation overrun this budget (see
 # h-common.sh's finalize_rx_hugepages_bounded for the full explanation and the fix).
+# ROUND 5f (Codex, PR #2 follow-up review): "Compare the deadline without launching another process" - this
+# used to compute BLOX_HP_DEADLINE via awk even though $BLOX_HP_T0_US just above is already this exact same
+# instant in forkless integer microseconds; finalize_rx_hugepages_bounded's own deadline parameter is now
+# integer microseconds throughout (the same DEADLINE_US convention both engines' own h-stats.sh already use
+# for every other timing decision two lines above), so this becomes plain bash arithmetic - no fork.
+# BLOX_HP_TOTAL_BUDGET_S is a plain seconds string (a test-only override of the real 3.0 s budget) -
+# _hp_secs_to_us converts it the same forkless way. No special-casing needed for a degenerate BLOX_HP_T0_US of
+# "0" (EPOCHREALTIME AND the date fallback both failing) either: that naturally yields a deadline far in the
+# past relative to any real "now", so finalize_rx_hugepages_bounded's own budget check already bails out
+# immediately on it - exactly like the old awk special case did, and exactly how DEADLINE_US's own
+# unconditional computation two lines above already handles the identical degenerate case, with no code needed.
 if [[ $engine == rx ]]; then
-	BLOX_HP_DEADLINE=$(awk -v t0="${BLOX_HP_T0:-0}" -v budget="${BLOX_HP_TOTAL_BUDGET_S:-3.0}" 'BEGIN{
-		if (t0 == 0) { print 0; exit }
-		printf "%.6f", t0 + budget
-	}' 2>/dev/null)
-	finalize_rx_hugepages_bounded "${BLOX_HP_DEADLINE:-0}"
+	_hp_secs_to_us "${BLOX_HP_TOTAL_BUDGET_S:-3.0}"
+	finalize_rx_hugepages_bounded "$(( BLOX_HP_T0_US + REPLY ))"
 fi
 true

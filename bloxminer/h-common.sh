@@ -256,6 +256,35 @@ _hp_uptime_seconds() {
 	printf '%s' "${first%%.*}"
 }
 
+# _hp_now_us - sets $REPLY = now, integer microseconds since epoch. PR #2 follow-up review (Codex): "Compare
+# the deadline without launching another process" - bash-builtin EPOCHREALTIME (no fork), falling back to
+# `date +%s.%N` only if unset (an older bash), is the EXACT same idiom (and 6-digit-padding fix) both engines'
+# own h-stats.sh already use for every timing decision (see their own now_us()) - reused verbatim rather than
+# a second, independently-written copy of this arithmetic that could subtly drift from it. EPOCHREALTIME's own
+# fraction is always exactly 6 digits (real microseconds) already, but the `date +%s.%N` fallback's is 9
+# (nanoseconds) - concatenating it raw would silently inflate the result by 1000x whenever that fallback path
+# is ever taken. Pad with trailing zeros first, then keep only the first 6 digits - normalizes either source
+# to exactly 6 real microsecond digits, no fork.
+_hp_now_us() {
+	local t=${EPOCHREALTIME:-} frac
+	[[ -n $t ]] || t=$(date +%s.%N 2>/dev/null)
+	frac="${t#*.}000000"
+	REPLY="${t%%.*}${frac:0:6}"
+}
+
+# _hp_secs_to_us <seconds, possibly fractional e.g. "1.5"> - sets $REPLY = integer microseconds, no fork. Only
+# needed for BLOX_HP_TOTAL_BUDGET_S (h-stats.sh's test-only override of the real 3.0 s poll budget) -
+# _hp_now_us's own EPOCHREALTIME input never needs this (always exactly "S.ffffff", 6 digits already). Handles
+# a bare integer ("3", no dot) too, defensively, even though the real default ("3.0") and every test override
+# on file always have one. `10#` forces base-10 on both halves - a fractional part with a leading zero (e.g.
+# "1.05" -> frac "050000") would otherwise be misread as octal by bash's own arithmetic evaluator.
+_hp_secs_to_us() {
+	local s=$1 whole frac
+	if [[ $s == *.* ]]; then frac="${s#*.}000000"; frac=${frac:0:6}; else frac=000000; fi
+	whole=${s%%.*}
+	REPLY=$(( 10#$whole * 1000000 + 10#$frac ))
+}
+
 # _hp_field <name> - one field from the ownership record, or empty if absent/unreadable. A tiny shared reader
 # so every gate below (note/finalize/restore) parses the same key=value file the same way. ROUND 5d: builtin
 # `while read` (IFS='=' so "key=value" lines split cleanly, even if value itself is empty), no fork (was
@@ -810,7 +839,32 @@ _hp_bounded_still_running() { if [[ -n ${2:-} ]]; then kill -0 -- "-$2" 2>/dev/n
 # differs from the caller's own).
 _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/null; else kill -"$1" "$2" 2>/dev/null; fi; }
 
-# finalize_rx_hugepages_bounded <absolute deadline, EPOCHREALTIME-style seconds.fraction> - the ONLY way the
+# _hp_wait <fd> <seconds, may be fractional e.g. "0.05"> - blocks for approximately that long, WITHOUT forking
+# (was `sleep`, an external process). PR #2 follow-up review (Codex): "Compare the deadline without launching
+# another process" named this loop's own `sleep 0.05` alongside its awk-based deadline check - under full CPU
+# saturation, the fork/exec latency of starting a NEW `sleep` process every single iteration is exactly the
+# kind of scheduling delay that can let the loop overshoot its own absolute deadline (the same class of bug
+# already fixed for every OTHER external process this file's own poll/escalation logic used to fork - see
+# _hp_bounded_still_running/_hp_bounded_escalate's own history). `read -t` against a private fd the caller
+# opened ONCE via `exec {fd}<> <(:)` (a process substitution of `:`, which exits immediately - but held open
+# read-WRITE on OUR end of that pipe, so the reader side never sees EOF) always times out after almost exactly
+# <seconds>: a plain builtin `read`, no external process launched per call, and no data is ever actually
+# transferred (nothing ever writes to it). <fd> < 0 (the one-time `exec {fd}<> <(:)` itself failed - not
+# expected in practice, but never assumed away) falls back to the external `sleep`, exactly the prior
+# behaviour, rather than a tight busy-loop that would itself burn the CPU budget this exists to protect.
+_hp_wait() {
+	local fd=$1 secs=$2
+	if (( fd >= 0 )); then
+		read -r -t "$secs" -u "$fd" _ 2>/dev/null
+	else
+		sleep "$secs" 2>/dev/null
+	fi
+	true
+}
+
+# finalize_rx_hugepages_bounded <absolute deadline, integer microseconds since epoch - the SAME DEADLINE_US
+# convention both engines' own h-stats.sh already use, never the "EPOCHREALTIME-style seconds.fraction" float
+# this parameter used to be (PR #2 follow-up review, Codex - see ROUND 5f below)> - the ONLY way the
 # top-level h-stats.sh ever calls finalize_rx_hugepages. ROUND 5c (Codex): finalize_rx_hugepages itself has no
 # deadline of its own - it runs AFTER the rx engine's own h-stats.sh, which already spends up to its own
 # ~2.4-2.7 s budget under load, so without a bound here finalize's own work (a /proc/net/tcp scan, a curl call,
@@ -871,14 +925,27 @@ _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/nul
 # high-resolution clock, no fork) is used for "now" wherever available, falling back to `date +%s.%N` only if
 # it is unset (an older bash) - consistent with minimising external children, on top of bounding the deadline
 # correctly.
+#
+# ROUND 5f (Codex, PR #2 follow-up review): "Compare the deadline without launching another process" - the
+# arithmetic above was never actually fork-free the way this whole function's own history claims: every "now"
+# and every deadline COMPARISON still forked an external `awk`, and the poll loop's own pacing forked an
+# external `sleep` every single iteration - under full CPU saturation, exactly the fork/exec scheduling latency
+# this function already eliminated everywhere else (the group-kill, the liveness probe, _hp_uptime_seconds, ...)
+# could still delay THESE specific calls past the loop's own absolute deadline: a stale "now" gets compared,
+# one more iteration + sleep runs anyway, and the advertised deadline is exceeded. Fixed by adopting integer
+# microseconds throughout - the exact same DEADLINE_US convention both engines' own h-stats.sh already use for
+# every other timing decision in this codebase (_hp_now_us reuses their now_us() idiom verbatim; the caller,
+# h-stats.sh, now passes an integer-microseconds deadline computed the same fork-free way) - so every
+# comparison here is plain `$(( ))` bash arithmetic, and the poll/escalation waits go through _hp_wait (a
+# builtin `read -t` against a private fd opened ONCE, not a fork of `sleep` per call - see its own header).
 finalize_rx_hugepages_bounded() {
-	local abs_deadline=$1 reserve=0.15   # RESERVE_S: 0.05 s TERM grace + signal-delivery/KILL/reap overhead -
-		# reserved from the deadline BEFORE any alarm duration is ever computed, never added on afterward.
-	local now alarm parent_pgid cpid pgid had_monitor=0
+	local abs_deadline_us=$1 reserve_us=150000   # RESERVE_US: 0.05 s TERM grace + signal-delivery/KILL/reap
+		# overhead - reserved from the deadline BEFORE any alarm duration is ever computed, never added on after.
+	local now_us alarm_us parent_pgid cpid pgid had_monitor=0 waitfd=-1
 
-	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
-	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
-	awk -v a="$alarm" 'BEGIN{exit !(a>0.05)}' || return 0   # not enough of the budget left to even attempt this poll
+	_hp_now_us; now_us=$REPLY
+	alarm_us=$(( abs_deadline_us - now_us - reserve_us )); (( alarm_us < 0 )) && alarm_us=0
+	(( alarm_us > 50000 )) || return 0   # not enough of the budget left to even attempt this poll (< 0.05 s)
 
 	rm -f "$HUGEPAGES_FILE".tmp.* 2>/dev/null   # best-effort: a leftover temp file from an earlier killed attempt
 
@@ -896,8 +963,9 @@ finalize_rx_hugepages_bounded() {
 	# Recompute the alarm duration ONE LAST TIME, right here, right before it actually starts: backgrounding
 	# the job and deriving/verifying its pgid above (a real `ps` fork) already consumed some of the budget -
 	# reusing the value computed at function entry would double-count that time on top of the reserve.
-	now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
-	alarm=$(awk -v d="$abs_deadline" -v n="$now" -v r="$reserve" 'BEGIN{a=d-n-r; if(a<0)a=0; printf "%.2f", a}')
+	_hp_now_us; now_us=$REPLY
+	alarm_us=$(( abs_deadline_us - now_us - reserve_us )); (( alarm_us < 0 )) && alarm_us=0
+	local poll_deadline_us=$(( now_us + alarm_us ))
 	# Poll for the child's own exit (short interval, forkless `kill -0` - no fork wasted on a real result once
 	# it's done) instead of `wait -n <cpid> <apid>`: `wait -n` given explicit pids that mix a job-control-tracked
 	# child (backgrounded under `set -m`, its own process group) with a plain one (the alarm `sleep`, started
@@ -905,21 +973,23 @@ finalize_rx_hugepages_bounded() {
 	# already exited in ~1 ms - reproducible, and specific to how the invoking shell itself was started
 	# (`bash -c '...'` vs a script file) - not something this function can assume away. Polling has no such
 	# invocation-context dependency.
-	local poll_deadline; poll_deadline=$(awk -v n="$now" -v a="$alarm" 'BEGIN{printf "%.6f", n+a}')
+	# One process-substitution fork here (never per iteration) for _hp_wait's own private fd - see its header.
+	exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1
 	# PR #2 follow-up review (Codex): the deadline is checked BEFORE the liveness probe on every iteration, not
 	# after (the old `while _hp_bounded_still_running ...; do now=...; awk ... done` checked liveness FIRST, as
 	# the loop's own condition) - see both engines' own h-stats.sh (same review) for the full rationale.
 	while :; do
-		now=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null)}
-		awk -v n="$now" -v d="$poll_deadline" 'BEGIN{exit !(n < d)}' || break
+		_hp_now_us; now_us=$REPLY
+		(( now_us < poll_deadline_us )) || break
 		_hp_bounded_still_running "$cpid" "$pgid" || break
-		sleep 0.05
+		_hp_wait "$waitfd" 0.05
 	done
 	if _hp_bounded_still_running "$cpid" "$pgid"; then
 		_hp_bounded_escalate TERM "$cpid" "$pgid"
-		sleep 0.05
+		_hp_wait "$waitfd" 0.05
 		_hp_bounded_still_running "$cpid" "$pgid" && _hp_bounded_escalate KILL "$cpid" "$pgid"
 	fi
+	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
 	wait "$cpid" 2>/dev/null
 	true
 }
