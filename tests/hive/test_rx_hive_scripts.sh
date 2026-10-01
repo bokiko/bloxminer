@@ -229,6 +229,20 @@ stats_case "per-core grouping, 16C/32T, bound and verified" 20001 "$SUM_OK" "$BA
 	 .stats.ver == "3.0.0 (xmrig 6.26.0)" and .stats.algo == "rx/0" and
 	 (.stats.hs[0] == (((100 + 0) * 10 + (100 + 16) * 10) / 1000)) and (.stats.temp[0] == 55)'
 
+# PR #2 follow-up review (Codex): "exec {fd}... 2>/dev/null" with no command after it is a bare redirection,
+# applied to the CURRENT SHELL PERMANENTLY, not scoped to that one statement - the poll loop's own fd-open
+# (`{ exec {waitfd}<> <(:); } 2>/dev/null`) and fd-close run unconditionally on every poll that reaches this
+# code (not just a hung one), so an unscoped version would have silently redirected THIS WHOLE SHELL's stderr
+# to /dev/null the instant the very first poll ever ran - Hive sources h-stats.sh repeatedly in one long-lived
+# shell, so every stats_case above already exercises the fixed form; this proves it directly: a message written
+# to stderr, in the SAME shell, immediately after a normal poll, must still be visible afterward.
+out=$(bash -c '. "$BLOX_DIR/h-stats.sh" > /dev/null; echo "STDERR_SURVIVES_AFTER_WAIT_FD" >&2' 2>&1)
+if grep -q "STDERR_SURVIVES_AFTER_WAIT_FD" <<< "$out"; then
+	ok "poll loop's own wait-fd open/close never silently redirects this shell's stderr afterward"
+else
+	bad "poll loop's own wait-fd open/close never silently redirects stderr afterward" "$out"
+fi
+
 # Coordinator (review of a4c4850): every SUM_OK-family fixture in this file omits `hashrate` from /2/summary
 # entirely, so Phase A always reports 0.00 and every one of these tests exercises Phase B's own /2/backends
 # path - useful, deliberate coverage (it is exactly what caught the GH-CI-only Phase B failure this fixture

@@ -846,10 +846,10 @@ _hp_bounded_escalate() { if [[ -n ${3:-} ]]; then kill -"$1" -- "-$3" 2>/dev/nul
 # kind of scheduling delay that can let the loop overshoot its own absolute deadline (the same class of bug
 # already fixed for every OTHER external process this file's own poll/escalation logic used to fork - see
 # _hp_bounded_still_running/_hp_bounded_escalate's own history). `read -t` against a private fd the caller
-# opened ONCE via `exec {fd}<> <(:)` (a process substitution of `:`, which exits immediately - but held open
+# opened ONCE via `{ exec {fd}<> <(:); } 2>/dev/null` (a process substitution of `:`, which exits immediately - but held open
 # read-WRITE on OUR end of that pipe, so the reader side never sees EOF) always times out after almost exactly
 # <seconds>: a plain builtin `read`, no external process launched per call, and no data is ever actually
-# transferred (nothing ever writes to it). <fd> < 0 (the one-time `exec {fd}<> <(:)` itself failed - not
+# transferred (nothing ever writes to it). <fd> < 0 (the one-time `{ exec {fd}<> <(:); } 2>/dev/null` itself failed - not
 # expected in practice, but never assumed away) falls back to the external `sleep`, exactly the prior
 # behaviour, rather than a tight busy-loop that would itself burn the CPU budget this exists to protect.
 _hp_wait() {
@@ -974,7 +974,13 @@ finalize_rx_hugepages_bounded() {
 	# (`bash -c '...'` vs a script file) - not something this function can assume away. Polling has no such
 	# invocation-context dependency.
 	# One process-substitution fork here (never per iteration) for _hp_wait's own private fd - see its header.
-	exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1
+	# PR #2 follow-up review (Codex): "exec {fd}... 2>/dev/null" with NO command after it is a bare redirection,
+	# not a command invocation - bash applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec
+	# 2>/dev/null` would), not just to this one statement; a function's own scope does not limit it either. That
+	# silently redirected this whole process's stderr to /dev/null for the rest of its life the instant this ran
+	# once. The `{ ...; } 2>/dev/null` group form keeps the SAME {fd} allocation (still visible after the group,
+	# since `{ }` is not a subshell) while scoping the redirect to only the command inside it.
+	{ exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
 	# PR #2 follow-up review (Codex): the deadline is checked BEFORE the liveness probe on every iteration, not
 	# after (the old `while _hp_bounded_still_running ...; do now=...; awk ... done` checked liveness FIRST, as
 	# the loop's own condition) - see both engines' own h-stats.sh (same review) for the full rationale.
@@ -989,7 +995,7 @@ finalize_rx_hugepages_bounded() {
 		_hp_wait "$waitfd" 0.05
 		_hp_bounded_still_running "$cpid" "$pgid" && _hp_bounded_escalate KILL "$cpid" "$pgid"
 	fi
-	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
+	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
 	wait "$cpid" 2>/dev/null
 	true
 }

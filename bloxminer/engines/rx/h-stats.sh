@@ -186,10 +186,10 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for curl --max-ti
 # (remaining_us/have_budget_us, above), but its own pacing still forked an external `sleep` every iteration;
 # under full CPU saturation that fork/exec latency is exactly what can go unscheduled past the loop's own
 # absolute deadline, the same class of bug this file's still_running()/escalate() already fixed for the
-# liveness probe. `read -t` against a private fd the caller opens ONCE (`exec {fd}<> <(:)` - a process
+# liveness probe. `read -t` against a private fd the caller opens ONCE (`{ exec {fd}<> <(:); } 2>/dev/null` - a process
 # substitution of `:`, which exits immediately, but held open read-WRITE on OUR end so the reader never sees
 # EOF) always times out after almost exactly <seconds>: a plain builtin, no external process per call, and no
-# data is ever actually transferred (nothing ever writes to it). <fd> < 0 (the one-time `exec {fd}<> <(:)`
+# data is ever actually transferred (nothing ever writes to it). <fd> < 0 (the one-time `{ exec {fd}<> <(:); } 2>/dev/null`
 # itself failed - not expected in practice) falls back to the external `sleep`, the prior behaviour.
 wait_secs() {
 	local fd=$1 secs=$2
@@ -704,8 +704,14 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# as the loop's own condition) - now that still_running() is forkless this is mostly defense in depth, but
 	# it also means a poll that is already out of budget never even pays for the (cheap, but not free) probe.
 	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
-	waitfd=-1; exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1   # top-level script code here, not inside a
-		# function - `local` is invalid outside one; this whole block is only ever entered once per poll anyway
+	# PR #2 follow-up review (Codex): "exec {fd}... 2>/dev/null" with NO command after it is a bare redirection,
+	# not a command invocation - bash applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec
+	# 2>/dev/null` would), not just to this one statement; this is top-level script code, so there is not even
+	# a function scope to (wrongly) hope would limit it. That silently redirected this whole process's stderr to
+	# /dev/null for the rest of its life the instant this ran once. The `{ ...; } 2>/dev/null` group form keeps
+	# the SAME {fd} allocation (still visible after the group, since `{ }` is not a subshell) while scoping the
+	# redirect to only the command inside it.
+	waitfd=-1; { exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break
@@ -727,7 +733,7 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null   # $CPID was still unreaped here - reap it
 	fi
-	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
+	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
 else

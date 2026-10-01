@@ -110,6 +110,20 @@ stats_case() {  # name summary cores jq-assertion
 
 stats_case "complete per-core reply" "$SUM_OK" "$CORES_OK" \
 	'.khs == "11900.00" and .stats.hs == [6000, 5900] and .stats.temp == [61, 64] and .stats.ar == [15, 1] and .stats.uptime == 321 and .stats.cpu_power == 136 and .stats.ver == "3.0.0 (verus, engine 2.1.0)" and .stats.algo == "verushash"'
+
+# PR #2 follow-up review (Codex): "exec {fd}... 2>/dev/null" with no command after it is a bare redirection,
+# applied to the CURRENT SHELL PERMANENTLY, not scoped to that one statement - see the RandomX engine's own
+# test_rx_hive_scripts.sh for the full rationale (identical pattern, same review). The poll loop's own fd-open/
+# close run unconditionally on every poll that reaches this code, so an unscoped version would have silently
+# redirected THIS WHOLE SHELL's stderr to /dev/null from the very first poll onward - Hive sources h-stats.sh
+# repeatedly in one long-lived shell. Proven directly: a message written to stderr, in the SAME shell,
+# immediately after a normal poll, must still be visible afterward.
+out=$(bash -c '. "$BLOX_DIR/h-stats.sh" > /dev/null; echo "STDERR_SURVIVES_AFTER_WAIT_FD" >&2' 2>&1)
+if grep -q "STDERR_SURVIVES_AFTER_WAIT_FD" <<< "$out"; then
+	ok "poll loop's own wait-fd open/close never silently redirects this shell's stderr afterward"
+else
+	bad "poll loop's own wait-fd open/close never silently redirects stderr afterward" "$out"
+fi
 stats_case "numbers are JSON numbers" "$SUM_OK" "$CORES_OK" \
 	'(.stats.ar | map(type) | unique) == ["number"] and (.stats.uptime | type) == "number" and (.stats.hs | map(type) | unique) == ["number"]'
 stats_case "stale cores reply -> FRESHKHS" "$SUM_OK" "${CORES_OK/AGE=1.2/AGE=9.5}" '.khs == "11900.00" and .stats.hs == [11900]'

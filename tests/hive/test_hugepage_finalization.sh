@@ -783,6 +783,30 @@ else
 	bad "timing audit (hung FIFO): whole poll still bounded to budget+tolerance" "elapsed=${elapsed}s max=${MAX_ELAPSED_S}s log=$(cat "$TIMING_AUDIT_LOG" 2>/dev/null)"
 fi
 
+# ================================================================== 22c. PR #2 follow-up review (Codex): "exec
+#    {fd}... 2>/dev/null" with no command after it is a bare redirection, applied to the CURRENT SHELL
+#    PERMANENTLY, not scoped to that one statement - finalize_rx_hugepages_bounded's own fd-open/close ran
+#    unconditionally on every poll that reaches it (not just a hung one), so an unscoped version would have
+#    silently redirected THIS WHOLE PROCESS's stderr to /dev/null the instant the very first rx poll EVER ran,
+#    for the rest of that SAME shell's life - Hive sources h-stats.sh repeatedly in one long-lived shell.
+#    Proven directly on a normal (non-hung, immediately-finalizing) poll: a message written to stderr, in the
+#    SAME bash -c/shell, right after it, must still be visible afterward.
+setup_pkg; write_rx_config false
+setup_proc 1201 1200 boot-STDERR
+write_smaps "$OWNER_PID" 1201 0
+mkdir -p "$T/state"; printf 'prior=0\nprelim=1200\nfree0=1200\nboot=boot-STDERR\nstart_uptime=1000\nfinal=0\n' > "$HUGEFILE"
+start_api 1200 1200 500000
+out_stderr=$(BLOX_DIR="$BLOX_DIR" BLOX_PROCFS_ROOT="$PROC" BLOX_API_PORT="$PORT" BLOX_STATE_DIR="$T/state" bash -c '
+	. "$BLOX_DIR/h-stats.sh" > /dev/null
+	echo "STDERR_SURVIVES_AFTER_WAIT_FD" >&2
+' 2>&1)
+stop_api
+if grep -q "STDERR_SURVIVES_AFTER_WAIT_FD" <<< "$out_stderr"; then
+	ok "finalize_rx_hugepages_bounded's own wait-fd open/close never silently redirects this shell's stderr afterward"
+else
+	bad "finalize_rx_hugepages_bounded's own wait-fd open/close never silently redirects stderr afterward" "$out_stderr"
+fi
+
 # ================================================================== 23. Round 5d (Codex): REPEATED timeouts (5
 #    consecutive polls, each with a FRESH hung smaps_rollup FIFO) must never accumulate stuck descendants, and
 #    each killed attempt must leave the record completely untouched - not just "final stays 0" but BYTE-

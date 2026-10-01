@@ -114,7 +114,7 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout`
 # deadline without launching another process" - see the RandomX engine's own h-stats.sh for the full rationale
 # (identical pattern, same review): the poll loop below already compares its deadline fork-free (remaining_us/
 # have_budget_us, above), but its own pacing still forked an external `sleep` every iteration. `read -t`
-# against a private fd the caller opens ONCE (`exec {fd}<> <(:)`) always times out after almost exactly
+# against a private fd the caller opens ONCE (`{ exec {fd}<> <(:); } 2>/dev/null`) always times out after almost exactly
 # <seconds>, a plain builtin, no external process per call. <fd> < 0 (the one-time fd open itself failed - not
 # expected in practice) falls back to the external `sleep`, the prior behaviour.
 wait_secs() {
@@ -462,8 +462,14 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# PR #2 follow-up review (Codex): deadline checked BEFORE the liveness probe on every iteration - see the
 	# RandomX engine's own h-stats.sh for the full rationale (identical pattern, same review).
 	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
-	waitfd=-1; exec {waitfd}<> <(:) 2>/dev/null || waitfd=-1   # top-level script code here, not inside a
-		# function - `local` is invalid outside one; this whole block is only ever entered once per poll anyway
+	# PR #2 follow-up review (Codex): "exec {fd}... 2>/dev/null" with NO command after it is a bare redirection,
+	# not a command invocation - bash applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec
+	# 2>/dev/null` would), not just to this one statement; this is top-level script code, so there is not even
+	# a function scope to (wrongly) hope would limit it. That silently redirected this whole process's stderr to
+	# /dev/null for the rest of its life the instant this ran once. The `{ ...; } 2>/dev/null` group form keeps
+	# the SAME {fd} allocation (still visible after the group, since `{ }` is not a subshell) while scoping the
+	# redirect to only the command inside it.
+	waitfd=-1; { exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break
@@ -475,7 +481,7 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		still_running && escalate KILL
 		wait "$CPID" 2>/dev/null
 	fi
-	(( waitfd >= 0 )) && exec {waitfd}<&- 2>/dev/null
+	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
 else
