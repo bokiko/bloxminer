@@ -308,6 +308,64 @@ else
 		"res=$res before_fds=$bf after_fds=$af after_children=$ac"
 fi
 
+# ---- unbounded-reap fix (ported from bloxminer-x commit 9a3778a, same bug): a SIGTERM-ignoring child, with a
+# HEALTHY positive API reply underneath it, must still have its already-written Phase A/B answer read back and
+# returned PROMPTLY (well under the 3.0 s budget / 4.0 s hard cap tests/hive/test_under_load.sh enforces) - the
+# parent must never block behind an untimed `wait "$CPID"` waiting for a SIGKILLed-but-not-yet-reaped child.
+# BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE makes the child trap/ignore SIGTERM and sleep well past the deadline
+# AFTER run() has already written a real result - forcing the full TERM-then-KILL escalation path, the exact
+# one a real GitHub CI run once measured stalling to 5.01 s with an EMPTY result (the external test timeout
+# killing the whole poll before this file ever got to answer).
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 10 bash -c '
+	. "$BLOX_DIR/h-stats.sh"
+	children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
+	jq -nc --arg k "$khs" --arg s "$stats" --arg c "$children" "{khs: \$k, stats: \$s, children: \$c}"
+' 2>&1)
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+khs_got=$(jq -r '.khs // ""' <<< "$res" 2>/dev/null)
+children_got=$(jq -r '.children // "" | split(" ") | map(select(. != "")) | length' <<< "$res" 2>/dev/null)
+if [[ $khs_got == "11900.00" ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 3.5)}' && [[ ${children_got:-9} -le 1 ]]; then
+	ok "SIGTERM-ignoring child, healthy summary: Phase A's fresh total survives escalation, returned promptly (${elapsed}s)"
+else
+	bad "SIGTERM-ignoring child, healthy summary: Phase A's fresh total survives escalation, returned promptly" \
+		"elapsed=${elapsed}s children=$children_got res=$res"
+fi
+# No explicit reap after SIGKILL (see h-stats.sh's own comment at that exact point) means AT MOST one stale
+# zombie can be left behind per poll that goes through this escalation path - bash's own job control reaps it
+# opportunistically on the NEXT poll's own backgrounding, at the latest. Runs 3 MORE polls through the exact
+# same forced-escalation path in the SAME shell and checks that count never grows past 1 - proves zombies do
+# not accumulate unbounded across repeated pollings, only ever a single pending one at a time.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE=1 timeout 20 bash -c '
+	max=0
+	for i in 1 2 3; do
+		. "$BLOX_DIR/h-stats.sh"
+		children=""; read -r children < "/proc/$$/task/$$/children" 2>/dev/null
+		n=0; [[ -n $children ]] && { read -ra arr <<< "$children"; n=${#arr[@]}; }
+		(( n > max )) && max=$n
+	done
+	echo "$max"
+' 2>&1)
+if [[ $res =~ ^[0-9]+$ ]] && (( res <= 1 )); then
+	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (max=$res)"
+else
+	bad "repeated escalation-path polls: at most one transient zombie between polls, never accumulating" "res=$res"
+fi
+
 # SIGTERM everything tracked, wait for each (a no-op if already reaped), THEN check for survivors - a real
 # leak is one that outlives its own SIGTERM, not one merely still alive before anything has tried to stop it.
 for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill "$p" 2>/dev/null; done

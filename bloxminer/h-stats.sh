@@ -417,6 +417,14 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		{ printf "%s" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]")"; } > "$2" 2>/dev/null
 		. "$1"
 		run
+		# tests only: forces the parent all the way through its own TERM-then-KILL escalation (see the unbounded-
+		# reap fix below, after this child is launched) - run() has already written a real, honest answer to
+		# $OUTFILE by this point (whatever it collected this poll), so what happens afterward exercises exactly
+		# the property that bug broke: an already-safely-written result must never be held hostage by how long a
+		# SIGTERM-ignoring child takes to actually die. SIGKILL (unlike SIGTERM) cannot be trapped or ignored, so
+		# this still exits - the test proves the PARENT does not wait around for that to happen before reading
+		# $OUTFILE back, not that this child survives forever.
+		[[ -n ${BLOX_HSTATS_TEST_FORCE_SIGTERM_IGNORE:-} ]] && { trap "" TERM; sleep 30; }
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
 	# stderr from everything inside run() goes to $BLOX_HSTATS_DEBUG_LOG when debugging, /dev/null otherwise.
 	CPID=$!
@@ -471,11 +479,37 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		escalate TERM
 		wait_secs "$waitfd" "$KILL_GRACE"
 		still_running && escalate KILL
-		wait "$CPID" 2>/dev/null
 	fi
 	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
+	# CI finding (ported from bloxminer-x commit 9a3778a, same bug, same fix - that package's own GitHub CI hit
+	# it: "poll 11: ZERO khs ()" at 5.01 s, hard cap 4.0 s, an EMPTY result because the test's own external
+	# `timeout` killed the whole poll before this file ever got to answer): the read-back used to happen AFTER
+	# a blocking, untimed `wait "$CPID"` right here. SIGKILL terminates its target immediately regardless of
+	# THIS shell's own scheduling, but `wait` only returns once this shell has itself been scheduled long enough
+	# to receive and process the resulting SIGCHLD - under the exact severe CPU starvation the TERM-then-KILL
+	# escalation above exists to recover from, that bookkeeping step had no bound of its own and could stall
+	# arbitrarily long, holding an already-written, honest answer (at minimum Phase A's own fresh total - see
+	# write_result()'s atomic tmp+rename) hostage behind it. $OUTFILE is read HERE, immediately after the
+	# escalation's own TERM/KILL calls, before any reap - not merely reordered-and-kept, because leaving a
+	# trailing `wait "$CPID"` anywhere before the khs/stats extraction below would still let it stall the whole
+	# poll.
 	result=$(cat "$OUTFILE" 2>/dev/null)
 	rm -f "$OUTFILE" "$HANDSHAKE"
+	# No explicit `wait "$CPID"` at all, deliberately: SIGKILL has already terminated $CPID by this point
+	# (unblockable, immediate, regardless of this shell's own scheduling) - a trailing `wait` here would only be
+	# REAPING it (clearing the zombie), a bookkeeping step with no bearing on the answer already captured above,
+	# and the exact thing measured to itself block arbitrarily long under the CPU starvation this escalation
+	# path exists to survive. Skipping it outright is safe, not just expedient: Hive sources this file
+	# repeatedly in the SAME long-lived agent shell (see tests/hive/test_hive_scripts.sh's own "sourced
+	# repeatedly" case) - bash's own job control opportunistically reaps a previously-terminated background job
+	# as a side effect of the NEXT poll's own backgrounding (this function backgrounds a fresh child every
+	# single poll), so a zombie left here is reclaimed on the very next poll at the latest, never accumulating
+	# unbounded - and even if it somehow never were, the kernel reparents and reaps any still-pending zombie the
+	# moment this process's own parent (Hive's agent, or whatever sourced this file) eventually exits. Trading a
+	# worst-case INDEFINITE hang for, at most, one transient zombie between polls is the right side of that
+	# trade, and does not weaken the existing 3.0 s/4.0 s budget/hard-cap guarantees - the collector design
+	# itself (BUDGET_US/KILL_GRACE) is unchanged; this was a reap ordering/boundedness bug, not a budget sizing
+	# one.
 else
 	result=""
 fi
