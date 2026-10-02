@@ -57,7 +57,10 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
 | **VRSC** | Supported and tested on Verus stratum pools |
 | **Fees** | **None.** No dev fee and no donation mining: every share goes to your wallet on the pool you configure. Open source (GPL-3.0); the full change to ccminer is [`build/bloxminer.patch`](build/bloxminer.patch) |
 | **Verus PBaaS chains** | The Verus merged-mining header handling is included (from monkins1010's ccminer). Whether a pool offers merged mining or a PBaaS chain, and which rewards you get, depends on the pool. Not tested by us |
-| **Other coins / algorithms** | Not supported. Any `algo` other than `verus` is refused at start with a message |
+| **Other coins / algorithms** | Not supported by this binary — any `algo` other than `verus` is refused at start with a message. For Monero (XMR) and the rest of the RandomX family, see [BloxMiner-X](https://github.com/bokiko/bloxminer-x), the companion 0 %-fee RandomX miner |
+
+**Also see:** [BloxMiner-X](https://github.com/bokiko/bloxminer-x) is the companion 0 %-fee **Monero (XMR,
+RandomX)** CPU miner, same HiveOS custom-miner packaging.
 
 ---
 
