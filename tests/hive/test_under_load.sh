@@ -32,6 +32,10 @@ T=$(mktemp -d)
 BUSY_PIDS=()
 API_PID=""   # backstop only - already killed inline right after each case finishes; the trap exists so an
 	# abnormal exit mid-case can never leave it running
+# Idempotent (safe to call more than once): every `kill -9` targets a pid that may already be dead/reaped
+# (silently fails under 2>/dev/null), and `rm -rf` on an already-removed $T is a no-op. That matters now that
+# INT/TERM each call this AND THEN exit (which fires the EXIT trap too, a second call to the SAME function) -
+# see the three traps below.
 cleanup() {
 	for p in "${BUSY_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
 	[[ -n $API_PID ]] && kill -9 "$API_PID" 2>/dev/null
@@ -39,7 +43,15 @@ cleanup() {
 	[[ -n ${API_WD_PID:-} ]] && kill -9 "$API_WD_PID" 2>/dev/null
 	rm -rf "$T"
 }
-trap cleanup EXIT INT TERM
+# P2 (bot finding): a single `trap cleanup EXIT INT TERM` with no explicit `exit` runs cleanup on a real INT/
+# TERM and then RETURNS to wherever the script was interrupted - the suite keeps running afterward against
+# fixtures cleanup() just deleted, and could even start NEW busy loops (saturate_cpus()) on top of whatever
+# this trap just killed. EXIT stays cleanup-only (it fires exactly once, at the point this script is already
+# ending, by whatever means); INT/TERM each call cleanup THEN exit with the conventional 128+signal code
+# (130/143) so the process actually terminates instead of resuming.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '%-70s ok\n' "$1"; }

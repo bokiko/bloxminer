@@ -7,7 +7,20 @@ T=$(mktemp -d)
 declare -a ALL_API_PIDS=()   # every fake-API pid THIS script ever started - killed exactly by pid, never by
 	# pattern (a fixed port could be held by another, unrelated process on a shared build host)
 cleanup_apis() { local p; for p in "${ALL_API_PIDS[@]:-}"; do [[ -n $p ]] && kill -9 "$p" 2>/dev/null; done; wait "${ALL_API_PIDS[@]:-}" 2>/dev/null || true; }
-trap 'cleanup_apis; rm -rf "$T"' EXIT INT TERM
+# cleanup() is idempotent (safe to call more than once): cleanup_apis() kills already-killed/reaped pids and
+# waits on already-reaped ones, both no-ops under 2>/dev/null / || true; rm -rf on an already-removed $T is
+# also a no-op. That matters now that INT/TERM each call it AND THEN exit (which fires the EXIT trap too, a
+# second call to the SAME function) - see the three traps below.
+cleanup() { cleanup_apis; rm -rf "$T"; }
+# P2 (bot finding): a single `trap '...' EXIT INT TERM` with no explicit `exit` runs cleanup on a real INT/
+# TERM and then RETURNS to wherever the script was interrupted - the suite keeps running afterward against
+# fixtures cleanup() just deleted (and, in test_under_load.sh's own case, could even start NEW busy loops).
+# EXIT stays cleanup-only (it fires exactly once, at the point this script is already ending, by whatever
+# means); INT/TERM each call cleanup THEN exit with the conventional 128+signal code (130/143) so the
+# process actually terminates instead of resuming.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 pass=0; fail=0; API_PID=
 ok()  { pass=$((pass+1)); printf '%-52s ok\n' "$1"; }
 bad() { fail=$((fail+1)); printf '%-52s FAIL: %s\n' "$1" "$2"; }
@@ -639,6 +652,66 @@ if [[ $khs_got == "0" ]] && [[ -z $leaked_wd ]]; then
 	ok "mktemp -d failure: honest fallback, no leaked working directory"
 else
 	bad "mktemp -d failure: honest fallback, no leaked working directory" "res=$res leaked=[$leaked_wd]"
+fi
+
+# ---- P1/P2 (bot finding): a sourcing caller running with `set -e` must survive every normal fallback path in
+# this file, not just the ones with their own explicit `return`/`if` guard already visible at a glance. Two
+# cases, both sourcing h-stats.sh from INSIDE a `set -e` bash -c and printing a marker line AFTER the sourcing
+# returns - if `set -e` ever killed the shell mid-sourcing (any of the bare, unguarded statements the audit
+# found: `remaining_us`'s own trailing `(( ))`, `result=$(cat "$OUTFILE")` when OUTFILE never existed, several
+# more), the marker would never print and the whole $res capture would be empty/truncated instead of showing
+# the expected khs value.
+#
+# Case 1: a delayed handshake long enough that the DEADLINE passes before the child ever gets to write
+# anything - OUTFILE never created at all, exactly the scenario the bot's own P1 finding named explicitly.
+# BLOX_HSTATS_TEST_HANDSHAKE_DELAY (5s) comfortably exceeds BUDGET_US+KILL_GRACE (2.4+0.3=2.7s), so the
+# parent's own poll loop gives up and escalates TERM/KILL on the child while it is still sleeping in that
+# delay - it never reaches `. "$1"; run()`, so $OUTFILE is never written. Must survive AND report khs=0.
+# The outer `timeout` here is a safety net ONLY, not part of what this case measures (h-stats.sh's own
+# 2.7 s internal budget is) - widened from 10s to 20s after an intermittent false FAIL on a heavily loaded
+# docker host running the full suite back-to-back (reproduced ~1/3 runs there; never in isolation or
+# natively) where the outer margin, not the fix itself, was too tight.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(BLOX_HSTATS_TEST_HANDSHAKE_DELAY=5 timeout 20 bash -c '
+	set -e
+	. "$BLOX_DIR/h-stats.sh"
+	echo "SURVIVED khs=[$khs]"
+' 2>"$T/errexit_delayed_stderr.log")
+if [[ $res == "SURVIVED khs=[0]" ]]; then
+	ok "set -e caller survives a delayed-handshake poll (OUTFILE never created): honest khs=0, no abort"
+else
+	bad "set -e caller survives a delayed-handshake poll (OUTFILE never created): honest khs=0, no abort" \
+		"res=[$res] stderr=$(cat "$T/errexit_delayed_stderr.log" 2>/dev/null)"
+fi
+# Case 2: the SAME `set -e` caller, but a normal healthy poll - must ALSO survive (every bare statement the
+# audit fixed is exercised on this path too: remaining_us(), write_result_fast()/write_result(), the Phase A
+# composition, the stall==1 check taking its FALSE branch, cores non-empty taking its FALSE branch, cat
+# "$OUTFILE" actually succeeding this time) and report the real positive rate, not just "didn't crash".
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# Same outer-margin widening as case 1 above, for consistency - this one normally completes in well under a
+# second, but costs nothing to give the same safety net.
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(timeout 20 bash -c '
+	set -e
+	. "$BLOX_DIR/h-stats.sh"
+	echo "SURVIVED khs=[$khs]"
+' 2>"$T/errexit_healthy_stderr.log")
+if [[ $res == "SURVIVED khs=[11900.00]" ]]; then
+	ok "set -e caller survives a normal healthy poll: real positive khs, no abort"
+else
+	bad "set -e caller survives a normal healthy poll: real positive khs, no abort" \
+		"res=[$res] stderr=$(cat "$T/errexit_healthy_stderr.log" 2>/dev/null)"
 fi
 
 # ---- P1: the MANDATORY `summary` call used to be capped at a flat 600 ms, same as the OPTIONAL `cores` call -
