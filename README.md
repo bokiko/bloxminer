@@ -13,7 +13,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Version-2.1.0-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.1.1-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/Based_on-ccminer-00599C?style=flat-square" alt="ccminer">
   <img src="https://img.shields.io/badge/Algorithm-VerusHash_v2.2-blue?style=flat-square" alt="VerusHash">
   <img src="https://img.shields.io/badge/Platform-Linux_x86--64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
@@ -75,7 +75,7 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
    - Miner name: `bloxminer`
    - Installation URL:
      ```
-     https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz
+     https://github.com/bokiko/bloxminer/releases/download/2.1.1/bloxminer-2.1.1.tar.gz
      ```
    - Hash algorithm: `verushash`
    - Wallet and worker template: `%WAL%.%WORKER_NAME%`
@@ -90,7 +90,7 @@ BloxMiner mines **VerusHash v2.2 only** — the proof-of-work of [Verus (VRSC)](
 |-------|-------|-------|
 | Miner | `custom` | Required |
 | Miner name | `bloxminer` | Must match exactly |
-| Installation URL | `https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz` | HiveOS installs it once and reuses it |
+| Installation URL | `https://github.com/bokiko/bloxminer/releases/download/2.1.1/bloxminer-2.1.1.tar.gz` | HiveOS installs it once and reuses it |
 | Hash algorithm | `verushash` | |
 | Wallet template | `%WAL%.%WORKER_NAME%` | Your wallet.worker |
 | Pool URL | `stratum+tcp://host:port` | Your pool (`host:port` also works) |
@@ -102,7 +102,7 @@ A pool that needs a **numeric** password: leave Pass empty and put `"pass": "123
 ### HiveOS Terminal Install
 
 ```bash
-/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer/releases/download/2.1.0/bloxminer-2.1.0.tar.gz
+/hive/miners/custom/custom-get https://github.com/bokiko/bloxminer/releases/download/2.1.1/bloxminer-2.1.1.tar.gz
 ```
 
 Then set the flight sheet as above. On a fresh HiveOS image, HiveOS installs its custom-miner support automatically
@@ -110,7 +110,7 @@ the first time a flight sheet uses a Custom miner.
 
 ### Updating
 
-Change the version in the Installation URL (e.g. `2.0.0` → `2.1.0`) and apply the flight sheet.
+Change the version in the Installation URL (e.g. `2.1.0` → `2.1.1`) and apply the flight sheet.
 HiveOS downloads the new package and restarts the miner. Your flight sheet fields stay the same.
 
 ---
@@ -159,6 +159,8 @@ table every 60 s, so the HiveOS web **Miner log** stays readable:
  C12 3.11M   63C  C13 3.11M   63C  C14 3.13M   63C  C15 3.11M   63C
 ```
 (Ryzen 9 5950X on HiveOS, from the log file.)
+The miner screen and log show the engine's own version: 2.1.1 ships the unchanged 2.1.0 engine, so they read
+2.1.0, while HiveOS stats (`ver`) report the package version 2.1.1.
 
 For a **live stats header** in the HiveOS miner screen add `"dashboard": true` to Extra config. HiveOS's web
 *Miner log* is a tail of the raw screen recording, so with the header on it fills with screen redraws; the clean
@@ -253,8 +255,12 @@ What HiveOS receives every agent tick (read from the miner's local API by `h-sta
 | `hs` | One value per physical core (kH/s), or per thread, or one total |
 | `temp` | Per row: CCD / core temperature, else package temperature |
 | `ar` | Accepted, rejected |
-| `uptime`, `ver`, `algo` | Miner uptime (s), `2.1.0`, `verushash` |
+| `uptime`, `ver`, `algo` | Miner uptime (s), `2.1.1`, `verushash` |
 | `cpu_power` | CPU package power in W (omitted when unavailable, never sent as 0). The HiveOS web (0.6-231, Sept 2026) does not show it in the CONSUMPTION tile; it is in the miner screen, log, API and `--sensors` |
+
+`ver` always reflects the **package** release (`h-manifest.conf`), not necessarily the engine binary: a scripts-only
+hotfix (like 2.1.1) ships an unchanged, already-gated binary, so the raw API's own `VER` field (see below) can
+legitimately lag the package version by a release or two.
 
 The total is the sum of **fresh** rows: a thread counts only while it keeps finishing work. When every thread is
 overdue (for example the pool connection is lost) the miner reports **0**, never its last rate — about 10 minutes
@@ -368,8 +374,13 @@ On Ubuntu 22.04 x86-64:
 
 ```bash
 build/build.sh                      # clang 14, -march=x86-64-v3 -mtune=znver3 -O3 → out/bloxminer-O3 (+ .provenance)
-build/package.sh out/bloxminer-O3   # → bloxminer-2.1.0.tar.gz + SHA256SUMS
+BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1 \
+build/package.sh out/bloxminer-O3   # → bloxminer-2.1.1.tar.gz + SHA256SUMS
 ```
+
+2.1.1 changes only the HiveOS scripts: the engine binary is the 2.1.0 build, so it reports version 2.1.0 while the
+package is 2.1.1. `package.sh` refuses that mismatch unless `BLOX_PACKAGE_ALLOW_VERSION_MISMATCH=1` is set, and then
+records it in `SOURCE.md`.
 
 Source: [monkins1010/ccminer](https://github.com/monkins1010/ccminer) `Verus2.2` @ `e28e183` + [`build/bloxminer.patch`](build/bloxminer.patch).
 The patch adds the BloxMiner screen, log file, sensors and power, the `cores` API, stall detection and fixes for

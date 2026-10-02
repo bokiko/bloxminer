@@ -19,6 +19,8 @@ jobs:
         run: shellcheck -s bash bloxminer/h-config.sh bloxminer/h-run.sh bloxminer/h-stats.sh build/*.sh tools/*.sh tests/*/*.sh
       - name: HiveOS script tests
         run: tests/hive/test_hive_scripts.sh
+      - name: HiveOS under-load tests (fork-free timing, no false zeros)
+        run: tests/hive/test_under_load.sh
       - name: hashing-identity tool controls
         run: tests/tools/test_hashing_identity.sh
 
@@ -28,6 +30,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: release build (same script as the published binary)
         run: build/build.sh -O3 out
+      - name: package.sh version-mismatch opt-in gate
+        run: tests/build/test_package.sh
       - name: patched source for unit tests and a sanitizer build
         run: tests/engine/prepare_source.sh src
       - name: sensor unit tests (fake sysfs)
