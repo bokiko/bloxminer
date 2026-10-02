@@ -677,17 +677,22 @@ jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/rep
 : > "$T/api.out"
 python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+# Asserts the INNER bash -c's own exit code (0), not just the printed khs value - a caller that "survived"
+# (printed something) but was itself non-zero for some OTHER reason would still be a real problem for a real
+# `set -e` Hive agent, which treats ANY non-zero exit from a sourced command the same way regardless of
+# whether that command's own stdout happened to look fine first.
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(BLOX_HSTATS_TEST_HANDSHAKE_DELAY=5 timeout 20 bash -c '
 	set -e
 	. "$BLOX_DIR/h-stats.sh"
 	echo "SURVIVED khs=[$khs]"
 ' 2>"$T/errexit_delayed_stderr.log")
-if [[ $res == "SURVIVED khs=[0]" ]]; then
-	ok "set -e caller survives a delayed-handshake poll (OUTFILE never created): honest khs=0, no abort"
+rc=$?
+if [[ $rc == 0 ]] && [[ $res == "SURVIVED khs=[0]" ]]; then
+	ok "set -e caller survives a delayed-handshake poll (OUTFILE never created): exit 0, honest khs=0"
 else
-	bad "set -e caller survives a delayed-handshake poll (OUTFILE never created): honest khs=0, no abort" \
-		"res=[$res] stderr=$(cat "$T/errexit_delayed_stderr.log" 2>/dev/null)"
+	bad "set -e caller survives a delayed-handshake poll (OUTFILE never created): exit 0, honest khs=0" \
+		"rc=$rc res=[$res] stderr=$(cat "$T/errexit_delayed_stderr.log" 2>/dev/null)"
 fi
 # Case 2: the SAME `set -e` caller, but a normal healthy poll - must ALSO survive (every bare statement the
 # audit fixed is exercised on this path too: remaining_us(), write_result_fast()/write_result(), the Phase A
@@ -701,17 +706,19 @@ python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_
 for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
 # Same outer-margin widening as case 1 above, for consistency - this one normally completes in well under a
 # second, but costs nothing to give the same safety net.
+# Same explicit exit-code assertion as case 1 above.
 # shellcheck disable=SC2016   # expanded by the inner bash, not here
 res=$(timeout 20 bash -c '
 	set -e
 	. "$BLOX_DIR/h-stats.sh"
 	echo "SURVIVED khs=[$khs]"
 ' 2>"$T/errexit_healthy_stderr.log")
-if [[ $res == "SURVIVED khs=[11900.00]" ]]; then
-	ok "set -e caller survives a normal healthy poll: real positive khs, no abort"
+rc=$?
+if [[ $rc == 0 ]] && [[ $res == "SURVIVED khs=[11900.00]" ]]; then
+	ok "set -e caller survives a normal healthy poll: exit 0, real positive khs"
 else
-	bad "set -e caller survives a normal healthy poll: real positive khs, no abort" \
-		"res=[$res] stderr=$(cat "$T/errexit_healthy_stderr.log" 2>/dev/null)"
+	bad "set -e caller survives a normal healthy poll: exit 0, real positive khs" \
+		"rc=$rc res=[$res] stderr=$(cat "$T/errexit_healthy_stderr.log" 2>/dev/null)"
 fi
 
 # ---- P1: the MANDATORY `summary` call used to be capped at a flat 600 ms, same as the OPTIONAL `cores` call -
