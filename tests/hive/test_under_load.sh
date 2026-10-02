@@ -35,6 +35,8 @@ API_PID=""   # backstop only - already killed inline right after each case finis
 cleanup() {
 	for p in "${BUSY_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
 	[[ -n $API_PID ]] && kill -9 "$API_PID" 2>/dev/null
+	[[ -n ${API_WF_PID:-} ]] && kill -9 "$API_WF_PID" 2>/dev/null
+	[[ -n ${API_WD_PID:-} ]] && kill -9 "$API_WD_PID" 2>/dev/null
 	rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
@@ -257,8 +259,87 @@ fi
 
 kill "${API_PID:-}" 2>/dev/null; wait "${API_PID:-}" 2>/dev/null
 
+# ================================================================== WAITFIFO regression: the parent's own
+# bounded wait (wait_secs(), via `read -t 0.05 -u $waitfd`) must never hang even when the collector child
+# exits WHILE that read is in progress. Ported proactively from bloxminer-x (commits a73c80a/751cac1): a real
+# GitHub CI run there (2-vCPU) captured a poll where the read was entered ~50ms before the collector child's
+# own exit - almost exactly when the read's own timeout and the exit were due to land together - and never
+# returned at all; the external `timeout 5` had to kill the whole run at 5.14s. Many FAST, healthy polls
+# back-to-back (no artificial delay, no saturation) each complete in well under a second but still pass
+# through a handful of the poll loop's own 50ms wait_secs() ticks - across enough iterations, naturally-
+# varying poll-to-poll jitter lands the child's own exit at many different phase offsets relative to those
+# ticks, including right on top of one, without needing to hand-engineer the exact timing.
+PORT=$((20000 + RANDOM % 20000)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies_wf.json"
+: > "$T/api_wf.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies_wf.json" > "$T/api_wf.out" 2>&1 & API_WF_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api_wf.out" && break; sleep 0.1; done
+grep -q ready "$T/api_wf.out" || bad "WAITFIFO regression: fake API startup" "$(cat "$T/api_wf.out" 2>/dev/null)"
+WF_DIR="$T/case-waitfifo"; mkdir -p "$WF_DIR"
+cp "$PKGSRC"/h-config.sh "$PKGSRC"/h-stats.sh "$WF_DIR"/
+cp "$BLOX_DIR/h-manifest.conf" "$WF_DIR/h-manifest.conf"
+export BLOX_DIR="$WF_DIR"
+N_POLLS_WF=100; HARD_CAP_WF=4.0
+n_bad_wf=0; max_wf=0
+for i in $(seq 1 "$N_POLLS_WF"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_bad_wf=$((n_bad_wf+1)); echo "  poll $i: ZERO khs ($res)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP_WF" 'BEGIN{exit !(e > c)}' && { n_bad_wf=$((n_bad_wf+1)); echo "  poll $i: HARD CAP EXCEEDED (${elapsed}s > ${HARD_CAP_WF}s)"; }
+	awk -v e="$elapsed" -v m="$max_wf" 'BEGIN{exit !(e > m)}' && max_wf=$elapsed
+done
+if (( n_bad_wf == 0 )); then
+	ok "WAITFIFO regression: $N_POLLS_WF fast back-to-back polls, child exit races the poll loop's own wait - no hang, max ${max_wf}s"
+else
+	bad "WAITFIFO regression: $N_POLLS_WF fast back-to-back polls, child exit races the poll loop's own wait - no hang" \
+		"n_bad=$n_bad_wf/$N_POLLS_WF max=${max_wf}s"
+fi
+kill "$API_WF_PID" 2>/dev/null; wait "$API_WF_PID" 2>/dev/null
+
+# ================================================================== WATCHDOG overhead on the NORMAL (healthy,
+# instant-reply, no escalation) path - the WATCHDOG adds one extra fork (itself) plus two further, sequential
+# forks of its own (`sleep`, never both alive at once) to EVERY poll, win or lose, not just the escalated ones
+# the SIGTERM-ignoring-child tests already cover - this is the overhead's cost on the common case, where it
+# should never be visible in the result. Reuses the SAME fixture as the WAITFIFO regression case above
+# (healthy, instant, no delay/escalation anywhere in this path); 20 polls, each its own fresh `bash -c`
+# process, average AND max reported explicitly so a before/after comparison against a pre-WATCHDOG checkout
+# is just a diff of two log lines, not a re-run with different instrumentation.
+PORT=$((20000 + RANDOM % 20000)); export BLOX_API_PORT=$PORT
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies_wd.json"
+: > "$T/api_wd.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies_wd.json" > "$T/api_wd.out" 2>&1 & API_WD_PID=$!
+for _ in $(seq 50); do grep -q ready "$T/api_wd.out" && break; sleep 0.1; done
+grep -q ready "$T/api_wd.out" || bad "WATCHDOG overhead: fake API startup" "$(cat "$T/api_wd.out" 2>/dev/null)"
+N_POLLS_WD=20; HARD_CAP_WD=3.0
+n_bad_wd=0; max_wd=0; sum_wd=0
+for i in $(seq 1 "$N_POLLS_WD"); do
+	t0=$(date +%s.%N)
+	# shellcheck disable=SC2016   # $BLOX_DIR/$khs expand in the inner bash -c, not here
+	res=$(timeout 5 bash -c '. "$BLOX_DIR/h-stats.sh"; echo "khs=[$khs]"' 2>&1)
+	t1=$(date +%s.%N)
+	elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
+	pkhs=$(sed -n 's/^khs=\[\(.*\)\]$/\1/p' <<< "$res")
+	awk -v k="${pkhs:-0}" 'BEGIN{exit !(k>0)}' || { n_bad_wd=$((n_bad_wd+1)); echo "  poll $i: ZERO khs ($res)"; }
+	awk -v e="$elapsed" -v c="$HARD_CAP_WD" 'BEGIN{exit !(e > c)}' && { n_bad_wd=$((n_bad_wd+1)); echo "  poll $i: OVER BUDGET (${elapsed}s)"; }
+	awk -v e="$elapsed" -v m="$max_wd" 'BEGIN{exit !(e > m)}' && max_wd=$elapsed
+	sum_wd=$(awk -v s="$sum_wd" -v e="$elapsed" 'BEGIN{printf "%.3f", s + e}')
+done
+avg_wd=$(awk -v s="$sum_wd" -v n="$N_POLLS_WD" 'BEGIN{printf "%.3f", s / n}')
+if (( n_bad_wd == 0 )); then
+	ok "WATCHDOG overhead, normal path: $N_POLLS_WD polls, avg ${avg_wd}s, max ${max_wd}s, all khs>0 and < ${HARD_CAP_WD}s"
+else
+	bad "WATCHDOG overhead, normal path: $N_POLLS_WD polls, all khs>0 and < ${HARD_CAP_WD}s" "n_bad=$n_bad_wd/$N_POLLS_WD avg=${avg_wd}s max=${max_wd}s"
+fi
+kill "$API_WD_PID" 2>/dev/null; wait "$API_WD_PID" 2>/dev/null
+
 leaked=()
 [[ -n $API_PID ]] && kill -0 "$API_PID" 2>/dev/null && leaked+=("$API_PID")
+[[ -n ${API_WF_PID:-} ]] && kill -0 "$API_WF_PID" 2>/dev/null && leaked+=("$API_WF_PID")
+[[ -n ${API_WD_PID:-} ]] && kill -0 "$API_WD_PID" 2>/dev/null && leaked+=("$API_WD_PID")
 if [[ ${#leaked[@]} -eq 0 ]]; then
 	ok "no leaked fake-API child processes at suite end"
 else

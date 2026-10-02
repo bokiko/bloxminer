@@ -161,15 +161,31 @@ us_to_secstr() {   # $1 = microseconds -> $REPLY = "S.ffffff", for the `timeout`
 	REPLY="$(( us / 1000000 )).$f"
 }
 # wait_secs <fd> <seconds, may be fractional e.g. "0.05"> - the poll loop below already compares its deadline
-# fork-free (remaining_us/have_budget_us, above), but its own pacing still forked an external `sleep` every
-# iteration. `read -t` against a private fd the caller opens ONCE (`{ exec {fd}<> <(:); } 2>/dev/null`) always
-# times out after almost exactly <seconds>, a plain builtin, no external process per call. <fd> < 0 (the
-# one-time fd open itself failed - not expected in practice) falls back to the external `sleep`, the prior
-# behaviour.
+# fork-free (remaining_us/have_budget_us, above), but its own pacing used to fork an external `sleep` every
+# iteration. `read -t` against $fd (see WAITFIFO's own header, further down, for what that fd actually is and
+# why) returns after almost exactly <seconds> in the normal case: a plain builtin, no external process per
+# call. <fd> < 0 (WAITFIFO setup itself failed - not expected in practice) falls back to the external `sleep`,
+# the prior behaviour.
+# -N 1, not a bare `read` (found while adding WAITFIFO's own byte-writers, below): a bare `read ... _` waits
+# for a NEWLINE (or EOF) before ever returning, regardless of how much data already arrived - a single
+# `printf x` byte with no trailing newline would sit in the pipe buffer forever, never itself waking this read
+# (ONLY `-t` firing, or an eventual EOF, would). `-N 1` reads EXACTLY one character the moment it is
+# available, delimiter or not (and still returns on EOF before that, same as a bare read) - this is what makes
+# WAITFIFO's own byte-writers (the collector child's own EXIT trap, the WATCHDOG, both below) ACTUALLY wake
+# this on arrival, not just happen to coincide with -t's own next tick.
+# BLOX_HSTATS_TEST_NO_TIMEOUT (tests only): drops -t entirely, so this read can ONLY ever return via a byte
+# actually arriving on $fd - simulates a PERMANENTLY lost -t timeout (the exact failure mode WAITFIFO's two
+# independent byte-writers, the child's own EXIT trap and the per-poll watchdog, exist to survive) without
+# needing to reproduce whatever causes a real timeout loss. Proves the wait is bounded by something other than
+# -t itself ever working, not just that -t usually does.
 wait_secs() {
 	local fd=$1 secs=$2
 	if (( fd >= 0 )); then
-		read -r -t "$secs" -u "$fd" _ 2>/dev/null
+		if [[ -n ${BLOX_HSTATS_TEST_NO_TIMEOUT:-} ]]; then
+			read -r -N 1 -u "$fd" _ 2>/dev/null
+		else
+			read -r -t "$secs" -N 1 -u "$fd" _ 2>/dev/null
+		fi
 	else
 		sleep "$secs" 2>/dev/null
 	fi
@@ -595,9 +611,58 @@ HANDSHAKE="$WORKDIR/hs"
 read -r _ _ _ _ PARENT_PGID _ < /proc/self/stat 2>/dev/null
 export OUTFILE
 
+# WAITFIFO: makes the parent's own bounded wait (wait_secs(), above) unconditionally bounded, independent of
+# whether bash's own `read -t` timeout mechanism is ever unreliable. Ported here proactively from the
+# combined-package Verus+RandomX "3.0.0" line (bloxminer-x commits a73c80a/751cac1) after a real GitHub CI run
+# there (2-vCPU) captured a poll where `read -r -t 0.05 -u <fd> _` was entered ~50ms before the collector
+# child's own exit (almost exactly when both the read's OWN timeout and the exit were due to land together)
+# and never returned at all - the external `timeout 5` had to kill the whole process group at 5.14s. This
+# package's own h-stats.sh shares the IDENTICAL `<(:)`-backed wait_secs() primitive this replaces, so the same
+# risk applies here even though it has not been directly observed in THIS package's own CI. Extensive isolated
+# reproduction attempts on ai02 (two independent review rounds, 25,400+ iterations total across plain-SIGCHLD
+# timing sweeps, a deterministic SIGSTOP/SIGCONT-forced alarm-before-block race at offsets up to the alarm's
+# own boundary, and a tight-loop variant under CPU saturation; a bash-5.1 strace confirmed fractional
+# `read -t` is textbook setitimer+SIGALRM/EINTR and looks correct in isolation) could not reproduce the
+# underlying behavior on this hardware - consistent with bloxminer-x's own non-reproduction there. Rather than
+# keep chasing a mechanism that will not reproduce here, this makes the wait itself unconditionally bounded
+# regardless of the exact root cause, validated on bloxminer-x by repeated GitHub CI runs (clean after the
+# fix, intermittently failing before):
+# `-t 0.05` stays the NORMAL way wait_secs()'s read unblocks (pure pacing, nothing expected to arrive) - but
+# $waitfd now ALSO has TWO independent writers, so a read that for any reason never saw its own -t fire can
+# still never block past the next BYTE instead of forever:
+#   1. the collector CHILD writes one byte on its own exit (a `trap ... EXIT` inside its script, set up right
+#      where it is launched below - covers normal completion and any trappable signal; SIGKILL cannot be
+#      trapped, which is exactly what the next point exists for);
+#   2. a dedicated per-poll WATCHDOG (its own setsid'd process - one extra fork, accepted here as the cost of
+#      a correctness fix for a real hang, not an optimization) sleeps until this poll's own absolute
+#      DEADLINE_US and writes a byte, then sleeps KILL_GRACE further and writes a second one - covering the
+#      escalation stage's own wait_secs() call too, so EITHER wait, in EITHER code path, is bounded by an
+#      explicit byte no matter what happened to its own -t.
+# Both writers get this SAME fd via plain fork() - created and opened READ-WRITE *before* either the child or
+# the watchdog is launched (opening it only after backgrounding would be too late for either to inherit
+# something that does not exist yet). The parent keeps its OWN read-write reference for its own lifetime too -
+# no close/reopen dance is needed (unlike an EOF-based design would require): this one never depends on EOF,
+# only on a byte arriving, so the parent also holding a harmless, never-used write capability of its own does
+# not matter. Every process the child itself later forks (nc, jq, ...) also inherits a copy by the same
+# fork() semantics; left alone rather than closed everywhere those run, since none of them ever write to it
+# either - a stray inherited copy is inert here, not a hazard, precisely because this design was not built to
+# depend on who still holds the fd open, only on who actually writes to it.
+WAITFIFO="$WORKDIR/waitfifo"
+waitfd=-1
+mkfifo "$WAITFIFO" 2>/dev/null && { exec {waitfd}<>"$WAITFIFO"; } 2>/dev/null || waitfd=-1
+# mkfifo is this file's only remaining non-bash-builtin fork before the child launches, and the watchdog below
+# is one more full process - both accepted here because this is a correctness fix for a (so far elsewhere-
+# observed) real hang, not an optimization; wait_secs() already degrades safely to a forking `sleep` whenever
+# its own fd argument is < 0 (mkfifo unsupported/failed), the same fallback this file always had for the old
+# <(:) mechanism this replaces.
+
 if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
-	# shellcheck disable=SC2016   # $1/$2 and the field vars below are the child bash's own, not this shell's
-	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" setsid bash -c '
+	# shellcheck disable=SC2016   # $1/$2 and the field vars below are the child bash's own, not this shell's;
+	# $WAITFD is this same shell's $waitfd, deliberately passed as an exported env var (not interpolated into
+	# the single-quoted script) so the child's own trap command is built from a plain, already-resolved fd
+	# number at trap-registration time, inside the child, not guessed at from out here.
+	BUDGET_US="$BUDGET_US" DEADLINE_US="$DEADLINE_US" WAITFD="$waitfd" setsid bash -c '
+		(( WAITFD >= 0 )) && trap "printf x >&$WAITFD 2>/dev/null" EXIT
 		[[ -n ${BLOX_HSTATS_TEST_HANDSHAKE_DELAY:-} ]] && sleep "$BLOX_HSTATS_TEST_HANDSHAKE_DELAY"   # tests only
 		# Fork-free pgid read (/proc/self/stat - see the parent own copy of this exact technique, just above,
 		# for the full rationale) directly into a bash builtin printf, no $(...) subshell or ps/tr fork pair.
@@ -608,6 +673,55 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	' _ "$LIB" "$HANDSHAKE" > /dev/null 2>>"${BLOX_HSTATS_DEBUG_LOG:-/dev/null}" &
 	# stderr from everything inside run() goes to $BLOX_HSTATS_DEBUG_LOG when debugging, /dev/null otherwise.
 	CPID=$!
+	# disown: same "Killed" diagnostic risk as WATCHDOG_PID's own disown below, found while adding it - $CPID
+	# is also always eventually signal-terminated whenever escalate() ever reaches TERM/KILL (see the poll
+	# loop below), and the SIGTERM-ignoring-child test already forces that path. Nothing about
+	# validated_pgid()/still_running()/escalate() below depends on $CPID staying in bash's OWN job table
+	# (every one of them signals it directly by PID/PGID via the kernel, bypassing job-control syntax
+	# entirely) - disowning it closes the same latent "an async notice lands inside captured output" risk
+	# class before a future timing window makes it land somewhere that corrupts a real result.
+	disown "$CPID" 2>/dev/null
+	# PARENT_PGID was already read above, before this child was ever launched - fork-free in this file (see
+	# that read's own comment), so unlike bloxminer-x's `ps`-based equivalent there is no cost to overlap by
+	# reordering it after the fork; the value is identical either way since backgrounding a child never
+	# changes this process's own pgid.
+	# WATCHDOG: the second of WAITFIFO's two independent byte-writers (see its own header above) - its own
+	# setsid'd process (own pgid, deliberately never confused with the collector's own group:
+	# still_running()/escalate() below only ever target a pgid validated_pgid() read back from the
+	# collector's OWN handshake, never this one), so it can be killed on its own at the end of the poll
+	# without touching collector escalation at all. Sleeps until this poll's own absolute DEADLINE_US
+	# (computed fork-free, same EPOCHREALTIME-slicing technique as the top of this file), writes one byte,
+	# then sleeps KILL_GRACE further and writes a second - covering the main poll loop's own wait_secs(0.05)
+	# calls AND the escalation stage's wait_secs($KILL_GRACE) call with the SAME two writes, since both read
+	# the SAME fd. `sleep` here is an external fork (twice, sequentially) - deliberately not reusing this
+	# file's own forkless wait_secs()/read-based sleep trick, which would make the WATCHDOG itself depend on
+	# the exact mechanism it exists to be a backstop for.
+	WATCHDOG_PID=""
+	if (( waitfd >= 0 )); then
+		# shellcheck disable=SC2016   # $DEADLINE_US/$KILL_GRACE/$WAITFD are this same single-quoted script's
+		# OWN environment variables (exported into it right below) - never meant to expand out here.
+		DEADLINE_US="$DEADLINE_US" KILL_GRACE="$KILL_GRACE" WAITFD="$waitfd" setsid bash -c '
+			__t=${EPOCHREALTIME:-}; [[ -n $__t ]] || __t=$(date +%s.%N)
+			__frac="${__t#*.}000000"
+			now_us="${__t%%.*}${__frac:0:6}"
+			remain_us=$(( DEADLINE_US - now_us )); (( remain_us < 0 )) && remain_us=0
+			printf -v remain_f "%d.%06d" $(( remain_us / 1000000 )) $(( remain_us % 1000000 ))
+			sleep "$remain_f" 2>/dev/null
+			printf x >&"$WAITFD" 2>/dev/null
+			sleep "$KILL_GRACE" 2>/dev/null
+			printf x >&"$WAITFD" 2>/dev/null
+		' > /dev/null 2>&1 &
+		WATCHDOG_PID=$!
+		# disown, not just backgrounded: this process is UNCONDITIONALLY SIGKILLed at the end of EVERY single
+		# poll below, whether or not it ever fired either of its own two bytes - a plain backgrounded job
+		# that dies by a signal (as opposed to exiting 0) gets an asynchronous "Killed" diagnostic from bash
+		# itself the next time it does job-table housekeeping, which can land on THIS shell's own stdout/
+		# stderr well before this function ever returns. `disown` removes it from the job table, so no such
+		# diagnostic is ever printed, while `kill -9 -- "-$pid"` against its pgid still works identically
+		# afterward - disown only affects bash's OWN notification bookkeeping, never the kernel-level
+		# process/group the PID still refers to.
+		disown "$WATCHDOG_PID" 2>/dev/null
+	fi
 
 	validated_pgid() {   # sets $REPLY to the verified pgid, or empty - no fork (was `echo`/`$(...)` + `cat`)
 		REPLY=""
@@ -640,16 +754,8 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 	# calls validated_pgid, which reads $HANDSHAKE) is itself not free, and checking it first would let that
 	# cost silently eat into the budget on every single iteration instead of the loop simply exiting once the
 	# deadline alone says to stop.
-	# One process-substitution fork here (never per iteration) for wait_secs's own private fd - see its header.
-	# "exec {fd}... 2>/dev/null" with NO command after it is a bare redirection, not a command invocation - bash
-	# applies it to the CURRENT SHELL PERMANENTLY (exactly like a plain `exec 2>/dev/null` would), not just to
-	# this one statement; this is top-level script code, so there is not even a function scope to (wrongly) hope
-	# would limit it. That would silently redirect this whole process's stderr to /dev/null for the rest of its
-	# life the instant this ran once - and Hive sources h-stats.sh repeatedly in one long-lived shell, so every
-	# later poll's own stderr would be gone too. The `{ ...; } 2>/dev/null` group form keeps the SAME {fd}
-	# allocation (still visible after the group, since `{ }` is not a subshell) while scoping the redirect to
-	# only the command inside it.
-	waitfd=-1; { exec {waitfd}<> <(:); } 2>/dev/null || waitfd=-1
+	# $waitfd and the WATCHDOG were already created/launched above, before the child - see WAITFIFO's own
+	# header for why both must exist before the child is ever backgrounded - nothing left to set up here.
 	while :; do
 		remaining_us; have_budget_us "$REPLY" || break
 		still_running || break
@@ -660,6 +766,13 @@ if [[ -n $OUTFILE && -n $HANDSHAKE ]]; then
 		wait_secs "$waitfd" "$KILL_GRACE"
 		still_running && escalate KILL
 	fi
+	# The WATCHDOG's own job is done the instant this poll is - killed by its own pgid (it is setsid'd, so
+	# its pid IS its pgid), unconditionally, whether it already fired both its bytes or is still sleeping
+	# toward either one. Sourced repeatedly in the same long-lived Hive agent shell: a watchdog left running
+	# into the NEXT poll would eventually write a stray byte into that poll's own (freshly re-created)
+	# $waitfd - it cannot, since each poll gets its own $WORKDIR/$WAITFIFO, but it would still be a needless
+	# lingering process.
+	[[ -n $WATCHDOG_PID ]] && kill -9 -- "-$WATCHDOG_PID" 2>/dev/null
 	(( waitfd >= 0 )) && { exec {waitfd}<&-; } 2>/dev/null
 	# CI finding (ported from bloxminer-x commit 9a3778a, same bug, same fix - that package's own GitHub CI hit
 	# it: "poll 11: ZERO khs ()" at 5.01 s, hard cap 4.0 s, an EMPTY result because the test's own external

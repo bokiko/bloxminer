@@ -511,10 +511,17 @@ else
 		"elapsed=${elapsed}s children=$children_got children_na=$na_got res=$res"
 fi
 # No explicit reap after SIGKILL (see h-stats.sh's own comment at that exact point) means AT MOST one stale
-# zombie can be left behind per poll that goes through this escalation path - bash's own job control reaps it
-# opportunistically on the NEXT poll's own backgrounding, at the latest. Runs 3 MORE polls through the exact
-# same forced-escalation path in the SAME shell and checks that count never grows past 1 - proves zombies do
-# not accumulate unbounded across repeated pollings, only ever a single pending one at a time.
+# zombie can be left behind PER backgrounded-child type, per poll that goes through this escalation path -
+# bash's own job control reaps it opportunistically on the NEXT poll's own backgrounding, at the latest.
+# WAITFIFO/WATCHDOG update: this shell now backgrounds TWO children per poll (the collector, $CPID, and the
+# WATCHDOG, $WATCHDOG_PID) instead of one, and neither is explicitly `wait`-ed on (the collector by
+# established design above; the WATCHDOG because it is killed by its own pgid at poll end and the SAME
+# "a zombie here is reclaimed by the next poll's own job-control operations at the latest" reasoning applies
+# to it too - it is just as disposable). The bound below is widened from <= 1 to <= 2 accordingly: at most one
+# lingering zombie PER backgrounded-child type can survive to the next poll under the same opportunistic-
+# reaping argument, never unbounded growth either way. Runs 3 MORE polls through the exact same
+# forced-escalation path in the SAME shell and checks that count never grows past 2 - proves zombies do not
+# accumulate unbounded across repeated pollings, only ever a bounded, small number pending at a time.
 kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
 PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
 jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
@@ -542,12 +549,65 @@ res=$(PATH="$STUBBIN:$PATH" timeout 20 bash -c '
 ' 2>"$T/sigterm_ignore_stderr2.log")
 na_got=${res%% *}; max_got=${res#* }
 if [[ $na_got == 1 ]]; then
-	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (SKIPPED: /proc/\$\$/task/\$\$/children unavailable)"
-elif [[ $max_got =~ ^[0-9]+$ ]] && (( max_got <= 1 )); then
-	ok "repeated escalation-path polls: at most one transient zombie between polls, never accumulating (max=$max_got)"
+	ok "repeated escalation-path polls: <= 2 unreaped children (collector + watchdog) between polls, never accumulating (SKIPPED: /proc/\$\$/task/\$\$/children unavailable)"
+elif [[ $max_got =~ ^[0-9]+$ ]] && (( max_got <= 2 )); then
+	ok "repeated escalation-path polls: <= 2 unreaped children (collector + watchdog) between polls, never accumulating (max=$max_got)"
 else
-	bad "repeated escalation-path polls: at most one transient zombie between polls, never accumulating" "res=$res"
+	bad "repeated escalation-path polls: <= 2 unreaped children (collector + watchdog) between polls, never accumulating" "res=$res"
 fi
+
+# ---- WATCHDOG boundedness proof: WAITFIFO's EOF-era design (and this file's own earlier `<(:)`-only design)
+# relied ENTIRELY on `read -t` to ever unblock whenever the collector itself is still alive (blocked on the
+# SAME SIGTERM-ignoring `nc cores` stub used above, so its own EXIT trap never fires either) - the real,
+# rare CI finding this whole port exists for (see h-stats.sh's own WAITFIFO header) was `-t` itself losing its
+# timeout for one single read. BLOX_HSTATS_TEST_NO_TIMEOUT=1 (test-only: h-stats.sh's own wait_secs()) drops
+# -t from this read ENTIRELY, so the ONLY thing that can ever wake the main poll loop's wait_secs(0.05) calls
+# and the escalation stage's wait_secs($KILL_GRACE) call is a byte actually arriving on $waitfd - simulating
+# the WORST version of a lost timeout (not just losing ONE, but having NONE at all, for the whole poll)
+# without needing to reproduce whatever rare bash/kernel condition causes a real loss. Combined with the
+# SIGTERM-ignoring `nc cores` stub (so the collector genuinely never exits on its own, meaning its own EXIT
+# trap - WAITFIFO's OTHER writer - never fires either), NOTHING would ever unblock either read except the
+# WATCHDOG's own two independent byte-writes - this isolates the WATCHDOG from the collector's own EXIT trap
+# entirely. Must still complete within the 4.0 s hard cap with Phase A's own fresh positive total, and leave
+# no survivor process behind - the exact same two properties the existing SIGTERM-ignoring case above already
+# proves for the NORMAL (timeout-working) path.
+kill "$API_PID" 2>/dev/null; wait "$API_PID" 2>/dev/null
+PORT=$((PORT + 1)); export BLOX_API_PORT=$PORT
+MARKER_WD="bloxminer_test_watchdog_nc_$$"
+STUBBIN_WD="$T/stubbin-watchdog"; mkdir -p "$STUBBIN_WD"
+cat > "$STUBBIN_WD/nc" <<STUBEOF
+#!/usr/bin/env bash
+cmd=\$(cat)
+if [[ \$cmd == cores ]]; then
+	trap '' TERM
+	exec -a $MARKER_WD sleep 30
+fi
+printf '%s' "\$cmd" | "$REAL_NC" "\$@"
+STUBEOF
+chmod +x "$STUBBIN_WD/nc"
+jq -n --arg s "$SUM_OK" --arg c "$CORES_OK" '{summary: $s, cores: $c}' > "$T/replies.json"
+: > "$T/api.out"
+python3 "$HERE/fake_api.py" "$PORT" "$T/replies.json" > "$T/api.out" 2>&1 & API_PID=$!; ALL_API_PIDS+=("$API_PID")
+for _ in $(seq 50); do grep -q ready "$T/api.out" && break; sleep 0.1; done
+t0=$(date +%s.%N)
+# shellcheck disable=SC2016   # expanded by the inner bash, not here
+res=$(PATH="$STUBBIN_WD:$PATH" BLOX_HSTATS_TEST_NO_TIMEOUT=1 timeout 10 bash -c '
+	. "$BLOX_DIR/h-stats.sh"
+	jq -nc --arg k "$khs" --arg s "$stats" "{khs: \$k, stats: \$s}"
+' 2>"$T/watchdog_stderr.log")
+rc=$?
+t1=$(date +%s.%N)
+elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b - a}')
+sleep 0.5   # let init reap anything that died, before checking for survivors
+survivors_wd=$(pgrep -f "$MARKER_WD" || true)
+khs_got=$(jq -r '.khs // ""' <<< "$res" 2>/dev/null)
+if [[ $rc == 0 ]] && awk -v e="$elapsed" 'BEGIN{exit !(e < 4.0)}' && [[ $khs_got == "11900.00" ]] && [[ -z $survivors_wd ]]; then
+	ok "WATCHDOG boundedness: read -t permanently lost + SIGTERM-ignoring nc 'cores' -> still < 4.0 s, Phase A's positive total survives, no survivors (${elapsed}s)"
+else
+	bad "WATCHDOG boundedness: read -t permanently lost + SIGTERM-ignoring nc 'cores' -> still < 4.0 s, Phase A's positive total survives, no survivors" \
+		"rc=$rc elapsed=${elapsed}s survivors=[$survivors_wd] res=$res"
+fi
+pkill -9 -f "$MARKER_WD" 2>/dev/null   # safety net: never leak a process into the host even if this test fails
 
 # ---- P2: a mktemp failure (e.g. /tmp runs out of inodes/quota) must still fall back honestly and leak
 # nothing. LIB/OUTFILE/HANDSHAKE now share ONE mktemp -d'd working directory (fixed names inside it) rather
